@@ -1,4 +1,4 @@
-# EvTrack
+# MVMamba
 
 This repository contains the implementation used for the experiments in our anonymous submission. It supports multi-camera detection and tracking on Wildtrack, MultiviewX, CityTrack, MVCrowdTrack, and GMVD.
 
