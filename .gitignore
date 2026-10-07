@@ -1,0 +1,72 @@
+# Python caches and local environments
+__pycache__/
+.ipynb_checkpoints/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Editors and operating-system metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Credentials and local configuration
+.env
+.env.*
+
+# Model artifacts
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npy
+*.npz
+checkpoints/
+weights/
+
+# Generated experiment artifacts
+logs/
+runs/
+wandb/
+outputs/
+output*/
+experiments/
+tensorboard/
+maps_*/
+map_*.jpg
+*.avi
+*.mp4
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# Generated evaluation files
+all_res.txt
+mota_pred.txt
+mota_gt.txt
+mota_pred_best_tracking.txt
+test_*.txt
+tracking_trajectory_*.png
+tracking_video_*.avi
+tracking_camera_video_*.avi
+
+# Local dataset split files
+train_datapath.csv
+test_datapath.csv
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Local reference repositories
+/DiffMOT/
+/Trust3R/
+/MVTrackTrans/
+/TrackTacular/
