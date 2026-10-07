@@ -16,7 +16,7 @@ from dataloader.wildtrack import Wildtrack
 from dataloader.multiviewx import MultiviewX
 from dataloader.citytrack import CityTrack
 from dataloader.mvcrowdtrack import MVCrowdTrack
-from dataloader.dataloader import GetDataset, diffmot_joint_collate
+from dataloader.dataloader import GetDataset, motion_joint_collate
 from dataloader.concat_dataset import ConcatDataset
 from utils.logger import Logger
 from utils import utils
@@ -24,6 +24,7 @@ from utils.loss import CornerNetFocalLoss
 from detector.multiview_model import MultiView_Detection
 from detector.encoder import resnet18
 from tracker.diffusion_motion_predictor import DiffusionMotionPredictor
+from tracker.mamba_motion_predictor import MambaMotionPredictor
     
 ###################################################################################################################################
 score = []
@@ -108,18 +109,18 @@ def train(
         else:
             offset_loss = occ_loss.new_zeros(())
 
-        has_diffusion_sample = args.motion_model == 'diffusion' and item['motion_condition'].size(0) > 0
-        if has_diffusion_sample:
+        has_motion_sample = args.motion_model in ('diffusion', 'mamba') and item['motion_condition'].size(0) > 0
+        if has_motion_sample:
             motion_condition = item['motion_condition'].to(bev_center.device)
             motion_target = item['motion_target'].to(bev_center.device)
             motion_bev_grid_shape = item['motion_bev_grid_shape'].to(bev_center.device)
-            diffusion_loss = model.motion_predictor(
+            motion_loss = model.motion_predictor(
                 motion_condition,
                 motion_target,
                 bev_grid_shape=motion_bev_grid_shape,
             )
         else:
-            diffusion_loss = occ_loss.new_zeros(())
+            motion_loss = occ_loss.new_zeros(())
 
         if args.multi_task_loss == "uncertainty":
             total_loss = torch.exp(-model.instance_weight) * occ_loss + model.instance_weight
@@ -129,14 +130,14 @@ def train(
                 total_loss = total_loss + torch.exp(-model.offset_weight) * offset_loss + model.offset_weight
                 task_weight_parts.append("offset {:.3f}".format(model.offset_weight.item()))
 
-            if has_diffusion_sample:
-                total_loss = total_loss + torch.exp(-model.diffusion_weight) * diffusion_loss + model.diffusion_weight
-            if args.motion_model == 'diffusion':
-                task_weight_parts.append("diffusion {:.3f}".format(model.diffusion_weight.item()))
+            if has_motion_sample:
+                total_loss = total_loss + torch.exp(-model.motion_weight) * motion_loss + model.motion_weight
+            if args.motion_model in ('diffusion', 'mamba'):
+                task_weight_parts.append("motion {:.3f}".format(model.motion_weight.item()))
 
             task_weight_text = ', weights: ' + ', '.join(task_weight_parts)
         else:
-            total_loss = occ_loss + offset_loss + diffusion_loss
+            total_loss = occ_loss + offset_loss + motion_loss
             task_weight_text = ''
         
         (total_loss / grad_accum_steps).backward()
@@ -152,12 +153,12 @@ def train(
             scheduler.step()
 
         if (batch_idx + 1) % log_interval == 0:
-            print('Train Epoch: {}, Batch:{}/{},\t occ_loss: {:.3f}, offset_loss: {:.3f}, diffusion_loss: {:.3f}{}, \tTime: {:.3f} (min), maxima: {:.3f}'.format(
-                    epoch, (batch_idx + 1), len(data_loader), occ_loss.item(), offset_loss.item(), diffusion_loss.item(), task_weight_text, (time.time()-tic)/60, bev_center.max()))
+            print('Train Epoch: {}, Batch:{}/{},\t occ_loss: {:.3f}, offset_loss: {:.3f}, motion_loss: {:.3f}{}, \tTime: {:.3f} (min), maxima: {:.3f}'.format(
+                    epoch, (batch_idx + 1), len(data_loader), occ_loss.item(), offset_loss.item(), motion_loss.item(), task_weight_text, (time.time()-tic)/60, bev_center.max()))
             pass
 
-    print('Train Epoch: {}, Batch:{}/{},\t occ_loss: {:.3f}, offset_loss: {:.3f}, diffusion_loss: {:.3f}{}, \tTime: {:.3f} (min), maxima: {:.3f}'.format(
-                    epoch, (batch_idx + 1), len(data_loader), occ_loss.item(), offset_loss.item(), diffusion_loss.item(), task_weight_text, (time.time()-tic)/60, bev_center.max()))
+    print('Train Epoch: {}, Batch:{}/{},\t occ_loss: {:.3f}, offset_loss: {:.3f}, motion_loss: {:.3f}{}, \tTime: {:.3f} (min), maxima: {:.3f}'.format(
+                    epoch, (batch_idx + 1), len(data_loader), occ_loss.item(), offset_loss.item(), motion_loss.item(), task_weight_text, (time.time()-tic)/60, bev_center.max()))
 
     return losses / len(data_loader)
 
@@ -219,7 +220,7 @@ def test(
                 args,
                 measure_fps=measure_fps,
                 realtime_tic=realtime_tic,
-                diffusion_motion_predictor=getattr(model, 'motion_predictor', None),
+                motion_predictor=getattr(model, 'motion_predictor', None),
             )
             all_res_rows.append(result_rows)
             if realtime_elapsed is not None:
@@ -267,8 +268,15 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Multiview detector')
     parser.add_argument('--high_cls_thres', type=float, default=0.4, help='Confidence threshold for high-confidence detections')
     parser.add_argument('--track_match_thresh', type=float, default=75, help='MVTrackTrans-style center-distance association threshold')
-    parser.add_argument('--motion_model', type=str, default='kalman', choices=['kalman', 'diffusion'], help='Motion prediction model used by the tracker')
-    parser.add_argument('--motion_normalization',type=str, default='bev', choices=['bev', 'none'], help='Normalize diffusion-motion coordinates by BEV grid size or use raw grid coordinates.')
+    parser.add_argument('--motion_model', type=str, default='mamba', choices=['kalman', 'diffusion', 'mamba'], help='Motion prediction model used by the tracker')
+    parser.add_argument('--motion_normalization',type=str, default='bev', choices=['bev', 'none'], help='Normalize learned-motion coordinates by BEV grid size or use raw grid coordinates.')
+    parser.add_argument('--motion_history_len', type=int, default=5, help='Number of trajectory tokens used by learned motion models')
+    parser.add_argument('--mamba_d_model', type=int, default=64)
+    parser.add_argument('--mamba_d_state', type=int, default=16)
+    parser.add_argument('--mamba_d_conv', type=int, default=4)
+    parser.add_argument('--mamba_expand', type=int, default=2)
+    parser.add_argument('--mamba_layers', type=int, default=2)
+    parser.add_argument('--mamba_dropout', type=float, default=0.0)
     parser.add_argument('--track_low_match_thresh', type=float, default=100, help='MVTrackTrans-style center-distance gate for unconfirmed tracks')
     parser.add_argument('--use_offset', type=int, default=1, choices=[0, 1], help='Use the BEV sub-grid offset branch (1: use, 0: disable)')
     parser.add_argument('--bev_gaussian_sigma', type=float, default=2.0, help='Gaussian sigma used to generate BEV occupancy targets')
@@ -301,6 +309,13 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if args.bev_gaussian_sigma <= 0.0:
         parser.error("--bev_gaussian_sigma must be greater than 0")
+    if args.motion_history_len < 1:
+        parser.error("--motion_history_len must be at least 1")
+    for name in ('mamba_d_model', 'mamba_d_state', 'mamba_d_conv', 'mamba_expand', 'mamba_layers'):
+        if getattr(args, name) < 1:
+            parser.error("--{} must be at least 1".format(name))
+    if not 0.0 <= args.mamba_dropout < 1.0:
+        parser.error("--mamba_dropout must be in [0, 1)")
     print('Occupancy loss: focal')
     print('Motion model: {}'.format(args.motion_model))
     print('Multi-task loss: {}'.format(args.multi_task_loss))
@@ -366,7 +381,7 @@ if __name__ == '__main__':
             if data_row[0]=='train':
                 # Train data
                 # dataset_obj = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=4, train_ratio=train_ratio, sample_require=sample_require)
-                dataset_obj = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=8, train_ratio=train_ratio, sample_require=sample_require, data_aug=args.aug, build_diffmot_motion=args.motion_model == 'diffusion', bev_gaussian_sigma=args.bev_gaussian_sigma)
+                dataset_obj = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=8, train_ratio=train_ratio, sample_require=sample_require, data_aug=args.aug, build_motion_samples=args.motion_model in ('diffusion', 'mamba'), motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
                 train_dataset_list.append(dataset_obj)
                 
             else:
@@ -393,7 +408,7 @@ if __name__ == '__main__':
     elif args.dataset in ['wildtrack', 'multiviewx', 'citytrack', 'mvcrowdtrack']:
         grid_reduce = int(getattr(base0, 'default_grid_reduce', 4))
         img_reduce = int(getattr(base0, 'default_img_reduce', 8))
-        train_dataset_ = GetDataset(base0, train=True, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=args.aug, build_diffmot_motion=args.motion_model == 'diffusion', bev_gaussian_sigma=args.bev_gaussian_sigma)
+        train_dataset_ = GetDataset(base0, train=True, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=args.aug, build_motion_samples=args.motion_model in ('diffusion', 'mamba'), motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
         test_dataset_ = GetDataset(base0, train=False, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=False, bev_gaussian_sigma=args.bev_gaussian_sigma)
 
         print("Training datasets")
@@ -404,7 +419,7 @@ if __name__ == '__main__':
     # Train and Test Data Loader 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                                             num_workers=args.num_workers, pin_memory=True, worker_init_fn=init_fn,
-                                            collate_fn=diffmot_joint_collate if args.motion_model == 'diffusion' else None)
+                                            collate_fn=motion_joint_collate if args.motion_model in ('diffusion', 'mamba') else None)
     
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False,
                                             num_workers=args.num_workers, pin_memory=True, worker_init_fn=init_fn)
@@ -422,10 +437,21 @@ if __name__ == '__main__':
         multi_task_loss=args.multi_task_loss,
         view_pool=args.view_pool,
         use_offset=args.use_offset,
-        use_diffusion_loss=args.motion_model == 'diffusion',
+        use_motion_loss=args.motion_model in ('diffusion', 'mamba'),
     )
     if args.motion_model == 'diffusion':
         model.motion_predictor = DiffusionMotionPredictor(
+            motion_normalization=args.motion_normalization,
+        )
+    elif args.motion_model == 'mamba':
+        model.motion_predictor = MambaMotionPredictor(
+            history_len=args.motion_history_len,
+            d_model=args.mamba_d_model,
+            d_state=args.mamba_d_state,
+            d_conv=args.mamba_d_conv,
+            expand=args.mamba_expand,
+            num_layers=args.mamba_layers,
+            dropout=args.mamba_dropout,
             motion_normalization=args.motion_normalization,
         )
 

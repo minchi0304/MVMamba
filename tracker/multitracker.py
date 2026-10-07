@@ -23,6 +23,7 @@ class STrack:
         xy,
         score,
         buffer_size=30,
+        motion_history_len=5,
     ):
         self._xy = np.asarray(xy, dtype=np.float32).reshape(2)
         self.score = float(score)
@@ -36,7 +37,7 @@ class STrack:
         self.is_activated = False
         self.start_frame = 0
         self.frame_id = 0
-        self.conds = deque([], maxlen=5)
+        self.conds = deque([], maxlen=int(motion_history_len))
 
     @classmethod
     def next_id(cls):
@@ -80,7 +81,7 @@ class STrack:
                 new_track.to_xy(),
             )
         else:
-            self._update_diffusion_history(new_track.to_xy())
+            self._update_motion_history(new_track.to_xy())
         self.tracklet_len = 0
         self.state = TrackState.Tracked
         self.is_activated = True
@@ -125,13 +126,13 @@ class STrack:
                 new_track.to_xy(),
             )
         else:
-            self._update_diffusion_history(new_track.to_xy())
+            self._update_motion_history(new_track.to_xy())
 
         self.score = new_track.score
         self.state = TrackState.Tracked
         self.is_activated = True
 
-    def _update_diffusion_history(self, observed_xy):
+    def _update_motion_history(self, observed_xy):
         observed_xy = np.asarray(observed_xy, dtype=np.float32).reshape(2)
         if self.conds:
             if len(self.conds) > 1:
@@ -164,6 +165,26 @@ class STrack:
             track._xy = predicted_xy
             track.conds.append(np.concatenate((predicted_xy, predicted_xy - previous_xy)))
 
+    @staticmethod
+    def multi_predict_mamba(stracks, model, bev_grid_shape):
+        if len(stracks) == 0:
+            return
+
+        conditions = [track.conds for track in stracks]
+        with torch.no_grad():
+            motion = model.generate(
+                conditions,
+                bev_grid_shape=bev_grid_shape,
+            )
+
+        for track, delta in zip(stracks, motion):
+            previous_xy = track.xy
+            predicted_xy = previous_xy + np.asarray(delta, dtype=np.float32)
+            track._xy = predicted_xy
+            track.conds.append(
+                np.concatenate((predicted_xy, predicted_xy - previous_xy))
+            )
+
     def mark_lost(self):
         self.state = TrackState.Lost
 
@@ -185,7 +206,8 @@ class Tracker:
         motion_normalization="bev",
         bev_grid_shape=None,
         device=None,
-        diffusion_motion_predictor=None,
+        motion_predictor=None,
+        motion_history_len=5,
     ):
         self.tracked_stracks: List[STrack] = []
         self.lost_stracks: List[STrack] = []
@@ -200,25 +222,31 @@ class Tracker:
         self.unconfirmed_match_thresh = float(unconfirmed_match_thresh)
         self.duplicate_thresh = float(duplicate_thresh)
 
-        if motion_model not in ("kalman", "diffusion"):
-            raise ValueError("motion_model must be 'kalman' or 'diffusion'")
+        if motion_model not in ("kalman", "diffusion", "mamba"):
+            raise ValueError("motion_model must be 'kalman', 'diffusion', or 'mamba'")
         self.motion_model = motion_model
         self.bev_grid_shape = bev_grid_shape
+        self.motion_history_len = int(motion_history_len)
 
         self.kalman_filter = KalmanFilter() if motion_model == "kalman" else None
-        self.diffusion_motion_predictor = None
-        if motion_model == "diffusion":
+        self.motion_predictor = None
+        if motion_model in ("diffusion", "mamba"):
             if motion_normalization == "bev" and bev_grid_shape is None:
-                raise ValueError("bev_grid_shape is required for BEV-normalized diffusion motion")
-            if diffusion_motion_predictor is None:
-                raise ValueError("a trained diffusion motion predictor is required")
-            self.diffusion_motion_predictor = diffusion_motion_predictor
-            self.diffusion_motion_predictor.to(device or "cpu")
-            self.diffusion_motion_predictor.eval()
+                raise ValueError("bev_grid_shape is required for BEV-normalized learned motion")
+            if motion_predictor is None:
+                raise ValueError("a trained motion predictor is required")
+            self.motion_predictor = motion_predictor
+            self.motion_predictor.to(device or "cpu")
+            self.motion_predictor.eval()
 
     def _make_detections(self, dets, scores):
         return [
-            STrack(xy, score, self.max_time_lost)
+            STrack(
+                xy,
+                score,
+                self.max_time_lost,
+                motion_history_len=self.motion_history_len,
+            )
             for xy, score in zip(dets, scores)
         ]
 
@@ -276,10 +304,16 @@ class Tracker:
         strack_pool = _joint_stracks(tracked_stracks, self.lost_stracks)
         if self.motion_model == "kalman":
             STrack.multi_predict(strack_pool)
-        else:
+        elif self.motion_model == "diffusion":
             STrack.multi_predict_diff(
                 strack_pool,
-                self.diffusion_motion_predictor,
+                self.motion_predictor,
+                self.bev_grid_shape,
+            )
+        else:
+            STrack.multi_predict_mamba(
+                strack_pool,
+                self.motion_predictor,
                 self.bev_grid_shape,
             )
 

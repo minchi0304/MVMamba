@@ -1,10 +1,14 @@
 einops==0.7.0
 kornia==0.6.12
 matplotlib==3.7.5
+mamba-ssm==1.2.0.post1
+transformers==4.39.3
 motmetrics==1.4.0
 networkx==3.2.1
+ninja==1.11.1.1
 numpy==1.24.4
 opencv-python-headless==4.8.1.78
 Pillow==10.2.0
 scipy==1.10.1
 tqdm==4.66.5
+causal-conv1d==1.2.0.post2

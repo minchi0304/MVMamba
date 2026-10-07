@@ -257,7 +257,7 @@ def save_frame_visualization(logdir, epoch, target, decoded, frame_id, dataset_i
     )
 
 
-def build_tracker(args, dataset_config, tracker_device, diffusion_motion_predictor=None):
+def build_tracker(args, dataset_config, tracker_device, motion_predictor=None):
     base_dataset = dataset_config['base'].base
     return Tracker(
         high_cls_thres=float(args.high_cls_thres),
@@ -267,17 +267,18 @@ def build_tracker(args, dataset_config, tracker_device, diffusion_motion_predict
         motion_normalization=args.motion_normalization,
         bev_grid_shape=tuple(base_dataset.world_grid_shape),
         device=tracker_device,
-        diffusion_motion_predictor=diffusion_motion_predictor,
+        motion_predictor=motion_predictor,
+        motion_history_len=int(args.motion_history_len),
     )
 
 
-def get_tracker(trackers_by_root, root_name, args, dataset_config, tracker_device, diffusion_motion_predictor=None):
+def get_tracker(trackers_by_root, root_name, args, dataset_config, tracker_device, motion_predictor=None):
     if root_name not in trackers_by_root:
         trackers_by_root[root_name] = build_tracker(
             args,
             dataset_config,
             tracker_device,
-            diffusion_motion_predictor=diffusion_motion_predictor,
+            motion_predictor=motion_predictor,
         )
     return trackers_by_root[root_name]
 
@@ -296,7 +297,7 @@ def update_tracking_for_frame(
     args,
     measure_fps=False,
     realtime_tic=None,
-    diffusion_motion_predictor=None,
+    motion_predictor=None,
 ):
     dataset_config = data_loader.dataset.dicts[root_name]
 
@@ -318,7 +319,7 @@ def update_tracking_for_frame(
         args,
         dataset_config,
         decoded['xy_all'].device,
-        diffusion_motion_predictor=diffusion_motion_predictor,
+        motion_predictor=motion_predictor,
     ).update(
         xy_track_world.detach().cpu().numpy(),
         decoded['scores_all'].squeeze(-1).detach().cpu().numpy(),

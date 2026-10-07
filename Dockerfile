@@ -1,5 +1,5 @@
 
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -10,6 +10,7 @@ WORKDIR /workspace
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
+    build-essential \
     ca-certificates \
     cuda-nvrtc-11-8 \
     libglib2.0-0 \
@@ -25,9 +26,10 @@ RUN python -m pip install \
     --index-url https://download.pytorch.org/whl/cu118
 
 COPY requirements.txt .
-RUN python -m pip install -r requirements.txt
+RUN python -m pip install -r requirements.txt --no-build-isolation
+RUN python -m pip install transformers==4.39.3
 
-RUN python -c "import cv2, einops, kornia, matplotlib, motmetrics, networkx, numpy, PIL, scipy, torch, torchvision; print('PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda)"
+RUN python -c "import cv2, einops, kornia, mamba_ssm, matplotlib, motmetrics, networkx, numpy, PIL, scipy, torch, torchvision; print('PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda)"
 
 COPY . .
 

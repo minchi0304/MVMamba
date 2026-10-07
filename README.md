@@ -4,12 +4,12 @@ This repository contains the implementation used for the experiments in our anon
 
 ## Environment
 
-The provided `Dockerfile` uses Python 3.8, PyTorch 2.0.1, torchvision 0.15.2, and CUDA 11.8.
+The provided `Dockerfile` uses Python 3.10, PyTorch 2.0.1, torchvision 0.15.2, CUDA 11.8, and Mamba-SSM 1.2.0.post1.
 
 To install the remaining dependencies:
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt --no-build-isolation
 ```
 
 ## Dataset preparation
@@ -34,7 +34,8 @@ The following command trains the model on Wildtrack:
 ```bash
 python main.py \
   --dataset wildtrack \
-  --data_root <DATA_ROOT>
+  --data_root <DATA_ROOT> \
+  --motion_model mamba
 ```
 
 Replace `wildtrack` with `multiviewx`, `citytrack`, `mvcrowdtrack`, or `gmvd_train` as needed.
@@ -57,8 +58,13 @@ Test outputs are saved under `logs/`.
 The main tracking controls are:
 
 - `--high_cls_thres`: confidence threshold for high-confidence detections
-- `--motion_model`: `kalman` or `diffusion`
+- `--motion_model`: `mamba`, `kalman`, or `diffusion` (`mamba` is the default)
+- `--motion_history_len`: number of `[x, y, dx, dy]` trajectory tokens (default: `5`)
+- `--motion_normalization`: normalize coordinates and deltas by BEV width/height (`bev`) or keep raw grid units (`none`)
 - `--use_offset`: `1` to use BEV sub-grid offsets, `0` to disable them
+
+The Mamba predictor estimates the normalized forward displacement. During tracking it is converted back to world-grid units and applied as
+`predicted_xy = previous_xy + predicted_delta`. A matched detection then replaces the predicted state and becomes the newest trajectory observation.
 
 Use `python main.py --help` for the complete list of options.
 

@@ -13,13 +13,16 @@ from utils import basic
 from operator import itemgetter
 
 class GetDataset(VisionDataset):
-    def __init__(self, base, train=True, transform=ToTensor(), target_transform=ToTensor(),grid_reduce=4, img_reduce=4, train_ratio=0.9, sample_require=0, data_aug=True, build_diffmot_motion=False, bev_gaussian_sigma=2.0):
+    def __init__(self, base, train=True, transform=ToTensor(), target_transform=ToTensor(),grid_reduce=4, img_reduce=4, train_ratio=0.9, sample_require=0, data_aug=True, build_motion_samples=False, motion_history_len=5, bev_gaussian_sigma=2.0):
         # parameters in super can be accessed as (self.param) eg:- self.transform, self.target_transform
         super().__init__(base.root, transform=transform, target_transform=target_transform)
         self.base = base
         self.train = bool(train)
         self.data_aug = bool(data_aug)
-        self.build_diffmot_motion = bool(build_diffmot_motion)
+        self.build_motion_samples = bool(build_motion_samples)
+        self.motion_history_len = int(motion_history_len)
+        if self.motion_history_len < 1:
+            raise ValueError("motion_history_len must be at least 1")
         self.root, self.num_cam, self.num_frames = base.root, base.num_cam, base.num_frames
         self.dataset_name = base.dataset_name
         self.img_shape, self.world_grid_shape = base.img_shape, base.world_grid_shape # H,W; N_row,N_col
@@ -72,14 +75,14 @@ class GetDataset(VisionDataset):
         self.download(frame_range)
         max_frame_objects = max((len(points) for points, _ in self.world_gt.values()), default=0)
         self.max_objects = int(max_frame_objects)
-        self.diffmot_motion_samples = (
-            self._build_diffmot_motion_samples()
-            if self.train and self.build_diffmot_motion
+        self.motion_samples = (
+            self._build_motion_samples()
+            if self.train and self.build_motion_samples
             else {}
         )
 
 
-    def _build_diffmot_motion_samples(self):
+    def _build_motion_samples(self):
         trajectories = defaultdict(list)
         for frame in sorted(self.world_gt):
             world_pts, world_pids = self.world_gt[frame]
@@ -89,13 +92,28 @@ class GetDataset(VisionDataset):
                 )
 
         samples_by_frame = defaultdict(list)
+        history_len = self.motion_history_len
+        window_len = history_len + 2
+        dataset_frames = np.asarray(sorted(self.world_gt), dtype=np.int64)
+        frame_steps = np.diff(dataset_frames)
+        frame_steps = frame_steps[frame_steps > 0]
+        nominal_frame_step = int(frame_steps.min()) if len(frame_steps) else 1
         for trajectory in trajectories.values():
-            for end_index in range(6, len(trajectory)):
-                window = trajectory[end_index - 6:end_index + 1]
+            for end_index in range(window_len - 1, len(trajectory)):
+                window = trajectory[end_index - window_len + 1:end_index + 1]
+                window_frames = np.asarray(
+                    [entry[0] for entry in window],
+                    dtype=np.int64,
+                )
+                if not np.all(np.diff(window_frames) == nominal_frame_step):
+                    continue
                 boxes = np.stack([entry[1] for entry in window], axis=0)
-                deltas = boxes[1:6] - boxes[0:5]
-                condition = np.concatenate([boxes[1:6], deltas], axis=1)
-                delta_position = boxes[6] - boxes[5]
+                deltas = boxes[1:history_len + 1] - boxes[0:history_len]
+                condition = np.concatenate(
+                    [boxes[1:history_len + 1], deltas],
+                    axis=1,
+                )
+                delta_position = boxes[history_len + 1] - boxes[history_len]
                 target_frame = window[-1][0]
                 samples_by_frame[target_frame].append(
                     (condition, delta_position)
@@ -342,8 +360,8 @@ class GetDataset(VisionDataset):
             'root': self.root,
             'proj_mats': proj_mats,
         }
-        if self.train and self.build_diffmot_motion:
-            motion_samples = self.diffmot_motion_samples.get(frame, [])
+        if self.train and self.build_motion_samples:
+            motion_samples = self.motion_samples.get(frame, [])
             if motion_samples:
                 item['motion_condition'] = torch.from_numpy(
                     np.stack([sample[0] for sample in motion_samples], axis=0)
@@ -375,7 +393,7 @@ class GetDataset(VisionDataset):
         return len(self.world_gt.keys())
 
 
-def diffmot_joint_collate(batch):
+def motion_joint_collate(batch):
     items, targets = zip(*batch)
     motion_conditions = []
     motion_targets = []
@@ -412,3 +430,7 @@ def diffmot_joint_collate(batch):
         collated_item['motion_target'] = torch.empty((0, 2), dtype=torch.float32)
         collated_item['motion_bev_grid_shape'] = torch.empty((0, 2), dtype=torch.float32)
     return collated_item, collated_target
+
+
+# Compatibility alias for checkpoints/scripts created before the Mamba motion model.
+diffmot_joint_collate = motion_joint_collate

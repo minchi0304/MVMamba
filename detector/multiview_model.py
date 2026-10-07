@@ -17,7 +17,7 @@ class MultiView_Detection(nn.Module):
         multi_task_loss="plain",
         view_pool="avg",
         use_offset=True,
-        use_diffusion_loss=False,
+        use_motion_loss=False,
     ):
         super().__init__()
         if multi_task_loss not in ["plain", "uncertainty"]:
@@ -31,13 +31,13 @@ class MultiView_Detection(nn.Module):
         self.multi_task_loss = multi_task_loss
         self.view_pool = view_pool
         self.use_offset = bool(use_offset)
-        self.use_diffusion_loss = bool(use_diffusion_loss)
+        self.use_motion_loss = bool(use_motion_loss)
         if self.multi_task_loss == "uncertainty":
             self.instance_weight = nn.Parameter(torch.tensor(0.0), requires_grad=True)
             if self.use_offset:
                 self.offset_weight = nn.Parameter(torch.tensor(0.0), requires_grad=True)
-            if self.use_diffusion_loss:
-                self.diffusion_weight = nn.Parameter(torch.tensor(0.0), requires_grad=True)
+            if self.use_motion_loss:
+                self.motion_weight = nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
         self.out_channel = 512
    
