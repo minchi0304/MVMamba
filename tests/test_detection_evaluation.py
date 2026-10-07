@@ -113,14 +113,6 @@ class DetectionEvaluationTests(unittest.TestCase):
             configs[str(dataset_root)] = {"base": dataset}
         return SimpleNamespace(dataset=SimpleNamespace(dataset_list=names, dicts=configs))
 
-    def test_pipeline_passes_test_frames_and_mvft_two_metre_threshold(self):
-        loader = self.make_loader([("MVFT", [10, 11])])
-        # 24 MVFT grid cells = 1.5 m; one other test frame is completely missed.
-        predictions = torch.tensor([[10, 24, 0, 0.9, 0]])
-        result = evaluate_detection_results(str(self.root), 1, loader, predictions)
-        np.testing.assert_allclose(result, [50, 25, 100, 50])
-        self.assertEqual(list(self.root.glob("_mod_eval_*.txt")), [])
-
     def test_pipeline_keeps_other_dataset_thresholds(self):
         loader = self.make_loader([("CityTrack", [10, 11]), ("MVCrowdTrack", [10, 11]),
                                    ("Wildtrack", [10, 11]), ("MultiviewX", [10, 11])])
@@ -135,7 +127,7 @@ class DetectionEvaluationTests(unittest.TestCase):
         np.testing.assert_allclose(result, [50, 50, 50, 50])
 
     def test_pipeline_accepts_completely_empty_predictions(self):
-        loader = self.make_loader([("MVFT", [10, 11])])
+        loader = self.make_loader([("CityTrack", [10, 11])])
         result = evaluate_detection_results(str(self.root), 1, loader, torch.empty((0, 5)))
         np.testing.assert_array_equal(result, [0, 0, 0, 0])
 

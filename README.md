@@ -1,6 +1,6 @@
 # EvTrack
 
-This repository contains the implementation used for the experiments in our anonymous submission. It supports multi-camera detection and tracking on Wildtrack, MultiviewX, CityTrack, MVCrowdTrack, MVFT, and GMVD.
+This repository contains the implementation used for the experiments in our anonymous submission. It supports multi-camera detection and tracking on Wildtrack, MultiviewX, CityTrack, MVCrowdTrack, and GMVD.
 
 ## Environment
 
@@ -22,7 +22,6 @@ Place the datasets under a common root directory:
 ├── MultiviewX/
 ├── CityTrack/
 ├── MVCrowdTrack/
-├── MVFT/
 └── GMVD/
 ```
 
@@ -38,16 +37,7 @@ python main.py \
   --data_root <DATA_ROOT>
 ```
 
-Replace `wildtrack` with `multiviewx`, `citytrack`, `mvcrowdtrack`, `mvft`, or `gmvd_train` as needed.
-
-MVFT uses a chronological train/test split. The default ratio is 0.8 and can be changed with `--mvft_train_ratio`:
-
-```bash
-python main.py \
-  --dataset mvft \
-  --data_root <DATA_ROOT> \
-  --mvft_train_ratio 0.8
-```
+Replace `wildtrack` with `multiviewx`, `citytrack`, `mvcrowdtrack`, or `gmvd_train` as needed.
 
 ## Test
 

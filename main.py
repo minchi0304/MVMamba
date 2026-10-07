@@ -16,7 +16,6 @@ from dataloader.wildtrack import Wildtrack
 from dataloader.multiviewx import MultiviewX
 from dataloader.citytrack import CityTrack
 from dataloader.mvcrowdtrack import MVCrowdTrack
-from dataloader.mvft import MVFT
 from dataloader.dataloader import GetDataset, diffmot_joint_collate
 from dataloader.concat_dataset import ConcatDataset
 from utils.logger import Logger
@@ -275,8 +274,7 @@ if __name__ == '__main__':
     parser.add_argument('--bev_gaussian_sigma', type=float, default=2.0, help='Gaussian sigma used to generate BEV occupancy targets')
     parser.add_argument('--multi_task_loss', type=str, default='uncertainty', choices=['plain', 'uncertainty'], help='Choose plain summed loss or learned uncertainty multi-task loss')
     parser.add_argument('--data_root', type=str, default='/dataset/Multiview_datasets', help='Root containing dataset folders')
-    parser.add_argument('-d', '--dataset', type=str, default='wildtrack', choices=['wildtrack', 'multiviewx', 'citytrack', 'mvcrowdtrack', 'mvft', 'gmvd_test','gmvd_train'], help='Choose dataset wildtrack/multiviewx/citytrack/mvcrowdtrack/mvft (default: wildtrack)')
-    parser.add_argument('--mvft_train_ratio', type=float, default=0.8, help='Temporal train fraction for MVFT (default: 0.8)')
+    parser.add_argument('-d', '--dataset', type=str, default='wildtrack', choices=['wildtrack', 'multiviewx', 'citytrack', 'mvcrowdtrack', 'gmvd_test','gmvd_train'], help='Choose dataset wildtrack/multiviewx/citytrack/mvcrowdtrack/gmvd (default: wildtrack)')
     parser.add_argument('-pr', '--pretrained', default=False, action='store_true', help='Use pretrained weights (default: True)')
     parser.add_argument('-cd', '--cross_dataset', type=str, default='wildtrack', choices=['wildtrack', 'multiviewx'])
     parser.add_argument('-j', '--num_workers', type=int, default=4)
@@ -301,8 +299,6 @@ if __name__ == '__main__':
     parser.add_argument('--lr_sched',type=str, default='cosine_lr', choices=['step_lr', 'onecycle_lr', 'cosine_lr'], help='Choose lr scheduler. (default:cosine_lr)')
 
     args = parser.parse_args()
-    if not 0.0 < args.mvft_train_ratio < 1.0:
-        parser.error("--mvft_train_ratio must be between 0 and 1, exclusively")
     if args.bev_gaussian_sigma <= 0.0:
         parser.error("--bev_gaussian_sigma must be greater than 0")
     print('Occupancy loss: focal')
@@ -344,9 +340,6 @@ if __name__ == '__main__':
     elif args.dataset == 'mvcrowdtrack':
         data_path = os.path.expanduser(os.path.join(args.data_root, 'MVCrowdTrack'))
         base0 = MVCrowdTrack(data_path)
-    elif args.dataset == 'mvft':
-        data_path = os.path.expanduser(os.path.join(args.data_root, 'MVFT'))
-        base0 = MVFT(data_path)
         
     elif 'gmvd_train' in args.dataset or 'gmvd_test' in args.dataset:
         train_dataset_list = []
@@ -397,12 +390,11 @@ if __name__ == '__main__':
         print("Testing datasets")
         test_dataset = ConcatDataset(*test_dataset_list)
 
-    elif args.dataset in ['wildtrack', 'multiviewx', 'citytrack', 'mvcrowdtrack', 'mvft']:
+    elif args.dataset in ['wildtrack', 'multiviewx', 'citytrack', 'mvcrowdtrack']:
         grid_reduce = int(getattr(base0, 'default_grid_reduce', 4))
         img_reduce = int(getattr(base0, 'default_img_reduce', 8))
-        train_ratio = args.mvft_train_ratio if args.dataset == 'mvft' else 0.9
-        train_dataset_ = GetDataset(base0, train=True, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, train_ratio=train_ratio, data_aug=args.aug, build_diffmot_motion=args.motion_model == 'diffusion', bev_gaussian_sigma=args.bev_gaussian_sigma)
-        test_dataset_ = GetDataset(base0, train=False, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, train_ratio=train_ratio, data_aug=False, bev_gaussian_sigma=args.bev_gaussian_sigma)
+        train_dataset_ = GetDataset(base0, train=True, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=args.aug, build_diffmot_motion=args.motion_model == 'diffusion', bev_gaussian_sigma=args.bev_gaussian_sigma)
+        test_dataset_ = GetDataset(base0, train=False, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=False, bev_gaussian_sigma=args.bev_gaussian_sigma)
 
         print("Training datasets")
         train_dataset = ConcatDataset(train_dataset_)

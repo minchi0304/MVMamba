@@ -445,15 +445,11 @@ def evaluate_detection_results(res_dir, epoch, data_loader, all_res):
 
         evaluation_dataset = data_loader.dataset.dicts[dataset_name]["base"]
         base_dataset = evaluation_dataset.base
-        detection_match_thresh = (
-            2.0 / float(base_dataset.metric_grid_cell)
-            if os.path.basename(dataset_name).lower() == "mvft" else 20.0
-        )
         try:
             lrecall, lprecision, lmoda, lmodp = modMetricsCalculator(
                 mod_eval_path,
                 os.path.abspath(base_dataset.gt_fname),
-                distance_threshold=detection_match_thresh,
+                distance_threshold=20.0,
                 frame_ids=evaluation_dataset.world_gt.keys(),
             )
         finally:
@@ -505,7 +501,7 @@ def finalize_results(
 
     moda_avg, modp_avg, prec_avg, rec_avg = evaluate_detection_results(res_dir, epoch, data_loader, all_res)
     dataset_name = os.path.basename(data_loader.dataset.dataset_list[0]).lower()
-    mot_eval_match_thresh = 2.0 if dataset_name in ["citytrack", "mvcrowdtrack", "mvft"] else 1.0
+    mot_eval_match_thresh = 2.0 if dataset_name in ["citytrack", "mvcrowdtrack"] else 1.0
     tracking_summary = mot_metrics(
         res_dir + '/mota_pred.txt',
         res_dir + '/mota_gt.txt',
