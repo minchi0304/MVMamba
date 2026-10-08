@@ -23,7 +23,6 @@ from utils import utils
 from utils.loss import CornerNetFocalLoss
 from detector.multiview_model import MultiView_Detection
 from detector.encoder import resnet18
-from tracker.diffusion_motion_predictor import DiffusionMotionPredictor
 from tracker.mamba_motion_predictor import MambaMotionPredictor
     
 ###################################################################################################################################
@@ -79,19 +78,14 @@ def train(
     data_loader,
     optimizer,
     log_interval,
-    scheduler=None,
-    grad_accum_steps=1,
 ):
     model.train()
     tic = time.time()
 
     losses = 0
-    num_batches = len(data_loader)
-    grad_accum_steps = max(1, int(grad_accum_steps))
 
-    optimizer.zero_grad()
-    
     for batch_idx, (item, target) in enumerate(data_loader):
+        optimizer.zero_grad()
         data = item['img'].to(device)
                 
         bev_occupancy, bev_offset = model(train_dataset, item['root'], data, item.get('proj_mats'))
@@ -109,7 +103,7 @@ def train(
         else:
             offset_loss = occ_loss.new_zeros(())
 
-        has_motion_sample = args.motion_model in ('diffusion', 'mamba') and item['motion_condition'].size(0) > 0
+        has_motion_sample = args.motion_model == 'mamba' and item['motion_condition'].size(0) > 0
         if has_motion_sample:
             motion_condition = item['motion_condition'].to(bev_center.device)
             motion_target = item['motion_target'].to(bev_center.device)
@@ -132,7 +126,7 @@ def train(
 
             if has_motion_sample:
                 total_loss = total_loss + torch.exp(-model.motion_weight) * motion_loss + model.motion_weight
-            if args.motion_model in ('diffusion', 'mamba'):
+            if args.motion_model == 'mamba':
                 task_weight_parts.append("motion {:.3f}".format(model.motion_weight.item()))
 
             task_weight_text = ', weights: ' + ', '.join(task_weight_parts)
@@ -140,22 +134,13 @@ def train(
             total_loss = occ_loss + offset_loss + motion_loss
             task_weight_text = ''
         
-        (total_loss / grad_accum_steps).backward()
-
-        do_optimizer_step = (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == num_batches
-        if do_optimizer_step:
-            optimizer.step()
-            optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
         losses += float(total_loss.detach().item())
-
-
-        if do_optimizer_step and isinstance(scheduler, torch.optim.lr_scheduler.OneCycleLR):
-            scheduler.step()
 
         if (batch_idx + 1) % log_interval == 0:
             print('Train Epoch: {}, Batch:{}/{},\t occ_loss: {:.3f}, offset_loss: {:.3f}, motion_loss: {:.3f}{}, \tTime: {:.3f} (min), maxima: {:.3f}'.format(
                     epoch, (batch_idx + 1), len(data_loader), occ_loss.item(), offset_loss.item(), motion_loss.item(), task_weight_text, (time.time()-tic)/60, bev_center.max()))
-            pass
 
     print('Train Epoch: {}, Batch:{}/{},\t occ_loss: {:.3f}, offset_loss: {:.3f}, motion_loss: {:.3f}{}, \tTime: {:.3f} (min), maxima: {:.3f}'.format(
                     epoch, (batch_idx + 1), len(data_loader), occ_loss.item(), offset_loss.item(), motion_loss.item(), task_weight_text, (time.time()-tic)/60, bev_center.max()))
@@ -268,30 +253,28 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Multiview detector')
     parser.add_argument('--high_cls_thres', type=float, default=0.4, help='Confidence threshold for high-confidence detections')
     parser.add_argument('--track_match_thresh', type=float, default=75, help='MVTrackTrans-style center-distance association threshold')
-    parser.add_argument('--motion_model', type=str, default='mamba', choices=['kalman', 'diffusion', 'mamba'], help='Motion prediction model used by the tracker')
+    parser.add_argument('--track_low_match_thresh', type=float, default=100, help='MVTrackTrans-style center-distance gate for unconfirmed tracks')
+    parser.add_argument('--motion_model', type=str, default='mamba', choices=['kalman', 'mamba'], help='Motion prediction model used by the tracker')
     parser.add_argument('--motion_normalization',type=str, default='bev', choices=['bev', 'none'], help='Normalize learned-motion coordinates by BEV grid size or use raw grid coordinates.')
     parser.add_argument('--motion_history_len', type=int, default=5, help='Number of trajectory tokens used by learned motion models')
+    parser.add_argument('--mamba_history_mode', type=str, default='window', choices=['window', 'stateful'], help='Use a fixed trajectory window or persistent per-track Mamba state')
     parser.add_argument('--mamba_d_model', type=int, default=64)
     parser.add_argument('--mamba_d_state', type=int, default=16)
     parser.add_argument('--mamba_d_conv', type=int, default=4)
     parser.add_argument('--mamba_expand', type=int, default=2)
     parser.add_argument('--mamba_layers', type=int, default=2)
     parser.add_argument('--mamba_dropout', type=float, default=0.0)
-    parser.add_argument('--track_low_match_thresh', type=float, default=100, help='MVTrackTrans-style center-distance gate for unconfirmed tracks')
     parser.add_argument('--use_offset', type=int, default=1, choices=[0, 1], help='Use the BEV sub-grid offset branch (1: use, 0: disable)')
     parser.add_argument('--bev_gaussian_sigma', type=float, default=2.0, help='Gaussian sigma used to generate BEV occupancy targets')
     parser.add_argument('--multi_task_loss', type=str, default='uncertainty', choices=['plain', 'uncertainty'], help='Choose plain summed loss or learned uncertainty multi-task loss')
     parser.add_argument('--data_root', type=str, default='/dataset/Multiview_datasets', help='Root containing dataset folders')
     parser.add_argument('-d', '--dataset', type=str, default='wildtrack', choices=['wildtrack', 'multiviewx', 'citytrack', 'mvcrowdtrack', 'gmvd_test','gmvd_train'], help='Choose dataset wildtrack/multiviewx/citytrack/mvcrowdtrack/gmvd (default: wildtrack)')
     parser.add_argument('-pr', '--pretrained', default=False, action='store_true', help='Use pretrained weights (default: True)')
-    parser.add_argument('-cd', '--cross_dataset', type=str, default='wildtrack', choices=['wildtrack', 'multiviewx'])
     parser.add_argument('-j', '--num_workers', type=int, default=4)
     parser.add_argument('-b', '--batch_size', type=int, default=1, metavar='N', help='input batch size for training (default: 2)')
     parser.add_argument('--epochs', type=int, default=120, metavar='N', help='number of epochs to train')
     parser.add_argument('--lr', type=float, default=1e-4, metavar='LR', help='learning rate (default: 1e-3)')
-    parser.add_argument('--max_lr', type=float, default=1e-2, metavar='max LR', help=' max learning rate (default: 1e-2)')
     parser.add_argument('--min_lr', type=float, default=1e-6, metavar='min LR', help='minimum learning rate for cosine scheduler')
-    parser.add_argument('--grad_accum_steps', type=int, default=1, help='number of mini-batches to accumulate before optimizer step')
     parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--momentum', type=float, default=0.5, metavar='M', help='SGD momentum (default: 0.5)')
     parser.add_argument('--log_interval', type=int, default=200, metavar='N', help='how many batches to wait before logging training status')
@@ -302,20 +285,8 @@ if __name__ == '__main__':
     parser.add_argument('--aug', action='store_true', help='Use train-time random resize/crop augmentation')
     parser.add_argument('--view_pool', type=str, default='max', choices=['avg', 'max'], help='Camera-view pooling mode')
     parser.add_argument('--optim', type=str, default='Adam', choices=['SGD', 'Adam'], help='Choose optimizer.(default : SGD)')
-    parser.add_argument('--step_size',default=1, type=int)
-    parser.add_argument('--gamma',default=0.1, type=float)
-    parser.add_argument('--lr_sched',type=str, default='cosine_lr', choices=['step_lr', 'onecycle_lr', 'cosine_lr'], help='Choose lr scheduler. (default:cosine_lr)')
 
     args = parser.parse_args()
-    if args.bev_gaussian_sigma <= 0.0:
-        parser.error("--bev_gaussian_sigma must be greater than 0")
-    if args.motion_history_len < 1:
-        parser.error("--motion_history_len must be at least 1")
-    for name in ('mamba_d_model', 'mamba_d_state', 'mamba_d_conv', 'mamba_expand', 'mamba_layers'):
-        if getattr(args, name) < 1:
-            parser.error("--{} must be at least 1".format(name))
-    if not 0.0 <= args.mamba_dropout < 1.0:
-        parser.error("--mamba_dropout must be in [0, 1)")
     print('Occupancy loss: focal')
     print('Motion model: {}'.format(args.motion_model))
     print('Multi-task loss: {}'.format(args.multi_task_loss))
@@ -381,7 +352,7 @@ if __name__ == '__main__':
             if data_row[0]=='train':
                 # Train data
                 # dataset_obj = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=4, train_ratio=train_ratio, sample_require=sample_require)
-                dataset_obj = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=8, train_ratio=train_ratio, sample_require=sample_require, data_aug=args.aug, build_motion_samples=args.motion_model in ('diffusion', 'mamba'), motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
+                dataset_obj = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=8, train_ratio=train_ratio, sample_require=sample_require, data_aug=args.aug, build_motion_samples=args.motion_model == 'mamba', motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
                 train_dataset_list.append(dataset_obj)
                 
             else:
@@ -408,7 +379,7 @@ if __name__ == '__main__':
     elif args.dataset in ['wildtrack', 'multiviewx', 'citytrack', 'mvcrowdtrack']:
         grid_reduce = int(getattr(base0, 'default_grid_reduce', 4))
         img_reduce = int(getattr(base0, 'default_img_reduce', 8))
-        train_dataset_ = GetDataset(base0, train=True, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=args.aug, build_motion_samples=args.motion_model in ('diffusion', 'mamba'), motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
+        train_dataset_ = GetDataset(base0, train=True, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=args.aug, build_motion_samples=args.motion_model == 'mamba', motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
         test_dataset_ = GetDataset(base0, train=False, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=False, bev_gaussian_sigma=args.bev_gaussian_sigma)
 
         print("Training datasets")
@@ -419,7 +390,7 @@ if __name__ == '__main__':
     # Train and Test Data Loader 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                                             num_workers=args.num_workers, pin_memory=True, worker_init_fn=init_fn,
-                                            collate_fn=motion_joint_collate if args.motion_model in ('diffusion', 'mamba') else None)
+                                            collate_fn=motion_joint_collate if args.motion_model == 'mamba' else None)
     
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False,
                                             num_workers=args.num_workers, pin_memory=True, worker_init_fn=init_fn)
@@ -437,13 +408,9 @@ if __name__ == '__main__':
         multi_task_loss=args.multi_task_loss,
         view_pool=args.view_pool,
         use_offset=args.use_offset,
-        use_motion_loss=args.motion_model in ('diffusion', 'mamba'),
+        use_motion_loss=args.motion_model == 'mamba',
     )
-    if args.motion_model == 'diffusion':
-        model.motion_predictor = DiffusionMotionPredictor(
-            motion_normalization=args.motion_normalization,
-        )
-    elif args.motion_model == 'mamba':
+    if args.motion_model == 'mamba':
         model.motion_predictor = MambaMotionPredictor(
             history_len=args.motion_history_len,
             d_model=args.mamba_d_model,
@@ -453,6 +420,7 @@ if __name__ == '__main__':
             num_layers=args.mamba_layers,
             dropout=args.mamba_dropout,
             motion_normalization=args.motion_normalization,
+            history_mode=args.mamba_history_mode,
         )
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -487,23 +455,11 @@ if __name__ == '__main__':
         optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
     # LR Scheduler
-    if args.grad_accum_steps < 1:
-        raise ValueError("--grad_accum_steps must be >= 1")
-    steps_per_epoch = len(train_loader) // args.grad_accum_steps + (1 if len(train_loader) % args.grad_accum_steps != 0 else 0)
-    print("Gradient accumulation steps: {} (effective batch size: {})".format(
-        args.grad_accum_steps,
-        args.batch_size * args.grad_accum_steps,
-    ))
-
-    if args.lr_sched == 'step_lr':
-        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=args.step_size, gamma=args.gamma)
-    elif args.lr_sched == 'onecycle_lr':
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.max_lr, steps_per_epoch=steps_per_epoch,
-                                                        epochs=args.epochs)
-    elif args.lr_sched == 'cosine_lr':
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr)
-    else:
-        scheduler = None
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs,
+        eta_min=args.min_lr,
+    )
     
     # Loss
     criterion = CornerNetFocalLoss().to(device)
@@ -516,8 +472,6 @@ if __name__ == '__main__':
             train_loader,
             optimizer,
             args.log_interval,
-            scheduler,
-            grad_accum_steps=args.grad_accum_steps,
         )
         
         print('Testing...')
@@ -529,8 +483,7 @@ if __name__ == '__main__':
             visualize=True,
         )
             
-        if scheduler is not None and not isinstance(scheduler, torch.optim.lr_scheduler.OneCycleLR):
-            scheduler.step()
+        scheduler.step()
         
         # Save Dictionary
         current_detection_score_key = utils.detection_score_key(score[-1])

@@ -38,6 +38,8 @@ class STrack:
         self.start_frame = 0
         self.frame_id = 0
         self.conds = deque([], maxlen=int(motion_history_len))
+        self.mamba_state = None
+        self.mamba_next_delta = None
 
     @classmethod
     def next_id(cls):
@@ -146,26 +148,6 @@ class STrack:
         self._xy = observed_xy
 
     @staticmethod
-    def multi_predict_diff(stracks, model, bev_grid_shape):
-        if len(stracks) == 0:
-            return
-
-        conditions = [track.conds for track in stracks]
-        with torch.no_grad():
-            motion = model.generate(
-                conditions,
-                sample=1,
-                bestof=True,
-                bev_grid_shape=bev_grid_shape,
-            ).mean(0)
-
-        for track, delta in zip(stracks, motion):
-            previous_xy = track.xy
-            predicted_xy = previous_xy + np.asarray(delta, dtype=np.float32)
-            track._xy = predicted_xy
-            track.conds.append(np.concatenate((predicted_xy, predicted_xy - previous_xy)))
-
-    @staticmethod
     def multi_predict_mamba(stracks, model, bev_grid_shape):
         if len(stracks) == 0:
             return
@@ -183,6 +165,43 @@ class STrack:
             track._xy = predicted_xy
             track.conds.append(
                 np.concatenate((predicted_xy, predicted_xy - previous_xy))
+            )
+
+    @staticmethod
+    def commit_mamba_state(stracks, model, bev_grid_shape):
+        if len(stracks) == 0:
+            return
+
+        tokens = np.asarray([track.conds[-1] for track in stracks], dtype=np.float32)
+        states = [track.mamba_state for track in stracks]
+        with torch.no_grad():
+            motion, next_states = model.stateful_step(
+                tokens,
+                states=states,
+                bev_grid_shape=bev_grid_shape,
+            )
+
+        for track, delta, state in zip(stracks, motion, next_states):
+            track.mamba_state = state
+            track.mamba_next_delta = np.asarray(delta, dtype=np.float32)
+
+    @staticmethod
+    def multi_predict_mamba_stateful(stracks, model, bev_grid_shape):
+        if len(stracks) == 0:
+            return
+
+        missing_state = [
+            track for track in stracks
+            if track.mamba_state is None or track.mamba_next_delta is None
+        ]
+        STrack.commit_mamba_state(missing_state, model, bev_grid_shape)
+
+        for track in stracks:
+            previous_xy = track.xy
+            predicted_xy = previous_xy + track.mamba_next_delta
+            track._xy = predicted_xy.astype(np.float32)
+            track.conds.append(
+                np.concatenate((track._xy, track._xy - previous_xy))
             )
 
     def mark_lost(self):
@@ -208,6 +227,7 @@ class Tracker:
         device=None,
         motion_predictor=None,
         motion_history_len=5,
+        mamba_history_mode="window",
     ):
         self.tracked_stracks: List[STrack] = []
         self.lost_stracks: List[STrack] = []
@@ -222,15 +242,18 @@ class Tracker:
         self.unconfirmed_match_thresh = float(unconfirmed_match_thresh)
         self.duplicate_thresh = float(duplicate_thresh)
 
-        if motion_model not in ("kalman", "diffusion", "mamba"):
-            raise ValueError("motion_model must be 'kalman', 'diffusion', or 'mamba'")
+        if motion_model not in ("kalman", "mamba"):
+            raise ValueError("motion_model must be 'kalman' or 'mamba'")
         self.motion_model = motion_model
         self.bev_grid_shape = bev_grid_shape
         self.motion_history_len = int(motion_history_len)
+        if mamba_history_mode not in ("window", "stateful"):
+            raise ValueError("mamba_history_mode must be 'window' or 'stateful'")
+        self.mamba_history_mode = mamba_history_mode
 
         self.kalman_filter = KalmanFilter() if motion_model == "kalman" else None
         self.motion_predictor = None
-        if motion_model in ("diffusion", "mamba"):
+        if motion_model == "mamba":
             if motion_normalization == "bev" and bev_grid_shape is None:
                 raise ValueError("bev_grid_shape is required for BEV-normalized learned motion")
             if motion_predictor is None:
@@ -291,6 +314,7 @@ class Tracker:
         refind_stracks = []
         lost_stracks = []
         removed_stracks = []
+        stateful_commit_tracks = []
 
         unconfirmed = []
         tracked_stracks = []
@@ -304,18 +328,19 @@ class Tracker:
         strack_pool = _joint_stracks(tracked_stracks, self.lost_stracks)
         if self.motion_model == "kalman":
             STrack.multi_predict(strack_pool)
-        elif self.motion_model == "diffusion":
-            STrack.multi_predict_diff(
-                strack_pool,
-                self.motion_predictor,
-                self.bev_grid_shape,
-            )
         else:
-            STrack.multi_predict_mamba(
-                strack_pool,
-                self.motion_predictor,
-                self.bev_grid_shape,
-            )
+            if self.mamba_history_mode == "stateful":
+                STrack.multi_predict_mamba_stateful(
+                    strack_pool,
+                    self.motion_predictor,
+                    self.bev_grid_shape,
+                )
+            else:
+                STrack.multi_predict_mamba(
+                    strack_pool,
+                    self.motion_predictor,
+                    self.bev_grid_shape,
+                )
 
         matches_idx, unmatched_tracks_idx, unmatched_detections_idx = self._linear_association(
             strack_pool, detections, self.match_thresh
@@ -331,11 +356,13 @@ class Tracker:
             else:
                 track.re_activate(det, self.frame_id, new_id=False, motion_model=self.motion_model)
                 refind_stracks.append(track)
+            stateful_commit_tracks.append(track)
 
         for track in unmatched_tracks:
             if track.state != TrackState.Lost:
                 track.mark_lost()
                 lost_stracks.append(track)
+            stateful_commit_tracks.append(track)
 
         matches_idx, unmatched_unconfirmed_idx, unmatched_detections_idx = self._linear_association(
             unconfirmed, detections, self.unconfirmed_match_thresh
@@ -347,6 +374,7 @@ class Tracker:
         for track, det in matches:
             track.update(det, self.frame_id, motion_model=self.motion_model)
             activated_stracks.append(track)
+            stateful_commit_tracks.append(track)
 
         for track in unmatched_unconfirmed:
             track.mark_removed()
@@ -361,6 +389,14 @@ class Tracker:
                 motion_model=self.motion_model,
             )
             activated_stracks.append(track)
+            stateful_commit_tracks.append(track)
+
+        if self.motion_model == "mamba" and self.mamba_history_mode == "stateful":
+            STrack.commit_mamba_state(
+                stateful_commit_tracks,
+                self.motion_predictor,
+                self.bev_grid_shape,
+            )
 
         for track in self.lost_stracks:
             if self.frame_id - track.end_frame > self.max_time_lost:

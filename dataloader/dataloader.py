@@ -430,7 +430,3 @@ def motion_joint_collate(batch):
         collated_item['motion_target'] = torch.empty((0, 2), dtype=torch.float32)
         collated_item['motion_bev_grid_shape'] = torch.empty((0, 2), dtype=torch.float32)
     return collated_item, collated_target
-
-
-# Compatibility alias for checkpoints/scripts created before the Mamba motion model.
-diffmot_joint_collate = motion_joint_collate

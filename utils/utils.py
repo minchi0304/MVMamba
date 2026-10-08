@@ -269,6 +269,7 @@ def build_tracker(args, dataset_config, tracker_device, motion_predictor=None):
         device=tracker_device,
         motion_predictor=motion_predictor,
         motion_history_len=int(args.motion_history_len),
+        mamba_history_mode=getattr(args, 'mamba_history_mode', 'window'),
     )
 
 

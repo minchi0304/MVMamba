@@ -2,14 +2,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton.language as triton_language
+from mamba_ssm import Mamba
+from mamba_ssm.modules import mamba_simple
 
-try:
-    from mamba_ssm import Mamba
-except ImportError as exc:  # Keep non-Mamba baselines importable without the optional package.
-    Mamba = None
-    _MAMBA_IMPORT_ERROR = exc
-else:
-    _MAMBA_IMPORT_ERROR = None
+if not hasattr(triton_language, "math"):
+    # Torch 2.0 bundles Triton 2.0, whose language API is too old for the
+    # optional Mamba 1.2 state-update kernel. Mamba's step method includes
+    # an equivalent PyTorch fallback when this optional kernel is disabled.
+    mamba_simple.selective_state_update = None
 
 
 class ResidualMambaBlock(nn.Module):
@@ -47,22 +48,21 @@ class MambaMotionPredictor(nn.Module):
         num_layers=2,
         dropout=0.0,
         motion_normalization="bev",
+        history_mode="window",
     ):
         super().__init__()
-        if Mamba is None:
-            raise ImportError(
-                "Mamba motion requires the mamba-ssm package. "
-                "Install the project dependencies or rebuild the Docker image."
-            ) from _MAMBA_IMPORT_ERROR
         if history_len < 1:
             raise ValueError("history_len must be at least 1")
         if num_layers < 1:
             raise ValueError("num_layers must be at least 1")
         if motion_normalization not in ("bev", "none"):
             raise ValueError("motion_normalization must be 'bev' or 'none'")
+        if history_mode not in ("window", "stateful"):
+            raise ValueError("history_mode must be 'window' or 'stateful'")
 
         self.history_len = int(history_len)
         self.motion_normalization = motion_normalization
+        self.history_mode = history_mode
         self.input_projection = nn.Linear(4, d_model)
         self.temporal_embedding = nn.Parameter(
             torch.zeros(1, self.history_len, d_model)
@@ -146,16 +146,102 @@ class MambaMotionPredictor(nn.Module):
         history = self._pad_history(history)
         history = self._normalize_history(history, bev_grid_shape)
         last_velocity = history[:, -1, 2:]
-        sequence = self.input_projection(history) + self.temporal_embedding
+        sequence = self.input_projection(history)
+        if self.history_mode == "window":
+            sequence = sequence + self.temporal_embedding
         for block in self.blocks:
             sequence = block(sequence)
         correction = self.delta_head(self.output_norm(sequence[:, -1]))
         return last_velocity + correction
 
+    @torch.no_grad()
+    def stateful_step(self, tokens, states=None, bev_grid_shape=None):
+        """Consume one token per track and return its next displacement.
+
+        ``states`` contains one cache per track. Each cache stores the
+        convolution and SSM state for every residual Mamba block. A ``None``
+        entry starts a new track from zero state.
+        """
+        if self.history_mode != "stateful":
+            raise RuntimeError("stateful_step requires history_mode='stateful'")
+
+        device = next(self.parameters()).device
+        tokens = torch.as_tensor(tokens, dtype=torch.float32, device=device)
+        if tokens.dim() == 1:
+            tokens = tokens.unsqueeze(0)
+        if tokens.dim() != 2 or tokens.size(-1) != 4:
+            raise ValueError("tokens must have shape [batch, 4]")
+        if self.motion_normalization == "bev" and bev_grid_shape is None:
+            raise ValueError("bev_grid_shape is required for BEV normalization")
+
+        batch_size = tokens.size(0)
+        if states is None:
+            states = [None] * batch_size
+        if len(states) != batch_size:
+            raise ValueError("states must contain one entry per token")
+
+        normalized_tokens = self._normalize_history(
+            tokens.unsqueeze(1),
+            bev_grid_shape,
+        ).squeeze(1)
+        last_velocity = normalized_tokens[:, 2:]
+        sequence = self.input_projection(normalized_tokens).unsqueeze(1)
+        layer_states = []
+
+        for layer_index, block in enumerate(self.blocks):
+            if not hasattr(block.mamba, "step") or not hasattr(
+                block.mamba, "allocate_inference_cache"
+            ):
+                raise RuntimeError(
+                    "the installed mamba-ssm version does not support recurrent inference"
+                )
+
+            conv_state, ssm_state = block.mamba.allocate_inference_cache(
+                batch_size=batch_size,
+                max_seqlen=1,
+                dtype=sequence.dtype,
+            )
+            for row_index, track_state in enumerate(states):
+                if track_state is None:
+                    continue
+                if len(track_state) != len(self.blocks):
+                    raise ValueError("each track state must contain one cache per block")
+                cached_conv, cached_ssm = track_state[layer_index]
+                conv_state[row_index : row_index + 1].copy_(
+                    cached_conv.to(device=conv_state.device, dtype=conv_state.dtype)
+                )
+                ssm_state[row_index : row_index + 1].copy_(
+                    cached_ssm.to(device=ssm_state.device, dtype=ssm_state.dtype)
+                )
+
+            mamba_output, conv_state, ssm_state = block.mamba.step(
+                block.norm(sequence),
+                conv_state,
+                ssm_state,
+            )
+            sequence = sequence + block.dropout(mamba_output)
+            layer_states.append((conv_state, ssm_state))
+
+        correction = self.delta_head(self.output_norm(sequence[:, -1]))
+        normalized_delta = last_velocity + correction
+        delta = self._denormalize_delta(normalized_delta, bev_grid_shape)
+
+        next_states = [[] for _ in range(batch_size)]
+        for conv_state, ssm_state in layer_states:
+            for row_index in range(batch_size):
+                next_states[row_index].append(
+                    (
+                        conv_state[row_index : row_index + 1].detach().clone(),
+                        ssm_state[row_index : row_index + 1].detach().clone(),
+                    )
+                )
+
+        return delta.detach().cpu().numpy(), next_states
+
     def forward(self, history, target_delta, bev_grid_shape=None):
         prediction = self.predict_normalized_delta(history, bev_grid_shape)
         target = self._normalize_delta(target_delta, bev_grid_shape)
-        return F.smooth_l1_loss(prediction, target, beta=0.01)
+        return F.smooth_l1_loss(prediction, target, beta=1)
 
     def generate(self, histories, bev_grid_shape=None):
         if len(histories) == 0:

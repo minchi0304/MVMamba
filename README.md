@@ -58,13 +58,16 @@ Test outputs are saved under `logs/`.
 The main tracking controls are:
 
 - `--high_cls_thres`: confidence threshold for high-confidence detections
-- `--motion_model`: `mamba`, `kalman`, or `diffusion` (`mamba` is the default)
+- `--motion_model`: `mamba` or `kalman` (`mamba` is the default)
 - `--motion_history_len`: number of `[x, y, dx, dy]` trajectory tokens (default: `5`)
+- `--mamba_history_mode`: `window` uses the fixed trajectory window; `stateful` keeps each track's Mamba convolution and SSM state across frames
 - `--motion_normalization`: normalize coordinates and deltas by BEV width/height (`bev`) or keep raw grid units (`none`)
 - `--use_offset`: `1` to use BEV sub-grid offsets, `0` to disable them
 
 The Mamba predictor estimates the normalized forward displacement. During tracking it is converted back to world-grid units and applied as
 `predicted_xy = previous_xy + predicted_delta`. A matched detection then replaces the predicted state and becomes the newest trajectory observation.
+
+For persistent recurrent inference, add `--mamba_history_mode stateful`. In this mode, `--motion_history_len` still controls the training sample length, while tracking inference carries the Mamba state forward without truncating it to that window.
 
 Use `python main.py --help` for the complete list of options.
 

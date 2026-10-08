@@ -5,15 +5,30 @@ import torch
 import torch.nn as nn
 
 import tracker.mamba_motion_predictor as mamba_motion
-from tracker.multitracker import STrack
+from tracker.multitracker import STrack, Tracker
 
 
 class IdentityMamba(nn.Module):
-    def __init__(self, **_):
+    def __init__(self, d_model, d_conv=4, d_state=16, **_):
         super().__init__()
+        self.d_model = d_model
+        self.d_conv = d_conv
+        self.d_state = d_state
 
     def forward(self, sequence):
         return sequence
+
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
+        del max_seqlen
+        return (
+            torch.zeros(batch_size, self.d_model, self.d_conv, dtype=dtype),
+            torch.zeros(batch_size, self.d_model, self.d_state, dtype=dtype),
+        )
+
+    def step(self, hidden_states, conv_state, ssm_state):
+        conv_state.add_(1.0)
+        ssm_state.add_(1.0)
+        return hidden_states, conv_state, ssm_state
 
 
 class ConstantDeltaPredictor(nn.Module):
@@ -23,6 +38,23 @@ class ConstantDeltaPredictor(nn.Module):
 
     def generate(self, histories, bev_grid_shape=None):
         return self.delta.cpu().numpy()[None].repeat(len(histories), axis=0)
+
+
+class ConstantStatefulPredictor(nn.Module):
+    def __init__(self, delta):
+        super().__init__()
+        self.register_buffer("delta", torch.tensor(delta, dtype=torch.float32))
+        self.seen_tokens = []
+
+    def stateful_step(self, tokens, states=None, bev_grid_shape=None):
+        del bev_grid_shape
+        tokens = np.asarray(tokens, dtype=np.float32)
+        self.seen_tokens.extend(tokens.copy())
+        if states is None:
+            states = [None] * len(tokens)
+        next_states = [1 if state is None else state + 1 for state in states]
+        motion = self.delta.cpu().numpy()[None].repeat(len(tokens), axis=0)
+        return motion, next_states
 
 
 class MambaMotionPredictorTest(unittest.TestCase):
@@ -79,6 +111,56 @@ class MambaMotionPredictorTest(unittest.TestCase):
 
         np.testing.assert_allclose(track.xy, [16.0, 19.0])
         np.testing.assert_allclose(track.conds[-1], [16.0, 19.0, 6.0, -1.0])
+
+    def test_stateful_step_carries_each_layer_cache_between_tokens(self):
+        predictor = mamba_motion.MambaMotionPredictor(
+            history_len=5,
+            d_model=8,
+            d_state=3,
+            d_conv=2,
+            num_layers=2,
+            motion_normalization="bev",
+            history_mode="stateful",
+        )
+
+        first_delta, states = predictor.stateful_step(
+            [[100.0, 200.0, 5.0, -2.0]],
+            bev_grid_shape=(1000, 2000),
+        )
+        second_delta, states = predictor.stateful_step(
+            [[105.0, 198.0, 6.0, -1.0]],
+            states=states,
+            bev_grid_shape=(1000, 2000),
+        )
+
+        np.testing.assert_allclose(first_delta[0], [5.0, -2.0], atol=1e-5)
+        np.testing.assert_allclose(second_delta[0], [6.0, -1.0], atol=1e-5)
+        self.assertEqual(len(states[0]), 2)
+        self.assertTrue(torch.all(states[0][0][0] == 2.0))
+        self.assertTrue(torch.all(states[0][1][1] == 2.0))
+
+    def test_stateful_tracker_commits_detection_corrected_token(self):
+        predictor = ConstantStatefulPredictor([5.0, -2.0])
+        tracker = Tracker(
+            high_cls_thres=0.4,
+            match_thresh=30.0,
+            motion_model="mamba",
+            motion_normalization="bev",
+            bev_grid_shape=(100, 200),
+            motion_predictor=predictor,
+            motion_history_len=5,
+            mamba_history_mode="stateful",
+        )
+
+        tracks = tracker.update([[10.0, 20.0]], scores=[0.9])
+        self.assertEqual(len(tracks), 1)
+        np.testing.assert_allclose(predictor.seen_tokens[-1], [10.0, 20.0, 0.0, 0.0])
+
+        tracks = tracker.update([[16.0, 19.0]], scores=[0.95])
+        self.assertEqual(len(tracks), 1)
+        np.testing.assert_allclose(tracks[0].xy, [16.0, 19.0])
+        np.testing.assert_allclose(predictor.seen_tokens[-1], [16.0, 19.0, 6.0, -1.0])
+        self.assertEqual(tracks[0].mamba_state, 2)
 
 
 if __name__ == "__main__":
