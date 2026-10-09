@@ -40,6 +40,10 @@ class STrack:
         self.conds = deque([], maxlen=int(motion_history_len))
         self.mamba_state = None
         self.mamba_next_delta = None
+        self.mamba_next_covariance = None
+        self.motion_delta = None
+        self.motion_covariance = None
+        self.motion_prediction_xy = None
 
     @classmethod
     def next_id(cls):
@@ -154,14 +158,28 @@ class STrack:
 
         conditions = [track.conds for track in stracks]
         with torch.no_grad():
-            motion = model.generate(
-                conditions,
-                bev_grid_shape=bev_grid_shape,
-            )
+            if hasattr(model, "generate_distribution"):
+                motion, covariance = model.generate_distribution(
+                    conditions,
+                    bev_grid_shape=bev_grid_shape,
+                )
+            else:
+                motion = model.generate(
+                    conditions,
+                    bev_grid_shape=bev_grid_shape,
+                )
+                covariance = None
 
-        for track, delta in zip(stracks, motion):
+        for row_index, (track, delta) in enumerate(zip(stracks, motion)):
             previous_xy = track.xy
             predicted_xy = previous_xy + np.asarray(delta, dtype=np.float32)
+            track.motion_delta = np.asarray(delta, dtype=np.float32)
+            track.motion_prediction_xy = predicted_xy.copy()
+            track.motion_covariance = (
+                None
+                if covariance is None
+                else np.asarray(covariance[row_index], dtype=np.float32)
+            )
             track._xy = predicted_xy
             track.conds.append(
                 np.concatenate((predicted_xy, predicted_xy - previous_xy))
@@ -175,15 +193,28 @@ class STrack:
         tokens = np.asarray([track.conds[-1] for track in stracks], dtype=np.float32)
         states = [track.mamba_state for track in stracks]
         with torch.no_grad():
-            motion, next_states = model.stateful_step(
-                tokens,
-                states=states,
-                bev_grid_shape=bev_grid_shape,
-            )
+            if hasattr(model, "stateful_step_distribution"):
+                motion, covariance, next_states = model.stateful_step_distribution(
+                    tokens,
+                    states=states,
+                    bev_grid_shape=bev_grid_shape,
+                )
+            else:
+                motion, next_states = model.stateful_step(
+                    tokens,
+                    states=states,
+                    bev_grid_shape=bev_grid_shape,
+                )
+                covariance = None
 
-        for track, delta, state in zip(stracks, motion, next_states):
+        for row_index, (track, delta, state) in enumerate(zip(stracks, motion, next_states)):
             track.mamba_state = state
             track.mamba_next_delta = np.asarray(delta, dtype=np.float32)
+            track.mamba_next_covariance = (
+                None
+                if covariance is None
+                else np.asarray(covariance[row_index], dtype=np.float32)
+            )
 
     @staticmethod
     def multi_predict_mamba_stateful(stracks, model, bev_grid_shape):
@@ -199,6 +230,13 @@ class STrack:
         for track in stracks:
             previous_xy = track.xy
             predicted_xy = previous_xy + track.mamba_next_delta
+            track.motion_delta = track.mamba_next_delta.copy()
+            track.motion_prediction_xy = predicted_xy.copy()
+            track.motion_covariance = (
+                None
+                if track.mamba_next_covariance is None
+                else track.mamba_next_covariance.copy()
+            )
             track._xy = predicted_xy.astype(np.float32)
             track.conds.append(
                 np.concatenate((track._xy, track._xy - previous_xy))
@@ -253,6 +291,7 @@ class Tracker:
 
         self.kalman_filter = KalmanFilter() if motion_model == "kalman" else None
         self.motion_predictor = None
+        self.last_motion_predictions = []
         if motion_model == "mamba":
             if motion_normalization == "bev" and bev_grid_shape is None:
                 raise ValueError("bev_grid_shape is required for BEV-normalized learned motion")
@@ -342,10 +381,13 @@ class Tracker:
                     self.bev_grid_shape,
                 )
 
+        predicted_tracks = list(strack_pool)
+
         matches_idx, unmatched_tracks_idx, unmatched_detections_idx = self._linear_association(
             strack_pool, detections, self.match_thresh
         )
         matches = [(strack_pool[int(i)], detections[int(j)]) for i, j in matches_idx]
+        matched_prediction_ids = {id(track) for track, _ in matches}
         unmatched_tracks = [strack_pool[int(i)] for i in unmatched_tracks_idx]
         detections = [detections[int(i)] for i in unmatched_detections_idx]
 
@@ -417,6 +459,23 @@ class Tracker:
         self.lost_stracks = _sub_stracks(self.lost_stracks, removed_stracks)
 
         self.removed_stracks.extend(removed_stracks)
+
+        self.last_motion_predictions = []
+        for track in predicted_tracks:
+            if track.motion_covariance is None:
+                continue
+            covariance = track.motion_covariance
+            self.last_motion_predictions.append({
+                "track_id": int(track.track_id),
+                "matched": int(id(track) in matched_prediction_ids),
+                "predicted_x": float(track.motion_prediction_xy[0]),
+                "predicted_y": float(track.motion_prediction_xy[1]),
+                "mean_dx": float(track.motion_delta[0]),
+                "mean_dy": float(track.motion_delta[1]),
+                "cov_xx": float(covariance[0, 0]),
+                "cov_xy": float(covariance[0, 1]),
+                "cov_yy": float(covariance[1, 1]),
+            })
 
         self.tracked_stracks, self.lost_stracks = _remove_duplicate_stracks(
             self.tracked_stracks,

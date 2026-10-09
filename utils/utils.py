@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import glob
 import os
 import time
+import csv
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -294,6 +295,7 @@ def update_tracking_for_frame(
     trackers_by_root,
     tracking_results,
     tracking_gt_results,
+    tracking_uncertainty_results,
     tracking_scales,
     args,
     measure_fps=False,
@@ -314,18 +316,25 @@ def update_tracking_for_frame(
         getattr(base_dataset, 'metric_grid_cell', float(base_dataset.grid_cell) / 100.0)
     )
     xy_track_world = decoded['xy_all'] * grid_reduce
-    tracks = get_tracker(
+    tracker = get_tracker(
         trackers_by_root,
         root_name,
         args,
         dataset_config,
         decoded['xy_all'].device,
         motion_predictor=motion_predictor,
-    ).update(
+    )
+    tracks = tracker.update(
         xy_track_world.detach().cpu().numpy(),
         decoded['scores_all'].squeeze(-1).detach().cpu().numpy(),
         frame_id=frame_id,
     )
+
+    for prediction in tracker.last_motion_predictions:
+        tracking_uncertainty_results[root_name].append({
+            "frame": int(frame_id),
+            **prediction,
+        })
 
     realtime_elapsed = None
     if measure_fps and realtime_tic is not None:
@@ -384,6 +393,38 @@ def write_tracking_result_files(res_dir, data_loader, all_res, tracking_results,
     mota_gt = np.asarray(mota_gt_rows, dtype=np.float32).reshape(-1, 11)
     np.savetxt(res_dir + '/mota_pred.txt', mota_pred, fmt='%.6f', delimiter=',')
     np.savetxt(res_dir + '/mota_gt.txt', mota_gt, fmt='%.6f', delimiter=',')
+
+
+def write_motion_uncertainty_file(
+    res_dir,
+    epoch,
+    data_loader,
+    tracking_uncertainty_results,
+):
+    output_path = os.path.join(
+        res_dir,
+        'motion_uncertainty_epoch_{}.csv'.format(epoch),
+    )
+    fieldnames = [
+        'sequence',
+        'frame',
+        'track_id',
+        'matched',
+        'predicted_x',
+        'predicted_y',
+        'mean_dx',
+        'mean_dy',
+        'cov_xx',
+        'cov_xy',
+        'cov_yy',
+    ]
+    with open(output_path, 'w', newline='') as output_file:
+        writer = csv.DictWriter(output_file, fieldnames=fieldnames)
+        writer.writeheader()
+        for sequence in data_loader.dataset.dataset_list:
+            for row in tracking_uncertainty_results.get(sequence, []):
+                writer.writerow({'sequence': sequence, **row})
+    return output_path
 
 
 def normalize_plot_sequence_indices(seq_names, seq_ids=None):
@@ -474,6 +515,7 @@ def finalize_results(
     all_res_rows,
     tracking_results,
     tracking_gt_results,
+    tracking_uncertainty_results,
     tracking_scales,
     realtime_update_time,
     realtime_update_count,
@@ -486,6 +528,14 @@ def finalize_results(
     all_res = stack_detection_results(all_res_rows, device)
     res_dir = os.path.abspath(os.path.dirname(res_fpath))
     write_tracking_result_files(res_dir, data_loader, all_res, tracking_results, tracking_gt_results)
+    if tracking_uncertainty_results:
+        uncertainty_path = write_motion_uncertainty_file(
+            res_dir,
+            epoch,
+            data_loader,
+            tracking_uncertainty_results,
+        )
+        print('Motion uncertainty: {}'.format(uncertainty_path))
 
     realtime_fps = None
     if measure_fps and realtime_update_time > 0.0:

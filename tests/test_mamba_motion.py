@@ -57,6 +57,22 @@ class ConstantStatefulPredictor(nn.Module):
         return motion, next_states
 
 
+class ConstantDistributionPredictor(ConstantDeltaPredictor):
+    def __init__(self, delta, covariance):
+        super().__init__(delta)
+        self.register_buffer(
+            "covariance",
+            torch.tensor(covariance, dtype=torch.float32),
+        )
+
+    def generate_distribution(self, histories, bev_grid_shape=None):
+        del bev_grid_shape
+        count = len(histories)
+        motion = self.delta.cpu().numpy()[None].repeat(count, axis=0)
+        covariance = self.covariance.cpu().numpy()[None].repeat(count, axis=0)
+        return motion, covariance
+
+
 class MambaMotionPredictorTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -98,6 +114,40 @@ class MambaMotionPredictorTest(unittest.TestCase):
 
         self.assertAlmostEqual(float(loss.item()), 0.0, places=7)
 
+    def _check_niw_head(self, head_type):
+        predictor = mamba_motion.MambaMotionPredictor(
+            history_len=2,
+            d_model=8,
+            num_layers=1,
+            motion_normalization="bev",
+            loss_type="niw",
+            evidential_head=head_type,
+        )
+        history = torch.tensor(
+            [[[100.0, 200.0, 5.0, -2.0], [105.0, 198.0, 5.0, -2.0]]]
+        )
+        target = torch.tensor([[5.0, -2.0]])
+        grid_shape = torch.tensor([[1000.0, 2000.0]])
+
+        loss = predictor(history, target, bev_grid_shape=grid_shape)
+        delta, covariance = predictor.generate_distribution(
+            [history[0].numpy()],
+            bev_grid_shape=(1000.0, 2000.0),
+        )
+
+        self.assertTrue(torch.isfinite(loss))
+        np.testing.assert_allclose(delta[0], [5.0, -2.0], atol=1e-5)
+        self.assertEqual(covariance.shape, (1, 2, 2))
+        self.assertGreater(covariance[0, 0, 0], 0.0)
+        self.assertGreater(covariance[0, 1, 1], 0.0)
+        np.testing.assert_allclose(covariance[0], covariance[0].T, atol=1e-6)
+
+    def test_separate_niw_head_returns_finite_loss_and_bev_covariance(self):
+        self._check_niw_head("separate")
+
+    def test_joint_niw_head_returns_finite_loss_and_bev_covariance(self):
+        self._check_niw_head("joint")
+
     def test_detection_update_replaces_the_predicted_track_state(self):
         track = STrack([10.0, 20.0], 0.9, motion_history_len=5)
         track.activate(None, frame_id=1, motion_model="mamba")
@@ -111,6 +161,33 @@ class MambaMotionPredictorTest(unittest.TestCase):
 
         np.testing.assert_allclose(track.xy, [16.0, 19.0])
         np.testing.assert_allclose(track.conds[-1], [16.0, 19.0, 6.0, -1.0])
+
+    def test_tracker_records_motion_covariance_without_using_it_for_update(self):
+        predictor = ConstantDistributionPredictor(
+            [5.0, -2.0],
+            [[4.0, 1.0], [1.0, 9.0]],
+        )
+        tracker = Tracker(
+            high_cls_thres=0.4,
+            match_thresh=30.0,
+            motion_model="mamba",
+            motion_normalization="bev",
+            bev_grid_shape=(100, 200),
+            motion_predictor=predictor,
+            motion_history_len=5,
+        )
+
+        tracker.update([[10.0, 20.0]], scores=[0.9])
+        tracks = tracker.update([[16.0, 19.0]], scores=[0.95])
+
+        self.assertEqual(len(tracks), 1)
+        np.testing.assert_allclose(tracks[0].xy, [16.0, 19.0])
+        self.assertEqual(len(tracker.last_motion_predictions), 1)
+        row = tracker.last_motion_predictions[0]
+        self.assertEqual(row["matched"], 1)
+        self.assertAlmostEqual(row["cov_xx"], 4.0)
+        self.assertAlmostEqual(row["cov_xy"], 1.0)
+        self.assertAlmostEqual(row["cov_yy"], 9.0)
 
     def test_stateful_step_carries_each_layer_cache_between_tokens(self):
         predictor = mamba_motion.MambaMotionPredictor(

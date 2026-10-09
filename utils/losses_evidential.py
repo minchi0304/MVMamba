@@ -242,3 +242,67 @@ def evidential_niw_loss_3d(
         "nu_mean": float(nu_flat.mean().detach()),
     }
     return loss, stats
+
+
+def niw_predictive_covariance_2d(kappa, nu, scale_tril, eps: float = 1e-8):
+    """Return the covariance of the 2D Student-t predictive distribution."""
+    psi = scale_tril @ scale_tril.transpose(-1, -2)
+    denominator = kappa * (nu - 3.0)
+    factor = (kappa + 1.0) / denominator.clamp_min(eps)
+    return psi * factor.unsqueeze(-1)
+
+
+def evidential_niw_loss_2d(
+    target: torch.Tensor,
+    mean: torch.Tensor,
+    kappa: torch.Tensor,
+    nu: torch.Tensor,
+    scale_tril: torch.Tensor,
+    lambda_evi: float = 1e-3,
+    eps: float = 1e-8,
+):
+    """NIW evidential loss for a batch of correlated 2D motion targets.
+
+    ``mean`` is the predictive location, ``kappa`` and ``nu`` are the NIW
+    evidence parameters, and ``scale_tril`` is the Cholesky factor of Psi.
+    The induced predictive distribution is a bivariate Student-t.
+    """
+    d = 2
+    diff = (target - mean).unsqueeze(-1)
+    solved = torch.linalg.solve_triangular(scale_tril, diff, upper=False)
+    delta_psi = solved.squeeze(-1).square().sum(dim=-1)
+
+    kappa_flat = kappa.squeeze(-1).clamp_min(eps)
+    nu_flat = nu.squeeze(-1).clamp_min(d + 1.0 + eps)
+    degrees_of_freedom = (nu_flat - d + 1.0).clamp_min(2.0 + eps)
+    scale_factor = (kappa_flat + 1.0) / (kappa_flat * degrees_of_freedom)
+    mahalanobis = delta_psi / scale_factor
+
+    diagonal = torch.diagonal(scale_tril, dim1=-2, dim2=-1)
+    logdet_psi = 2.0 * torch.log(diagonal.clamp_min(eps)).sum(dim=-1)
+    logdet_scale = logdet_psi + d * torch.log(scale_factor)
+    log_normalizer = (
+        torch.lgamma(0.5 * (degrees_of_freedom + d))
+        - torch.lgamma(0.5 * degrees_of_freedom)
+        - 0.5
+        * (
+            d * torch.log(degrees_of_freedom * math.pi)
+            + logdet_scale
+        )
+    )
+    nll = -(
+        log_normalizer
+        - 0.5
+        * (degrees_of_freedom + d)
+        * torch.log1p(mahalanobis / degrees_of_freedom)
+    )
+
+    regularizer = torch.sqrt(delta_psi + eps) * (kappa_flat + nu_flat)
+    loss = nll + lambda_evi * regularizer
+    stats = {
+        "nll": float(nll.mean().detach()),
+        "reg": float(regularizer.mean().detach()),
+        "kappa_mean": float(kappa_flat.mean().detach()),
+        "nu_mean": float(nu_flat.mean().detach()),
+    }
+    return loss.mean(), stats

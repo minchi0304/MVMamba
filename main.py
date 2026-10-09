@@ -113,8 +113,10 @@ def train(
                 motion_target,
                 bev_grid_shape=motion_bev_grid_shape,
             )
+            motion_stats = model.motion_predictor.last_loss_stats
         else:
             motion_loss = occ_loss.new_zeros(())
+            motion_stats = {}
 
         if args.multi_task_loss == "uncertainty":
             total_loss = torch.exp(-model.instance_weight) * occ_loss + model.instance_weight
@@ -124,26 +126,36 @@ def train(
                 total_loss = total_loss + torch.exp(-model.offset_weight) * offset_loss + model.offset_weight
                 task_weight_parts.append("offset {:.3f}".format(model.offset_weight.item()))
 
-            if has_motion_sample:
+            if has_motion_sample and args.motion_loss == 'niw':
+                total_loss = total_loss + motion_loss
+                task_weight_parts.append("motion fixed")
+            elif has_motion_sample:
                 total_loss = total_loss + torch.exp(-model.motion_weight) * motion_loss + model.motion_weight
-            if args.motion_model == 'mamba':
+            if args.motion_model == 'mamba' and args.motion_loss == 'smooth_l1':
                 task_weight_parts.append("motion {:.3f}".format(model.motion_weight.item()))
 
             task_weight_text = ', weights: ' + ', '.join(task_weight_parts)
         else:
             total_loss = occ_loss + offset_loss + motion_loss
             task_weight_text = ''
+
+        motion_stats_text = ''
+        if motion_stats:
+            motion_stats_text = (
+                ', niw_nll {nll:.4f}, niw_reg {reg:.4f}, '
+                'kappa {kappa_mean:.3f}, nu {nu_mean:.3f}'
+            ).format(**motion_stats)
         
         total_loss.backward()
         optimizer.step()
         losses += float(total_loss.detach().item())
 
         if (batch_idx + 1) % log_interval == 0:
-            print('Train Epoch: {}, Batch:{}/{},\t occ_loss: {:.3f}, offset_loss: {:.3f}, motion_loss: {:.3f}{}, \tTime: {:.3f} (min), maxima: {:.3f}'.format(
-                    epoch, (batch_idx + 1), len(data_loader), occ_loss.item(), offset_loss.item(), motion_loss.item(), task_weight_text, (time.time()-tic)/60, bev_center.max()))
+            print('Train Epoch: {}, Batch:{}/{},\t occ_loss: {:.3f}, offset_loss: {:.3f}, motion_loss: {:.6f}{}{}, \tTime: {:.3f} (min), maxima: {:.3f}'.format(
+                    epoch, (batch_idx + 1), len(data_loader), occ_loss.item(), offset_loss.item(), motion_loss.item(), task_weight_text, motion_stats_text, (time.time()-tic)/60, bev_center.max()))
 
-    print('Train Epoch: {}, Batch:{}/{},\t occ_loss: {:.3f}, offset_loss: {:.3f}, motion_loss: {:.3f}{}, \tTime: {:.3f} (min), maxima: {:.3f}'.format(
-                    epoch, (batch_idx + 1), len(data_loader), occ_loss.item(), offset_loss.item(), motion_loss.item(), task_weight_text, (time.time()-tic)/60, bev_center.max()))
+    print('Train Epoch: {}, Batch:{}/{},\t occ_loss: {:.3f}, offset_loss: {:.3f}, motion_loss: {:.6f}{}{}, \tTime: {:.3f} (min), maxima: {:.3f}'.format(
+                    epoch, (batch_idx + 1), len(data_loader), occ_loss.item(), offset_loss.item(), motion_loss.item(), task_weight_text, motion_stats_text, (time.time()-tic)/60, bev_center.max()))
 
     return losses / len(data_loader)
 
@@ -166,6 +178,7 @@ def test(
     trackers_by_root = {}
     tracking_results = defaultdict(list)
     tracking_gt_results = defaultdict(list)
+    tracking_uncertainty_results = defaultdict(list)
     tracking_scales = {}
     realtime_update_time = 0.0
     realtime_update_count = 0
@@ -201,6 +214,7 @@ def test(
                 trackers_by_root,
                 tracking_results,
                 tracking_gt_results,
+                tracking_uncertainty_results,
                 tracking_scales,
                 args,
                 measure_fps=measure_fps,
@@ -224,6 +238,7 @@ def test(
             all_res_rows,
             tracking_results,
             tracking_gt_results,
+            tracking_uncertainty_results,
             tracking_scales,
             realtime_update_time,
             realtime_update_count,
@@ -264,6 +279,9 @@ if __name__ == '__main__':
     parser.add_argument('--mamba_expand', type=int, default=2)
     parser.add_argument('--mamba_layers', type=int, default=2)
     parser.add_argument('--mamba_dropout', type=float, default=0.0)
+    parser.add_argument('--motion_loss', type=str, default='niw', choices=['smooth_l1', 'niw'], help='Motion prediction loss and output head')
+    parser.add_argument('--evidential_lambda', type=float, default=1e-3, help='Evidence regularization coefficient for NIW motion loss')
+    parser.add_argument('--evidential_head', type=str, default='separate', choices=['separate', 'joint'], help='Use separate mean/evidence MLPs or one joint NIW MLP')
     parser.add_argument('--use_offset', type=int, default=1, choices=[0, 1], help='Use the BEV sub-grid offset branch (1: use, 0: disable)')
     parser.add_argument('--bev_gaussian_sigma', type=float, default=2.0, help='Gaussian sigma used to generate BEV occupancy targets')
     parser.add_argument('--multi_task_loss', type=str, default='uncertainty', choices=['plain', 'uncertainty'], help='Choose plain summed loss or learned uncertainty multi-task loss')
@@ -289,6 +307,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     print('Occupancy loss: focal')
     print('Motion model: {}'.format(args.motion_model))
+    print('Motion loss: {}'.format(args.motion_loss))
     print('Multi-task loss: {}'.format(args.multi_task_loss))
     
     torch.cuda.empty_cache()
@@ -408,7 +427,7 @@ if __name__ == '__main__':
         multi_task_loss=args.multi_task_loss,
         view_pool=args.view_pool,
         use_offset=args.use_offset,
-        use_motion_loss=args.motion_model == 'mamba',
+        use_motion_loss=args.motion_model == 'mamba' and args.motion_loss == 'smooth_l1',
     )
     if args.motion_model == 'mamba':
         model.motion_predictor = MambaMotionPredictor(
@@ -421,6 +440,9 @@ if __name__ == '__main__':
             dropout=args.mamba_dropout,
             motion_normalization=args.motion_normalization,
             history_mode=args.mamba_history_mode,
+            loss_type=args.motion_loss,
+            evidential_lambda=args.evidential_lambda,
+            evidential_head=args.evidential_head,
         )
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -505,6 +527,15 @@ if __name__ == '__main__':
             current_mota_pred_path = os.path.join(logdir, 'mota_pred.txt')
             if os.path.exists(current_mota_pred_path):
                 shutil.copyfile(current_mota_pred_path, best_tracking_pred_path)
+            current_uncertainty_path = os.path.join(
+                logdir,
+                'motion_uncertainty_epoch_{}.csv'.format(epoch),
+            )
+            if os.path.exists(current_uncertainty_path):
+                shutil.copyfile(
+                    current_uncertainty_path,
+                    os.path.join(logdir, 'motion_uncertainty_best_tracking.csv'),
+                )
             print(
                 "Saved best tracking checkpoint by {}".format(
                     utils.tracking_score_text(current_tracking_score_key)

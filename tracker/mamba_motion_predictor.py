@@ -5,6 +5,10 @@ import torch.nn.functional as F
 import triton.language as triton_language
 from mamba_ssm import Mamba
 from mamba_ssm.modules import mamba_simple
+from utils.losses_evidential import (
+    evidential_niw_loss_2d,
+    niw_predictive_covariance_2d,
+)
 
 if not hasattr(triton_language, "math"):
     # Torch 2.0 bundles Triton 2.0, whose language API is too old for the
@@ -49,20 +53,19 @@ class MambaMotionPredictor(nn.Module):
         dropout=0.0,
         motion_normalization="bev",
         history_mode="window",
+        loss_type="smooth_l1",
+        evidential_lambda=1e-3,
+        evidential_head="separate",
     ):
         super().__init__()
-        if history_len < 1:
-            raise ValueError("history_len must be at least 1")
-        if num_layers < 1:
-            raise ValueError("num_layers must be at least 1")
-        if motion_normalization not in ("bev", "none"):
-            raise ValueError("motion_normalization must be 'bev' or 'none'")
-        if history_mode not in ("window", "stateful"):
-            raise ValueError("history_mode must be 'window' or 'stateful'")
 
         self.history_len = int(history_len)
         self.motion_normalization = motion_normalization
         self.history_mode = history_mode
+        self.loss_type = loss_type
+        self.evidential_lambda = float(evidential_lambda)
+        self.evidential_head_type = evidential_head
+        self.last_loss_stats = {}
         self.input_projection = nn.Linear(4, d_model)
         self.temporal_embedding = nn.Parameter(
             torch.zeros(1, self.history_len, d_model)
@@ -80,14 +83,46 @@ class MambaMotionPredictor(nn.Module):
             ]
         )
         self.output_norm = nn.LayerNorm(d_model)
-        self.delta_head = nn.Sequential(
+        use_joint_head = self.loss_type == "niw" and evidential_head == "joint"
+        self.delta_head = None if use_joint_head else nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.SiLU(),
             nn.Linear(d_model, 2),
         )
+        self.evidence_head = (
+            nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, 5),
+            )
+            if self.loss_type == "niw" and not use_joint_head
+            else None
+        )
+        self.joint_head = (
+            nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, 7),
+            )
+            if use_joint_head
+            else None
+        )
         nn.init.trunc_normal_(self.temporal_embedding, std=0.02)
-        nn.init.zeros_(self.delta_head[-1].weight)
-        nn.init.zeros_(self.delta_head[-1].bias)
+        if self.delta_head is not None:
+            nn.init.zeros_(self.delta_head[-1].weight)
+            nn.init.zeros_(self.delta_head[-1].bias)
+        if self.evidence_head is not None:
+            nn.init.zeros_(self.evidence_head[-1].weight)
+            nn.init.zeros_(self.evidence_head[-1].bias)
+            self.evidence_head[-1].bias.data.copy_(
+                torch.tensor([0.5413, 0.5413, -4.6002, 0.0, -4.6002])
+            )
+        if self.joint_head is not None:
+            nn.init.zeros_(self.joint_head[-1].weight)
+            nn.init.zeros_(self.joint_head[-1].bias)
+            self.joint_head[-1].bias.data[2:].copy_(
+                torch.tensor([0.5413, 0.5413, -4.6002, 0.0, -4.6002])
+            )
 
     @staticmethod
     def _coordinate_scale(bev_grid_shape, reference):
@@ -127,6 +162,12 @@ class MambaMotionPredictor(nn.Module):
             return delta
         return delta * self._coordinate_scale(bev_grid_shape, delta)
 
+    def _denormalize_covariance(self, covariance, bev_grid_shape):
+        if self.motion_normalization == "none":
+            return covariance
+        scale = self._coordinate_scale(bev_grid_shape, covariance)
+        return covariance * scale.unsqueeze(-1) * scale.unsqueeze(-2)
+
     def _pad_history(self, history):
         if history.size(1) >= self.history_len:
             return history[:, -self.history_len :]
@@ -137,12 +178,7 @@ class MambaMotionPredictor(nn.Module):
         padding = first.repeat(1, pad_count, 1)
         return torch.cat((padding, history), dim=1)
 
-    def predict_normalized_delta(self, history, bev_grid_shape=None):
-        if history.dim() != 3 or history.size(-1) != 4:
-            raise ValueError("history must have shape [batch, time, 4]")
-        if self.motion_normalization == "bev" and bev_grid_shape is None:
-            raise ValueError("bev_grid_shape is required for BEV normalization")
-
+    def _encode_history(self, history, bev_grid_shape=None):
         history = self._pad_history(history)
         history = self._normalize_history(history, bev_grid_shape)
         last_velocity = history[:, -1, 2:]
@@ -151,11 +187,48 @@ class MambaMotionPredictor(nn.Module):
             sequence = sequence + self.temporal_embedding
         for block in self.blocks:
             sequence = block(sequence)
-        correction = self.delta_head(self.output_norm(sequence[:, -1]))
-        return last_velocity + correction
+        features = self.output_norm(sequence[:, -1])
+        return features, last_velocity
+
+    def _predict_distribution_from_features(self, features, last_velocity):
+        if self.joint_head is not None:
+            joint_output = self.joint_head(features)
+            mean = last_velocity + joint_output[:, :2]
+            raw = joint_output[:, 2:]
+        else:
+            mean = last_velocity + self.delta_head(features)
+            raw = None if self.evidence_head is None else self.evidence_head(features)
+
+        if raw is None:
+            return mean, None, None, None, None
+
+        kappa = F.softplus(raw[:, 0:1]) + 1e-4
+        nu = F.softplus(raw[:, 1:2]) + 3.0 + 1e-4
+        batch_size = raw.size(0)
+        scale_tril = raw.new_zeros((batch_size, 2, 2))
+        scale_tril[:, 0, 0] = F.softplus(raw[:, 2]) + 1e-4
+        scale_tril[:, 1, 0] = raw[:, 3]
+        scale_tril[:, 1, 1] = F.softplus(raw[:, 4]) + 1e-4
+        covariance = niw_predictive_covariance_2d(
+            kappa,
+            nu,
+            scale_tril,
+        )
+        return mean, covariance, kappa, nu, scale_tril
+
+    def predict_normalized_distribution(self, history, bev_grid_shape=None):
+        features, last_velocity = self._encode_history(history, bev_grid_shape)
+        return self._predict_distribution_from_features(features, last_velocity)
+
+    def predict_normalized_delta(self, history, bev_grid_shape=None):
+        mean, _, _, _, _ = self.predict_normalized_distribution(
+            history,
+            bev_grid_shape,
+        )
+        return mean
 
     @torch.no_grad()
-    def stateful_step(self, tokens, states=None, bev_grid_shape=None):
+    def _stateful_step(self, tokens, states=None, bev_grid_shape=None):
         """Consume one token per track and return its next displacement.
 
         ``states`` contains one cache per track. Each cache stores the
@@ -222,9 +295,17 @@ class MambaMotionPredictor(nn.Module):
             sequence = sequence + block.dropout(mamba_output)
             layer_states.append((conv_state, ssm_state))
 
-        correction = self.delta_head(self.output_norm(sequence[:, -1]))
-        normalized_delta = last_velocity + correction
+        features = self.output_norm(sequence[:, -1])
+        normalized_delta, normalized_covariance, _, _, _ = (
+            self._predict_distribution_from_features(features, last_velocity)
+        )
         delta = self._denormalize_delta(normalized_delta, bev_grid_shape)
+        covariance = None
+        if normalized_covariance is not None:
+            covariance = self._denormalize_covariance(
+                normalized_covariance,
+                bev_grid_shape,
+            )
 
         next_states = [[] for _ in range(batch_size)]
         for conv_state, ssm_state in layer_states:
@@ -236,16 +317,53 @@ class MambaMotionPredictor(nn.Module):
                     )
                 )
 
-        return delta.detach().cpu().numpy(), next_states
+        covariance_numpy = None
+        if covariance is not None:
+            covariance_numpy = covariance.detach().cpu().numpy()
+        return delta.detach().cpu().numpy(), covariance_numpy, next_states
+
+    def stateful_step(self, tokens, states=None, bev_grid_shape=None):
+        delta, _, next_states = self._stateful_step(
+            tokens,
+            states=states,
+            bev_grid_shape=bev_grid_shape,
+        )
+        return delta, next_states
+
+    def stateful_step_distribution(self, tokens, states=None, bev_grid_shape=None):
+        return self._stateful_step(
+            tokens,
+            states=states,
+            bev_grid_shape=bev_grid_shape,
+        )
 
     def forward(self, history, target_delta, bev_grid_shape=None):
-        prediction = self.predict_normalized_delta(history, bev_grid_shape)
+        prediction, _, kappa, nu, scale_tril = self.predict_normalized_distribution(
+            history,
+            bev_grid_shape,
+        )
         target = self._normalize_delta(target_delta, bev_grid_shape)
+        if self.loss_type == "niw":
+            loss, self.last_loss_stats = evidential_niw_loss_2d(
+                target,
+                prediction,
+                kappa,
+                nu,
+                scale_tril,
+                lambda_evi=self.evidential_lambda,
+            )
+            return loss
+
+        self.last_loss_stats = {}
         return F.smooth_l1_loss(prediction, target, beta=1)
 
     def generate(self, histories, bev_grid_shape=None):
+        delta, _ = self.generate_distribution(histories, bev_grid_shape)
+        return delta
+
+    def generate_distribution(self, histories, bev_grid_shape=None):
         if len(histories) == 0:
-            return np.empty((0, 2), dtype=np.float32)
+            return np.empty((0, 2), dtype=np.float32), None
 
         device = next(self.parameters()).device
         prepared = []
@@ -260,9 +378,16 @@ class MambaMotionPredictor(nn.Module):
             prepared.append(self._pad_history(history_tensor.unsqueeze(0)))
 
         history_batch = torch.cat(prepared, dim=0)
-        normalized_delta = self.predict_normalized_delta(
+        normalized_delta, normalized_covariance, _, _, _ = self.predict_normalized_distribution(
             history_batch,
             bev_grid_shape,
         )
         delta = self._denormalize_delta(normalized_delta, bev_grid_shape)
-        return delta.detach().cpu().numpy()
+        covariance_numpy = None
+        if normalized_covariance is not None:
+            covariance = self._denormalize_covariance(
+                normalized_covariance,
+                bev_grid_shape,
+            )
+            covariance_numpy = covariance.detach().cpu().numpy()
+        return delta.detach().cpu().numpy(), covariance_numpy
