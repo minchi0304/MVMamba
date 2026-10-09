@@ -273,6 +273,7 @@ if __name__ == '__main__':
     parser.add_argument('--motion_normalization',type=str, default='bev', choices=['bev', 'none'], help='Normalize learned-motion coordinates by BEV grid size or use raw grid coordinates.')
     parser.add_argument('--motion_history_len', type=int, default=5, help='Number of trajectory tokens used by learned motion models')
     parser.add_argument('--mamba_history_mode', type=str, default='window', choices=['window', 'stateful'], help='Use a fixed trajectory window or persistent per-track Mamba state')
+    parser.add_argument('--motion_history_source', type=str, default='detection', choices=['detection', 'motion_immediate', 'motion_warmup'], help='Use detection history, motion rollout from frame two, or a two-detection warmup before motion rollout')
     parser.add_argument('--mamba_d_model', type=int, default=64)
     parser.add_argument('--mamba_d_state', type=int, default=16)
     parser.add_argument('--mamba_d_conv', type=int, default=4)

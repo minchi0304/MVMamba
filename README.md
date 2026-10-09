@@ -63,6 +63,7 @@ The main tracking controls are:
 - `--motion_model`: `mamba` or `kalman` (`mamba` is the default)
 - `--motion_history_len`: number of `[x, y, dx, dy]` trajectory tokens (default: `5`)
 - `--mamba_history_mode`: `window` uses the fixed trajectory window; `stateful` keeps each track's Mamba convolution and SSM state across frames
+- `--motion_history_source`: `detection` keeps detection-corrected history, `motion_immediate` starts motion rollout after the first detection, and `motion_warmup` uses two detections before motion rollout
 - `--motion_normalization`: normalize coordinates and deltas by BEV width/height (`bev`) or keep raw grid units (`none`)
 - `--motion_loss`: `niw` predicts a correlated 2D offset distribution; `smooth_l1` keeps the deterministic baseline
 - `--evidential_lambda`: NIW evidence regularization coefficient (default: `1e-3`)

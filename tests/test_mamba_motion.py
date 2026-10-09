@@ -189,6 +189,70 @@ class MambaMotionPredictorTest(unittest.TestCase):
         self.assertAlmostEqual(row["cov_xy"], 1.0)
         self.assertAlmostEqual(row["cov_yy"], 9.0)
 
+    def test_motion_immediate_keeps_prediction_history_after_first_detection(self):
+        predictor = ConstantDeltaPredictor([5.0, -2.0])
+        tracker = Tracker(
+            high_cls_thres=0.4,
+            match_thresh=30.0,
+            motion_model="mamba",
+            motion_normalization="bev",
+            bev_grid_shape=(100, 200),
+            motion_predictor=predictor,
+            motion_history_len=5,
+            motion_history_source="motion_immediate",
+        )
+
+        tracker.update([[10.0, 20.0]], scores=[0.9])
+        tracks = tracker.update([[16.0, 19.0]], scores=[0.95])
+        np.testing.assert_allclose(tracks[0].xy, [16.0, 19.0])
+        np.testing.assert_allclose(tracks[0].conds[-1], [15.0, 18.0, 5.0, -2.0])
+
+        tracks = tracker.update([[20.0, 16.0]], scores=[0.95])
+        np.testing.assert_allclose(tracks[0].xy, [20.0, 16.0])
+        np.testing.assert_allclose(tracks[0].conds[-1], [20.0, 16.0, 5.0, -2.0])
+
+    def test_motion_warmup_uses_two_detections_before_prediction_history(self):
+        predictor = ConstantDeltaPredictor([5.0, -2.0])
+        tracker = Tracker(
+            high_cls_thres=0.4,
+            match_thresh=30.0,
+            motion_model="mamba",
+            motion_normalization="bev",
+            bev_grid_shape=(100, 200),
+            motion_predictor=predictor,
+            motion_history_len=5,
+            motion_history_source="motion_warmup",
+        )
+
+        tracker.update([[10.0, 20.0]], scores=[0.9])
+        tracks = tracker.update([[16.0, 19.0]], scores=[0.95])
+        np.testing.assert_allclose(tracks[0].conds[-1], [16.0, 19.0, 6.0, -1.0])
+
+        tracks = tracker.update([[22.0, 18.0]], scores=[0.95])
+        np.testing.assert_allclose(tracks[0].xy, [22.0, 18.0])
+        np.testing.assert_allclose(tracks[0].conds[-1], [21.0, 17.0, 5.0, -2.0])
+
+    def test_motion_warmup_restarts_after_missing_second_detection(self):
+        predictor = ConstantDeltaPredictor([5.0, -2.0])
+        tracker = Tracker(
+            high_cls_thres=0.4,
+            match_thresh=30.0,
+            motion_model="mamba",
+            motion_normalization="bev",
+            bev_grid_shape=(100, 200),
+            motion_predictor=predictor,
+            motion_history_len=5,
+            motion_history_source="motion_warmup",
+        )
+
+        tracker.update([[10.0, 20.0]], scores=[0.9])
+        tracker.update([], scores=[])
+        tracks = tracker.update([[21.0, 17.0]], scores=[0.95])
+
+        self.assertEqual(len(tracks), 1)
+        np.testing.assert_allclose(tracks[0].conds[-1], [21.0, 17.0, 0.0, 0.0])
+        self.assertEqual(tracks[0].motion_observation_count, 1)
+
     def test_stateful_step_carries_each_layer_cache_between_tokens(self):
         predictor = mamba_motion.MambaMotionPredictor(
             history_len=5,
@@ -238,6 +302,33 @@ class MambaMotionPredictorTest(unittest.TestCase):
         np.testing.assert_allclose(tracks[0].xy, [16.0, 19.0])
         np.testing.assert_allclose(predictor.seen_tokens[-1], [16.0, 19.0, 6.0, -1.0])
         self.assertEqual(tracks[0].mamba_state, 2)
+
+    def test_stateful_motion_modes_commit_the_selected_history_token(self):
+        for history_source, expected_second_token in (
+            ("motion_immediate", [15.0, 18.0, 5.0, -2.0]),
+            ("motion_warmup", [16.0, 19.0, 6.0, -1.0]),
+        ):
+            with self.subTest(history_source=history_source):
+                predictor = ConstantStatefulPredictor([5.0, -2.0])
+                tracker = Tracker(
+                    high_cls_thres=0.4,
+                    match_thresh=30.0,
+                    motion_model="mamba",
+                    motion_normalization="bev",
+                    bev_grid_shape=(100, 200),
+                    motion_predictor=predictor,
+                    motion_history_len=5,
+                    mamba_history_mode="stateful",
+                    motion_history_source=history_source,
+                )
+
+                tracker.update([[10.0, 20.0]], scores=[0.9])
+                tracker.update([[16.0, 19.0]], scores=[0.95])
+
+                np.testing.assert_allclose(
+                    predictor.seen_tokens[-1],
+                    expected_second_token,
+                )
 
 
 if __name__ == "__main__":

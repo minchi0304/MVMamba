@@ -44,6 +44,9 @@ class STrack:
         self.motion_delta = None
         self.motion_covariance = None
         self.motion_prediction_xy = None
+        self.motion_prediction_pending = False
+        self.motion_observation_count = 0
+        self.last_observed_xy = None
 
     @classmethod
     def next_id(cls):
@@ -72,6 +75,8 @@ class STrack:
             )
         else:
             self.conds.append(np.concatenate((self._xy.copy(), np.zeros(2, dtype=np.float32))))
+            self.motion_observation_count = 1
+            self.last_observed_xy = self._xy.copy()
         self.tracklet_len = 0
         self.state = TrackState.Tracked
         if frame_id == 1:
@@ -79,7 +84,14 @@ class STrack:
         self.frame_id = frame_id
         self.start_frame = frame_id
 
-    def re_activate(self, new_track, frame_id, new_id=False, motion_model="kalman"):
+    def re_activate(
+        self,
+        new_track,
+        frame_id,
+        new_id=False,
+        motion_model="kalman",
+        motion_history_source="detection",
+    ):
         if motion_model == "kalman":
             self.mean, self.covariance = self.kalman_filter.update(
                 self.mean,
@@ -87,7 +99,10 @@ class STrack:
                 new_track.to_xy(),
             )
         else:
-            self._update_motion_history(new_track.to_xy())
+            self._update_motion_history(
+                new_track.to_xy(),
+                motion_history_source,
+            )
         self.tracklet_len = 0
         self.state = TrackState.Tracked
         self.is_activated = True
@@ -121,7 +136,13 @@ class STrack:
             stracks[idx].mean = mean
             stracks[idx].covariance = covariance
 
-    def update(self, new_track, frame_id, motion_model="kalman"):
+    def update(
+        self,
+        new_track,
+        frame_id,
+        motion_model="kalman",
+        motion_history_source="detection",
+    ):
         self.frame_id = frame_id
         self.tracklet_len += 1
 
@@ -132,27 +153,67 @@ class STrack:
                 new_track.to_xy(),
             )
         else:
-            self._update_motion_history(new_track.to_xy())
+            self._update_motion_history(
+                new_track.to_xy(),
+                motion_history_source,
+            )
 
         self.score = new_track.score
         self.state = TrackState.Tracked
         self.is_activated = True
 
-    def _update_motion_history(self, observed_xy):
+    def _update_motion_history(self, observed_xy, motion_history_source):
         observed_xy = np.asarray(observed_xy, dtype=np.float32).reshape(2)
-        if self.conds:
-            if len(self.conds) > 1:
+        use_observation = (
+            motion_history_source == "detection"
+            or (
+                motion_history_source == "motion_warmup"
+                and self.motion_observation_count < 2
+            )
+            or not self.motion_prediction_pending
+        )
+        if use_observation:
+            if (
+                motion_history_source == "motion_warmup"
+                and self.motion_observation_count == 0
+            ):
+                previous_xy = observed_xy
+            elif self.motion_prediction_pending and len(self.conds) > 1:
                 previous_xy = np.asarray(self.conds[-2][:2], dtype=np.float32)
+            elif self.last_observed_xy is not None:
+                previous_xy = self.last_observed_xy
             else:
-                previous_xy = np.asarray(self.conds[-1][:2], dtype=np.float32)
+                previous_xy = observed_xy
             condition = np.concatenate((observed_xy, observed_xy - previous_xy))
-            self.conds[-1] = condition
-        else:
-            self.conds.append(np.concatenate((observed_xy, np.zeros(2, dtype=np.float32))))
+            if self.motion_prediction_pending and self.conds:
+                self.conds[-1] = condition
+            else:
+                self.conds.append(condition)
+
         self._xy = observed_xy
+        self.last_observed_xy = observed_xy.copy()
+        self.motion_observation_count += 1
+        self.motion_prediction_pending = False
+
+    def motion_anchor(self, motion_history_source):
+        use_motion_position = (
+            motion_history_source == "motion_immediate"
+            or (
+                motion_history_source == "motion_warmup"
+                and self.motion_observation_count >= 2
+            )
+        )
+        if use_motion_position and self.conds:
+            return np.asarray(self.conds[-1][:2], dtype=np.float32).copy()
+        return self.xy
 
     @staticmethod
-    def multi_predict_mamba(stracks, model, bev_grid_shape):
+    def multi_predict_mamba(
+        stracks,
+        model,
+        bev_grid_shape,
+        motion_history_source="detection",
+    ):
         if len(stracks) == 0:
             return
 
@@ -171,7 +232,7 @@ class STrack:
                 covariance = None
 
         for row_index, (track, delta) in enumerate(zip(stracks, motion)):
-            previous_xy = track.xy
+            previous_xy = track.motion_anchor(motion_history_source)
             predicted_xy = previous_xy + np.asarray(delta, dtype=np.float32)
             track.motion_delta = np.asarray(delta, dtype=np.float32)
             track.motion_prediction_xy = predicted_xy.copy()
@@ -184,6 +245,7 @@ class STrack:
             track.conds.append(
                 np.concatenate((predicted_xy, predicted_xy - previous_xy))
             )
+            track.motion_prediction_pending = True
 
     @staticmethod
     def commit_mamba_state(stracks, model, bev_grid_shape):
@@ -217,7 +279,12 @@ class STrack:
             )
 
     @staticmethod
-    def multi_predict_mamba_stateful(stracks, model, bev_grid_shape):
+    def multi_predict_mamba_stateful(
+        stracks,
+        model,
+        bev_grid_shape,
+        motion_history_source="detection",
+    ):
         if len(stracks) == 0:
             return
 
@@ -228,7 +295,7 @@ class STrack:
         STrack.commit_mamba_state(missing_state, model, bev_grid_shape)
 
         for track in stracks:
-            previous_xy = track.xy
+            previous_xy = track.motion_anchor(motion_history_source)
             predicted_xy = previous_xy + track.mamba_next_delta
             track.motion_delta = track.mamba_next_delta.copy()
             track.motion_prediction_xy = predicted_xy.copy()
@@ -241,6 +308,7 @@ class STrack:
             track.conds.append(
                 np.concatenate((track._xy, track._xy - previous_xy))
             )
+            track.motion_prediction_pending = True
 
     def mark_lost(self):
         self.state = TrackState.Lost
@@ -266,6 +334,7 @@ class Tracker:
         motion_predictor=None,
         motion_history_len=5,
         mamba_history_mode="window",
+        motion_history_source="detection",
     ):
         self.tracked_stracks: List[STrack] = []
         self.lost_stracks: List[STrack] = []
@@ -288,6 +357,7 @@ class Tracker:
         if mamba_history_mode not in ("window", "stateful"):
             raise ValueError("mamba_history_mode must be 'window' or 'stateful'")
         self.mamba_history_mode = mamba_history_mode
+        self.motion_history_source = motion_history_source
 
         self.kalman_filter = KalmanFilter() if motion_model == "kalman" else None
         self.motion_predictor = None
@@ -373,12 +443,14 @@ class Tracker:
                     strack_pool,
                     self.motion_predictor,
                     self.bev_grid_shape,
+                    self.motion_history_source,
                 )
             else:
                 STrack.multi_predict_mamba(
                     strack_pool,
                     self.motion_predictor,
                     self.bev_grid_shape,
+                    self.motion_history_source,
                 )
 
         predicted_tracks = list(strack_pool)
@@ -393,14 +465,31 @@ class Tracker:
 
         for track, det in matches:
             if track.state == TrackState.Tracked:
-                track.update(det, self.frame_id, motion_model=self.motion_model)
+                track.update(
+                    det,
+                    self.frame_id,
+                    motion_model=self.motion_model,
+                    motion_history_source=self.motion_history_source,
+                )
                 activated_stracks.append(track)
             else:
-                track.re_activate(det, self.frame_id, new_id=False, motion_model=self.motion_model)
+                track.re_activate(
+                    det,
+                    self.frame_id,
+                    new_id=False,
+                    motion_model=self.motion_model,
+                    motion_history_source=self.motion_history_source,
+                )
                 refind_stracks.append(track)
             stateful_commit_tracks.append(track)
 
         for track in unmatched_tracks:
+            if (
+                self.motion_history_source == "motion_warmup"
+                and track.motion_observation_count < 2
+            ):
+                track.motion_observation_count = 0
+                track.last_observed_xy = None
             if track.state != TrackState.Lost:
                 track.mark_lost()
                 lost_stracks.append(track)
@@ -414,7 +503,12 @@ class Tracker:
         detections = [detections[int(i)] for i in unmatched_detections_idx]
 
         for track, det in matches:
-            track.update(det, self.frame_id, motion_model=self.motion_model)
+            track.update(
+                det,
+                self.frame_id,
+                motion_model=self.motion_model,
+                motion_history_source=self.motion_history_source,
+            )
             activated_stracks.append(track)
             stateful_commit_tracks.append(track)
 
