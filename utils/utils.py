@@ -146,10 +146,21 @@ def get_offset_mean(bev_offset):
     return bev_offset[:, 0:2]
 
 
+def split_occupancy_params(bev_occupancy):
+    evidence = F.softplus(bev_occupancy) + 1.0
+    alpha = evidence[:, 0:1]
+    beta = evidence[:, 1:2]
+    return alpha, beta, alpha + beta
+
+
 def get_occupancy_prob(bev_occupancy):
-    if bev_occupancy.dim() != 4 or bev_occupancy.size(1) != 1:
-        raise ValueError("occupancy head output must be [B,1,H,W]")
-    return torch.sigmoid(bev_occupancy).clamp(1e-4, 1.0 - 1e-4)
+    alpha, _, evidence_sum = split_occupancy_params(bev_occupancy)
+    return alpha / evidence_sum
+
+
+def get_occupancy_uncertainty(bev_occupancy):
+    _, _, evidence_sum = split_occupancy_params(bev_occupancy)
+    return 2.0 / evidence_sum
 
 
 def synchronize_cuda():
@@ -216,8 +227,18 @@ def decode_frame(model, dataset, item, batch_idx, device, args):
         bev_occupancy, bev_offset = model(dataset, item['root'], data, item.get('proj_mats'))
 
         bev_center = get_occupancy_prob(bev_occupancy)
+        occupancy_uncertainty = get_occupancy_uncertainty(bev_occupancy)
         bev_offset_mean = get_offset_mean(bev_offset)
-        xy, scores = decoder(bev_center, bev_offset_mean, K=get_decode_topk(args))
+        xy, scores, inds = decoder(
+            bev_center,
+            bev_offset_mean,
+            K=get_decode_topk(args),
+            return_inds=True,
+        )
+        point_uncertainty_all = _transpose_and_gather_feat(
+            occupancy_uncertainty,
+            inds,
+        ).view(occupancy_uncertainty.size(0), -1)
 
     xy_all = xy[0]
     scores_all = scores[0]
@@ -226,8 +247,11 @@ def decode_frame(model, dataset, item, batch_idx, device, args):
 
     return {
         'bev_center': bev_center,
+        'occupancy_uncertainty': occupancy_uncertainty,
         'xy_all': xy_all,
         'scores_all': scores_all,
+        'uncertainty_all': point_uncertainty_all[0],
+        'uncertainty': point_uncertainty_all[0][score_keep],
         'xy': xy_all[score_keep],
         'scores': scores_all[score_keep],
         'eval_xy': xy_all[score_keep],
@@ -271,7 +295,6 @@ def build_tracker(args, dataset_config, tracker_device, motion_predictor=None):
         motion_predictor=motion_predictor,
         motion_history_len=int(args.motion_history_len),
         mamba_history_mode=getattr(args, 'mamba_history_mode', 'window'),
-        motion_history_source=getattr(args, 'motion_history_source', 'detection'),
     )
 
 

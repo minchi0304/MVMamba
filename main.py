@@ -20,7 +20,7 @@ from dataloader.dataloader import GetDataset, motion_joint_collate
 from dataloader.concat_dataset import ConcatDataset
 from utils.logger import Logger
 from utils import utils
-from utils.loss import CornerNetFocalLoss
+from utils.loss import EvidentialOccupancyLoss
 from detector.multiview_model import MultiView_Detection
 from detector.encoder import resnet18
 from tracker.mamba_motion_predictor import MambaMotionPredictor
@@ -95,7 +95,7 @@ def train(
         gt_occ = target['center_bev'].to(bev_center.device)
         gt_valid_bev = target['valid_bev'].to(bev_center.device)
 
-        occ_loss = criterion(bev_occupancy, gt_occ)
+        occ_loss = criterion(bev_occupancy, gt_valid_bev.float(), gt_occ)
 
         if args.use_offset:
             gt_offset = target['offset_bev'].to(bev_center.device)
@@ -273,7 +273,6 @@ if __name__ == '__main__':
     parser.add_argument('--motion_normalization',type=str, default='bev', choices=['bev', 'none'], help='Normalize learned-motion coordinates by BEV grid size or use raw grid coordinates.')
     parser.add_argument('--motion_history_len', type=int, default=5, help='Number of trajectory tokens used by learned motion models')
     parser.add_argument('--mamba_history_mode', type=str, default='window', choices=['window', 'stateful'], help='Use a fixed trajectory window or persistent per-track Mamba state')
-    parser.add_argument('--motion_history_source', type=str, default='detection', choices=['detection', 'motion_immediate', 'motion_warmup'], help='Use detection history, motion rollout from frame two, or a two-detection warmup before motion rollout')
     parser.add_argument('--mamba_d_model', type=int, default=64)
     parser.add_argument('--mamba_d_state', type=int, default=16)
     parser.add_argument('--mamba_d_conv', type=int, default=4)
@@ -306,7 +305,7 @@ if __name__ == '__main__':
     parser.add_argument('--optim', type=str, default='Adam', choices=['SGD', 'Adam'], help='Choose optimizer.(default : SGD)')
 
     args = parser.parse_args()
-    print('Occupancy loss: focal')
+    print('Occupancy loss: edl')
     print('Motion model: {}'.format(args.motion_model))
     print('Motion loss: {}'.format(args.motion_loss))
     print('Multi-task loss: {}'.format(args.multi_task_loss))
@@ -485,7 +484,14 @@ if __name__ == '__main__':
     )
     
     # Loss
-    criterion = CornerNetFocalLoss().to(device)
+    criterion = EvidentialOccupancyLoss().to(device)
+    print(
+        'Occupancy EDL lambda_reg: {}, gamma: {}, eta: {}'.format(
+            criterion.lambda_reg,
+            criterion.gamma,
+            criterion.eta,
+        )
+    )
     best_tracking_pred_path = os.path.join(logdir, 'mota_pred_best_tracking.txt')
     for epoch in tqdm.tqdm(range(1, args.epochs+1)):
         print('Training...')

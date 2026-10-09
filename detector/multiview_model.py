@@ -59,7 +59,7 @@ class MultiView_Detection(nn.Module):
                 nn.Conv2d(shared_out_channels, offset_out_channels, kernel_size=1, padding=0),
             ).to(self.device)
     
-        center_out_channels = 1
+        center_out_channels = 2
         self.instance_center_head = nn.Sequential(
             nn.Conv2d(shared_out_channels, shared_out_channels, kernel_size=3, padding=1, bias=False),
             nn.InstanceNorm2d(shared_out_channels),
@@ -71,7 +71,8 @@ class MultiView_Detection(nn.Module):
         ).to(self.device)
         
         with torch.no_grad():
-            self.instance_center_head[-1].bias.fill_(-2.19)
+            self.instance_center_head[-1].bias[0].fill_(-4.0)
+            self.instance_center_head[-1].bias[1].fill_(4.0)
     
 
     def forward(self, dataset, dataset_name, imgs, proj_mats=None):
