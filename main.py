@@ -126,12 +126,8 @@ def train(
                 total_loss = total_loss + torch.exp(-model.offset_weight) * offset_loss + model.offset_weight
                 task_weight_parts.append("offset {:.3f}".format(model.offset_weight.item()))
 
-            if has_motion_sample and args.motion_loss == 'niw':
-                total_loss = total_loss + motion_loss
-                task_weight_parts.append("motion fixed")
-            elif has_motion_sample:
+            if has_motion_sample:
                 total_loss = total_loss + torch.exp(-model.motion_weight) * motion_loss + model.motion_weight
-            if args.motion_model == 'mamba' and args.motion_loss == 'smooth_l1':
                 task_weight_parts.append("motion {:.3f}".format(model.motion_weight.item()))
 
             task_weight_text = ', weights: ' + ', '.join(task_weight_parts)
@@ -271,9 +267,9 @@ if __name__ == '__main__':
     parser.add_argument('--track_low_match_thresh', type=float, default=100, help='MVTrackTrans-style center-distance gate for unconfirmed tracks')
     parser.add_argument('--motion_model', type=str, default='mamba', choices=['kalman', 'mamba'], help='Motion prediction model used by the tracker')
     parser.add_argument('--motion_normalization',type=str, default='bev', choices=['bev', 'none'], help='Normalize learned-motion coordinates by BEV grid size or use raw grid coordinates.')
-    parser.add_argument('--motion_history_len', type=int, default=5, help='Number of trajectory tokens used by learned motion models')
+    parser.add_argument('--motion_history_len', type=int, default=10, help='Number of trajectory tokens used by learned motion models')
     parser.add_argument('--mamba_history_mode', type=str, default='window', choices=['window', 'stateful'], help='Use a fixed trajectory window or persistent per-track Mamba state')
-    parser.add_argument('--mamba_d_model', type=int, default=64)
+    parser.add_argument('--mamba_d_model', type=int, default=128)
     parser.add_argument('--mamba_d_state', type=int, default=16)
     parser.add_argument('--mamba_d_conv', type=int, default=4)
     parser.add_argument('--mamba_expand', type=int, default=2)
@@ -427,7 +423,7 @@ if __name__ == '__main__':
         multi_task_loss=args.multi_task_loss,
         view_pool=args.view_pool,
         use_offset=args.use_offset,
-        use_motion_loss=args.motion_model == 'mamba' and args.motion_loss == 'smooth_l1',
+        use_motion_loss=args.motion_model == 'mamba',
     )
     if args.motion_model == 'mamba':
         model.motion_predictor = MambaMotionPredictor(

@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 
 class EvidentialOccupancyLoss(nn.Module):
-    def __init__(self, lambda_reg=1e-4, gamma=3.0, eta=4.0):
+    def __init__(self, lambda_reg=1e-4, gamma=2.0, eta=4.0):
         super().__init__()
         self.lambda_reg = float(lambda_reg)
         self.gamma = float(gamma)
