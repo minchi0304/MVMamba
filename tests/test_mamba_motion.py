@@ -181,6 +181,34 @@ class MambaMotionPredictorTest(unittest.TestCase):
             + predictor.motion_input_projection(history[:, 1, 5:8]),
         )
 
+    def test_full_separate_projection_routes_complete_source_tokens(self):
+        predictor = mamba_motion.MambaMotionPredictor(
+            history_len=2,
+            d_model=8,
+            num_layers=1,
+            motion_normalization="bev",
+            uncertainty_mode="separate_full",
+        )
+        history = torch.tensor([[
+            [100.0, 200.0, 5.0, -2.0, 0.2, 0.0, 0.0, 0.0, 1.0, 0.0],
+            [105.0, 198.0, 5.0, -2.0, 0.0, 4.0, 9.0, 1.0, 0.0, 1.0],
+        ]])
+
+        projected = predictor._project_history(history)
+        detection_input = history[:, 0, [0, 1, 2, 3, 4]]
+        motion_input = history[:, 1, [0, 1, 2, 3, 5, 6, 7]]
+
+        self.assertEqual(predictor.detection_input_projection.in_features, 5)
+        self.assertEqual(predictor.motion_input_projection.in_features, 7)
+        torch.testing.assert_close(
+            projected[:, 0],
+            predictor.detection_input_projection(detection_input),
+        )
+        torch.testing.assert_close(
+            projected[:, 1],
+            predictor.motion_input_projection(motion_input),
+        )
+
     def test_unified_implicit_generate_accepts_mixed_history(self):
         predictor = mamba_motion.MambaMotionPredictor(
             history_len=2,

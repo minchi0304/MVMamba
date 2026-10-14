@@ -68,7 +68,7 @@ The main tracking controls are:
 - `--motion_model`: `mamba` or `kalman` (`mamba` is the default)
 - `--motion_history_len`: number of trajectory tokens (default: `10`)
 - `--mamba_history_mode`: `window` uses the fixed trajectory window; `stateful` keeps each track's Mamba convolution and SSM state across frames
-- `--mamba_uncertainty_mode`: `none` uses `[x, y, dx, dy]`; `unified` projects kinematics, source masks, detection uncertainty, and motion covariance together; `separate` uses source-specific detection and motion projections
+- `--mamba_uncertainty_mode`: `none` uses `[x, y, dx, dy]`; `unified` projects kinematics, source masks, detection uncertainty, and motion covariance together; `separate` adds source-specific uncertainty projections to a shared kinematic projection; `separate_full` independently projects the full detection and motion tokens
 - `--motion_normalization`: normalize coordinates and deltas by BEV width/height (`bev`) or keep raw grid units (`none`)
 - `--motion_loss`: `niw` predicts a correlated 2D offset distribution; `smooth_l1` keeps the deterministic baseline
 - `--evidential_lambda`: NIW evidence regularization coefficient (default: `1e-3`)
@@ -100,6 +100,11 @@ projections therefore start from zero so that a checkpoint is not perturbed by
 untrained uncertainty weights. Training the uncertainty response itself
 requires detector/motion-derived historical tokens rather than the current
 GT-only motion histories.
+
+In `separate_full`, detection tokens use a `5 -> d_model` projection over
+`[x, y, dx, dy, u_det]`, while motion tokens use a separate `7 -> d_model`
+projection over `[x, y, dx, dy, cov_xx, cov_yy, cov_xy]`. The source masks
+select exactly one projection for each time step.
 
 For persistent recurrent inference, add `--mamba_history_mode stateful`. In this mode, `--motion_history_len` still controls the training sample length, while tracking inference carries the Mamba state forward without truncating it to that window.
 

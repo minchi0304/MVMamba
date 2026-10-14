@@ -79,6 +79,10 @@ class MambaMotionPredictor(nn.Module):
             self.uncertainty_input_projection = None
             self.detection_input_projection = nn.Linear(1, d_model, bias=False)
             self.motion_input_projection = nn.Linear(3, d_model, bias=False)
+        elif self.uncertainty_mode == "separate_full":
+            self.uncertainty_input_projection = None
+            self.detection_input_projection = nn.Linear(5, d_model)
+            self.motion_input_projection = nn.Linear(7, d_model)
         else:
             self.uncertainty_input_projection = None
             self.detection_input_projection = None
@@ -141,10 +145,21 @@ class MambaMotionPredictor(nn.Module):
             )
         if self.uncertainty_input_projection is not None:
             nn.init.zeros_(self.uncertainty_input_projection.weight)
-        if self.detection_input_projection is not None:
+        if self.uncertainty_mode == "separate":
             nn.init.zeros_(self.detection_input_projection.weight)
-        if self.motion_input_projection is not None:
             nn.init.zeros_(self.motion_input_projection.weight)
+        if self.uncertainty_mode == "separate_full":
+            with torch.no_grad():
+                self.detection_input_projection.weight[:, :4].copy_(
+                    self.input_projection.weight
+                )
+                self.detection_input_projection.weight[:, 4:].zero_()
+                self.detection_input_projection.bias.copy_(self.input_projection.bias)
+                self.motion_input_projection.weight[:, :4].copy_(
+                    self.input_projection.weight
+                )
+                self.motion_input_projection.weight[:, 4:].zero_()
+                self.motion_input_projection.bias.copy_(self.input_projection.bias)
 
     @staticmethod
     def _coordinate_scale(bev_grid_shape, reference):
@@ -197,6 +212,15 @@ class MambaMotionPredictor(nn.Module):
             return projected
         if self.uncertainty_mode == "unified":
             return projected + self.uncertainty_input_projection(history[..., 4:])
+        if self.uncertainty_mode == "separate_full":
+            detection_input = torch.cat((kinematics, history[..., 4:5]), dim=-1)
+            motion_input = torch.cat((kinematics, history[..., 5:8]), dim=-1)
+            detection_features = self.detection_input_projection(detection_input)
+            motion_features = self.motion_input_projection(motion_input)
+            return (
+                history[..., 8:9] * detection_features
+                + history[..., 9:10] * motion_features
+            )
 
         detection_features = self.detection_input_projection(history[..., 4:5])
         motion_features = self.motion_input_projection(history[..., 5:8])
