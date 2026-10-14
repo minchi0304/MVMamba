@@ -37,7 +37,8 @@ python main.py \
   --data_root <DATA_ROOT> \
   --motion_model mamba \
   --motion_loss niw \
-  --evidential_head separate
+  --evidential_head separate \
+  --mamba_uncertainty_mode unified
 ```
 
 Replace `wildtrack` with `multiviewx`, `citytrack`, `mvcrowdtrack`, or `gmvd_train` as needed.
@@ -65,8 +66,9 @@ The main tracking controls are:
 
 - `--high_cls_thres`: confidence threshold for high-confidence detections
 - `--motion_model`: `mamba` or `kalman` (`mamba` is the default)
-- `--motion_history_len`: number of `[x, y, dx, dy]` trajectory tokens (default: `5`)
+- `--motion_history_len`: number of trajectory tokens (default: `10`)
 - `--mamba_history_mode`: `window` uses the fixed trajectory window; `stateful` keeps each track's Mamba convolution and SSM state across frames
+- `--mamba_uncertainty_mode`: `none` uses `[x, y, dx, dy]`; `unified` projects kinematics, source masks, detection uncertainty, and motion covariance together; `separate` uses source-specific detection and motion projections
 - `--motion_normalization`: normalize coordinates and deltas by BEV width/height (`bev`) or keep raw grid units (`none`)
 - `--motion_loss`: `niw` predicts a correlated 2D offset distribution; `smooth_l1` keeps the deterministic baseline
 - `--evidential_lambda`: NIW evidence regularization coefficient (default: `1e-3`)
@@ -82,6 +84,22 @@ units and recorded without changing association. Per-epoch values are written to
 is copied to `motion_uncertainty_best_tracking.csv`. The CSV contains the predicted
 position, mean displacement, full symmetric 2D covariance, and whether the motion
 prediction matched a detection.
+
+The implicit uncertainty token is
+`[x, y, dx, dy, u_det, cov_xx, cov_yy, cov_xy, is_det, is_motion]`.
+A matched detection stores its Beta occupancy uncertainty and zero motion
+covariance. A frame without a matched detection stores the predicted NIW
+covariance and zero detection uncertainty. Covariance is normalized by the
+squared BEV axis scales before entering Mamba. Short histories retain the
+existing padding rule: the first state and source fields are repeated at the
+front, while only the repeated `dx, dy` values are set to zero.
+
+The current GT motion samples contain only kinematics. They are converted to
+detection-source tokens with zero uncertainty during training. The uncertainty
+projections therefore start from zero so that a checkpoint is not perturbed by
+untrained uncertainty weights. Training the uncertainty response itself
+requires detector/motion-derived historical tokens rather than the current
+GT-only motion histories.
 
 For persistent recurrent inference, add `--mamba_history_mode stateful`. In this mode, `--motion_history_len` still controls the training sample length, while tracking inference carries the Mamba state forward without truncating it to that window.
 

@@ -114,6 +114,90 @@ class MambaMotionPredictorTest(unittest.TestCase):
 
         self.assertAlmostEqual(float(loss.item()), 0.0, places=7)
 
+    def test_implicit_padding_repeats_first_source_and_only_zeros_velocity(self):
+        predictor = mamba_motion.MambaMotionPredictor(
+            history_len=3,
+            d_model=8,
+            num_layers=1,
+            motion_normalization="bev",
+            uncertainty_mode="unified",
+        )
+        history = torch.tensor([[[
+            100.0, 200.0, 5.0, -2.0,
+            0.25, 0.0, 0.0, 0.0, 1.0, 0.0,
+        ]]])
+
+        padded = predictor._pad_history(history)
+
+        self.assertEqual(tuple(padded.shape), (1, 3, 10))
+        torch.testing.assert_close(padded[0, 0, :2], history[0, 0, :2])
+        torch.testing.assert_close(padded[0, 0, 2:4], torch.zeros(2))
+        torch.testing.assert_close(padded[0, 0, 4:], history[0, 0, 4:])
+
+    def test_implicit_covariance_is_normalized_by_bev_axis_scales(self):
+        predictor = mamba_motion.MambaMotionPredictor(
+            history_len=1,
+            d_model=8,
+            num_layers=1,
+            motion_normalization="bev",
+            uncertainty_mode="unified",
+        )
+        history = torch.tensor([[[
+            100.0, 50.0, 20.0, 10.0,
+            0.0, 400.0, 100.0, 20.0, 0.0, 1.0,
+        ]]])
+
+        normalized = predictor._normalize_history(history, (100, 200))
+
+        torch.testing.assert_close(
+            normalized[0, 0],
+            torch.tensor([0.5, 0.5, 0.1, 0.1, 0.0, 0.01, 0.01, 0.001, 0.0, 1.0]),
+        )
+
+    def test_separate_implicit_projection_routes_tokens_by_source(self):
+        predictor = mamba_motion.MambaMotionPredictor(
+            history_len=2,
+            d_model=8,
+            num_layers=1,
+            motion_normalization="bev",
+            uncertainty_mode="separate",
+        )
+        history = torch.tensor([[
+            [100.0, 200.0, 5.0, -2.0, 0.2, 0.0, 0.0, 0.0, 1.0, 0.0],
+            [105.0, 198.0, 5.0, -2.0, 0.0, 4.0, 9.0, 1.0, 0.0, 1.0],
+        ]])
+
+        projected = predictor._project_history(history)
+
+        self.assertEqual(tuple(projected.shape), (1, 2, 8))
+        torch.testing.assert_close(
+            projected[:, 0],
+            predictor.input_projection(history[:, 0, :4])
+            + predictor.detection_input_projection(history[:, 0, 4:5]),
+        )
+        torch.testing.assert_close(
+            projected[:, 1],
+            predictor.input_projection(history[:, 1, :4])
+            + predictor.motion_input_projection(history[:, 1, 5:8]),
+        )
+
+    def test_unified_implicit_generate_accepts_mixed_history(self):
+        predictor = mamba_motion.MambaMotionPredictor(
+            history_len=2,
+            d_model=8,
+            num_layers=1,
+            motion_normalization="bev",
+            uncertainty_mode="unified",
+        )
+        history = np.asarray([
+            [100.0, 200.0, 5.0, -2.0, 0.2, 0.0, 0.0, 0.0, 1.0, 0.0],
+            [105.0, 198.0, 6.0, -1.0, 0.0, 4.0, 9.0, 1.0, 0.0, 1.0],
+        ], dtype=np.float32)
+
+        prediction = predictor.generate([history], bev_grid_shape=(1000, 2000))
+
+        np.testing.assert_allclose(prediction[0], [6.0, -1.0], atol=1e-5)
+
     def _check_niw_head(self, head_type):
         predictor = mamba_motion.MambaMotionPredictor(
             history_len=2,
@@ -189,6 +273,49 @@ class MambaMotionPredictorTest(unittest.TestCase):
         self.assertAlmostEqual(row["cov_xy"], 1.0)
         self.assertAlmostEqual(row["cov_yy"], 9.0)
 
+    def test_implicit_tracker_uses_detection_uncertainty_and_motion_covariance(self):
+        predictor = ConstantDistributionPredictor(
+            [5.0, -2.0],
+            [[4.0, 1.0], [1.0, 9.0]],
+        )
+        tracker = Tracker(
+            high_cls_thres=0.4,
+            match_thresh=30.0,
+            motion_model="mamba",
+            motion_normalization="bev",
+            bev_grid_shape=(100, 200),
+            motion_predictor=predictor,
+            motion_history_len=5,
+            mamba_uncertainty_mode="unified",
+        )
+
+        tracks = tracker.update(
+            [[10.0, 20.0]],
+            scores=[0.9],
+            uncertainties=[0.25],
+        )
+        np.testing.assert_allclose(
+            tracks[0].conds[-1],
+            [10.0, 20.0, 0.0, 0.0, 0.25, 0.0, 0.0, 0.0, 1.0, 0.0],
+        )
+
+        tracks = tracker.update(
+            [[16.0, 19.0]],
+            scores=[0.95],
+            uncertainties=[0.4],
+        )
+        np.testing.assert_allclose(
+            tracks[0].conds[-1],
+            [16.0, 19.0, 6.0, -1.0, 0.4, 0.0, 0.0, 0.0, 1.0, 0.0],
+        )
+
+        tracker.update([], scores=[], uncertainties=[])
+        motion_token = tracker.lost_stracks[0].conds[-1]
+        np.testing.assert_allclose(
+            motion_token,
+            [21.0, 17.0, 5.0, -2.0, 0.0, 4.0, 9.0, 1.0, 0.0, 1.0],
+        )
+
     def test_stateful_step_carries_each_layer_cache_between_tokens(self):
         predictor = mamba_motion.MambaMotionPredictor(
             history_len=5,
@@ -215,6 +342,28 @@ class MambaMotionPredictorTest(unittest.TestCase):
         self.assertEqual(len(states[0]), 2)
         self.assertTrue(torch.all(states[0][0][0] == 2.0))
         self.assertTrue(torch.all(states[0][1][1] == 2.0))
+
+    def test_stateful_step_accepts_implicit_motion_token(self):
+        predictor = mamba_motion.MambaMotionPredictor(
+            history_len=5,
+            d_model=8,
+            num_layers=1,
+            motion_normalization="bev",
+            history_mode="stateful",
+            uncertainty_mode="unified",
+        )
+        token = [[
+            105.0, 198.0, 6.0, -1.0,
+            0.0, 4.0, 9.0, 1.0, 0.0, 1.0,
+        ]]
+
+        delta, states = predictor.stateful_step(
+            token,
+            bev_grid_shape=(1000, 2000),
+        )
+
+        np.testing.assert_allclose(delta[0], [6.0, -1.0], atol=1e-5)
+        self.assertEqual(len(states[0]), 1)
 
     def test_stateful_tracker_commits_detection_corrected_token(self):
         predictor = ConstantStatefulPredictor([5.0, -2.0])

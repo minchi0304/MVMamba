@@ -295,6 +295,7 @@ def build_tracker(args, dataset_config, tracker_device, motion_predictor=None):
         motion_predictor=motion_predictor,
         motion_history_len=int(args.motion_history_len),
         mamba_history_mode=getattr(args, 'mamba_history_mode', 'window'),
+        mamba_uncertainty_mode=getattr(args, 'mamba_uncertainty_mode', 'none'),
     )
 
 
@@ -351,6 +352,7 @@ def update_tracking_for_frame(
     tracks = tracker.update(
         xy_track_world.detach().cpu().numpy(),
         decoded['scores_all'].squeeze(-1).detach().cpu().numpy(),
+        uncertainties=decoded['uncertainty_all'].detach().cpu().numpy(),
         frame_id=frame_id,
     )
 

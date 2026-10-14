@@ -24,9 +24,13 @@ class STrack:
         score,
         buffer_size=30,
         motion_history_len=5,
+        detection_uncertainty=0.0,
+        mamba_uncertainty_mode="none",
     ):
         self._xy = np.asarray(xy, dtype=np.float32).reshape(2)
         self.score = float(score)
+        self.detection_uncertainty = float(detection_uncertainty)
+        self.mamba_uncertainty_mode = mamba_uncertainty_mode
         self.buffer_size = buffer_size
         self.tracklet_len = 0
         self.track_id = 0
@@ -45,6 +49,42 @@ class STrack:
         self.motion_covariance = None
         self.motion_prediction_xy = None
         self.motion_prediction_pending = False
+
+    def _detection_condition(self, observed_xy, delta):
+        kinematics = np.concatenate((observed_xy, delta)).astype(np.float32)
+        if self.mamba_uncertainty_mode == "none":
+            return kinematics
+        return np.concatenate((
+            kinematics,
+            np.asarray([
+                self.detection_uncertainty,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+            ], dtype=np.float32),
+        ))
+
+    def _motion_condition(self, predicted_xy, delta):
+        kinematics = np.concatenate((predicted_xy, delta)).astype(np.float32)
+        if self.mamba_uncertainty_mode == "none":
+            return kinematics
+        covariance = self.motion_covariance
+        if covariance is None:
+            covariance_values = np.zeros(3, dtype=np.float32)
+        else:
+            covariance_values = np.asarray([
+                covariance[0, 0],
+                covariance[1, 1],
+                covariance[0, 1],
+            ], dtype=np.float32)
+        return np.concatenate((
+            kinematics,
+            np.asarray([0.0], dtype=np.float32),
+            covariance_values,
+            np.asarray([0.0, 1.0], dtype=np.float32),
+        ))
 
     @classmethod
     def next_id(cls):
@@ -72,7 +112,10 @@ class STrack:
                 self.to_xy(),
             )
         else:
-            self.conds.append(np.concatenate((self._xy.copy(), np.zeros(2, dtype=np.float32))))
+            self.conds.append(self._detection_condition(
+                self._xy.copy(),
+                np.zeros(2, dtype=np.float32),
+            ))
         self.tracklet_len = 0
         self.state = TrackState.Tracked
         if frame_id == 1:
@@ -81,6 +124,7 @@ class STrack:
         self.start_frame = frame_id
 
     def re_activate(self, new_track, frame_id, new_id=False, motion_model="kalman"):
+        self.detection_uncertainty = new_track.detection_uncertainty
         if motion_model == "kalman":
             self.mean, self.covariance = self.kalman_filter.update(
                 self.mean,
@@ -125,6 +169,7 @@ class STrack:
     def update(self, new_track, frame_id, motion_model="kalman"):
         self.frame_id = frame_id
         self.tracklet_len += 1
+        self.detection_uncertainty = new_track.detection_uncertainty
 
         if motion_model == "kalman":
             self.mean, self.covariance = self.kalman_filter.update(
@@ -147,7 +192,7 @@ class STrack:
             previous_xy = np.asarray(self.conds[-1][:2], dtype=np.float32)
         else:
             previous_xy = observed_xy
-        condition = np.concatenate((observed_xy, observed_xy - previous_xy))
+        condition = self._detection_condition(observed_xy, observed_xy - previous_xy)
         if self.motion_prediction_pending and self.conds:
             self.conds[-1] = condition
         else:
@@ -185,9 +230,10 @@ class STrack:
                 else np.asarray(covariance[row_index], dtype=np.float32)
             )
             track._xy = predicted_xy
-            track.conds.append(
-                np.concatenate((predicted_xy, predicted_xy - previous_xy))
-            )
+            track.conds.append(track._motion_condition(
+                predicted_xy,
+                predicted_xy - previous_xy,
+            ))
             track.motion_prediction_pending = True
 
     @staticmethod
@@ -243,9 +289,10 @@ class STrack:
                 else track.mamba_next_covariance.copy()
             )
             track._xy = predicted_xy.astype(np.float32)
-            track.conds.append(
-                np.concatenate((track._xy, track._xy - previous_xy))
-            )
+            track.conds.append(track._motion_condition(
+                track._xy,
+                track._xy - previous_xy,
+            ))
             track.motion_prediction_pending = True
 
     def mark_lost(self):
@@ -272,6 +319,7 @@ class Tracker:
         motion_predictor=None,
         motion_history_len=5,
         mamba_history_mode="window",
+        mamba_uncertainty_mode="none",
     ):
         self.tracked_stracks: List[STrack] = []
         self.lost_stracks: List[STrack] = []
@@ -294,6 +342,7 @@ class Tracker:
         if mamba_history_mode not in ("window", "stateful"):
             raise ValueError("mamba_history_mode must be 'window' or 'stateful'")
         self.mamba_history_mode = mamba_history_mode
+        self.mamba_uncertainty_mode = mamba_uncertainty_mode
 
         self.kalman_filter = KalmanFilter() if motion_model == "kalman" else None
         self.motion_predictor = None
@@ -307,15 +356,17 @@ class Tracker:
             self.motion_predictor.to(device or "cpu")
             self.motion_predictor.eval()
 
-    def _make_detections(self, dets, scores):
+    def _make_detections(self, dets, scores, uncertainties):
         return [
             STrack(
                 xy,
                 score,
                 self.max_time_lost,
                 motion_history_len=self.motion_history_len,
+                detection_uncertainty=uncertainty,
+                mamba_uncertainty_mode=self.mamba_uncertainty_mode,
             )
-            for xy, score in zip(dets, scores)
+            for xy, score, uncertainty in zip(dets, scores, uncertainties)
         ]
 
     @staticmethod
@@ -333,6 +384,7 @@ class Tracker:
         self,
         dets,
         scores=None,
+        uncertainties=None,
         frame_id=None,
         **_,
     ):
@@ -345,14 +397,19 @@ class Tracker:
 
         scores = np.asarray(scores, dtype=np.float32).reshape(-1)
 
-        if len(dets) != len(scores):
-            raise ValueError("dets and scores must have the same length")
+        if uncertainties is None:
+            uncertainties = np.zeros((len(dets),), dtype=np.float32)
+        uncertainties = np.asarray(uncertainties, dtype=np.float32).reshape(-1)
+
+        if len(dets) != len(scores) or len(dets) != len(uncertainties):
+            raise ValueError("dets, scores, and uncertainties must have the same length")
 
         candidate_indices = np.where(scores > self.low_det_thresh)[0]
 
         detections = self._make_detections(
             dets[candidate_indices],
             scores[candidate_indices],
+            uncertainties[candidate_indices],
         )
 
         activated_stracks = []

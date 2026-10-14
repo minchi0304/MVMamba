@@ -36,10 +36,12 @@ class ResidualMambaBlock(nn.Module):
 class MambaMotionPredictor(nn.Module):
     """Predict the next forward BEV displacement from a track history.
 
-    Each history token is ``[x, y, dx, dy]``. Coordinates and displacements are
-    normalized by ``[BEV width, BEV height]`` inside this module. The prediction
-    returned by :meth:`generate` is converted back to world-grid units so the
-    tracker can update its state as ``previous_xy + predicted_delta``.
+    The baseline history token is ``[x, y, dx, dy]``. Implicit uncertainty
+    modes use ``[x, y, dx, dy, u_det, cov_xx, cov_yy, cov_xy, is_det,
+    is_motion]``. Coordinates, displacements, and covariance are normalized by
+    the BEV size inside this module. The prediction returned by :meth:`generate`
+    is converted back to world-grid units so the tracker can update its state as
+    ``previous_xy + predicted_delta``.
     """
 
     def __init__(
@@ -56,6 +58,7 @@ class MambaMotionPredictor(nn.Module):
         loss_type="smooth_l1",
         evidential_lambda=1e-3,
         evidential_head="separate",
+        uncertainty_mode="none",
     ):
         super().__init__()
 
@@ -65,8 +68,21 @@ class MambaMotionPredictor(nn.Module):
         self.loss_type = loss_type
         self.evidential_lambda = float(evidential_lambda)
         self.evidential_head_type = evidential_head
+        self.uncertainty_mode = uncertainty_mode
         self.last_loss_stats = {}
         self.input_projection = nn.Linear(4, d_model)
+        if self.uncertainty_mode == "unified":
+            self.uncertainty_input_projection = nn.Linear(6, d_model, bias=False)
+            self.detection_input_projection = None
+            self.motion_input_projection = None
+        elif self.uncertainty_mode == "separate":
+            self.uncertainty_input_projection = None
+            self.detection_input_projection = nn.Linear(1, d_model, bias=False)
+            self.motion_input_projection = nn.Linear(3, d_model, bias=False)
+        else:
+            self.uncertainty_input_projection = None
+            self.detection_input_projection = None
+            self.motion_input_projection = None
         self.temporal_embedding = nn.Parameter(
             torch.zeros(1, self.history_len, d_model)
         )
@@ -123,6 +139,12 @@ class MambaMotionPredictor(nn.Module):
             self.joint_head[-1].bias.data[2:].copy_(
                 torch.tensor([0.5413, 0.5413, -4.6002, 0.0, -4.6002])
             )
+        if self.uncertainty_input_projection is not None:
+            nn.init.zeros_(self.uncertainty_input_projection.weight)
+        if self.detection_input_projection is not None:
+            nn.init.zeros_(self.detection_input_projection.weight)
+        if self.motion_input_projection is not None:
+            nn.init.zeros_(self.motion_input_projection.weight)
 
     @staticmethod
     def _coordinate_scale(bev_grid_shape, reference):
@@ -149,8 +171,40 @@ class MambaMotionPredictor(nn.Module):
             scale = scale.unsqueeze(1)
         history = history.clone()
         history[..., :2] = history[..., :2] / scale
-        history[..., 2:] = history[..., 2:] / scale
+        history[..., 2:4] = history[..., 2:4] / scale
+        if history.size(-1) == 10:
+            scale_x = scale[..., 0]
+            scale_y = scale[..., 1]
+            history[..., 5] = history[..., 5] / scale_x.square()
+            history[..., 6] = history[..., 6] / scale_y.square()
+            history[..., 7] = history[..., 7] / (scale_x * scale_y)
         return history
+
+    def _canonicalize_history(self, history):
+        if self.uncertainty_mode == "none":
+            return history[..., :4]
+        if history.size(-1) == 10:
+            return history
+
+        zeros = history.new_zeros((*history.shape[:-1], 6))
+        zeros[..., 4] = 1.0
+        return torch.cat((history[..., :4], zeros), dim=-1)
+
+    def _project_history(self, history):
+        kinematics = history[..., :4]
+        projected = self.input_projection(kinematics)
+        if self.uncertainty_mode == "none":
+            return projected
+        if self.uncertainty_mode == "unified":
+            return projected + self.uncertainty_input_projection(history[..., 4:])
+
+        detection_features = self.detection_input_projection(history[..., 4:5])
+        motion_features = self.motion_input_projection(history[..., 5:8])
+        return (
+            projected
+            + history[..., 8:9] * detection_features
+            + history[..., 9:10] * motion_features
+        )
 
     def _normalize_delta(self, delta, bev_grid_shape):
         if self.motion_normalization == "none":
@@ -174,15 +228,16 @@ class MambaMotionPredictor(nn.Module):
 
         pad_count = self.history_len - history.size(1)
         first = history[:, :1].clone()
-        first[..., 2:] = 0.0
+        first[..., 2:4] = 0.0
         padding = first.repeat(1, pad_count, 1)
         return torch.cat((padding, history), dim=1)
 
     def _encode_history(self, history, bev_grid_shape=None):
+        history = self._canonicalize_history(history)
         history = self._pad_history(history)
         history = self._normalize_history(history, bev_grid_shape)
-        last_velocity = history[:, -1, 2:]
-        sequence = self.input_projection(history)
+        last_velocity = history[:, -1, 2:4]
+        sequence = self._project_history(history)
         if self.history_mode == "window":
             sequence = sequence + self.temporal_embedding
         for block in self.blocks:
@@ -242,8 +297,7 @@ class MambaMotionPredictor(nn.Module):
         tokens = torch.as_tensor(tokens, dtype=torch.float32, device=device)
         if tokens.dim() == 1:
             tokens = tokens.unsqueeze(0)
-        if tokens.dim() != 2 or tokens.size(-1) != 4:
-            raise ValueError("tokens must have shape [batch, 4]")
+        tokens = self._canonicalize_history(tokens)
         if self.motion_normalization == "bev" and bev_grid_shape is None:
             raise ValueError("bev_grid_shape is required for BEV normalization")
 
@@ -257,8 +311,8 @@ class MambaMotionPredictor(nn.Module):
             tokens.unsqueeze(1),
             bev_grid_shape,
         ).squeeze(1)
-        last_velocity = normalized_tokens[:, 2:]
-        sequence = self.input_projection(normalized_tokens).unsqueeze(1)
+        last_velocity = normalized_tokens[:, 2:4]
+        sequence = self._project_history(normalized_tokens).unsqueeze(1)
         layer_states = []
 
         for layer_index, block in enumerate(self.blocks):
@@ -368,13 +422,15 @@ class MambaMotionPredictor(nn.Module):
         device = next(self.parameters()).device
         prepared = []
         for history in histories:
+            history_array = np.asarray(history)
             history_tensor = torch.as_tensor(
-                np.asarray(history),
+                history_array,
                 dtype=torch.float32,
                 device=device,
-            ).reshape(-1, 4)
+            ).reshape(-1, history_array.shape[-1])
             if history_tensor.size(0) == 0:
                 raise ValueError("each track must contain at least one history token")
+            history_tensor = self._canonicalize_history(history_tensor)
             prepared.append(self._pad_history(history_tensor.unsqueeze(0)))
 
         history_batch = torch.cat(prepared, dim=0)

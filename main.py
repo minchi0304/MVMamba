@@ -269,6 +269,7 @@ if __name__ == '__main__':
     parser.add_argument('--motion_normalization',type=str, default='bev', choices=['bev', 'none'], help='Normalize learned-motion coordinates by BEV grid size or use raw grid coordinates.')
     parser.add_argument('--motion_history_len', type=int, default=10, help='Number of trajectory tokens used by learned motion models')
     parser.add_argument('--mamba_history_mode', type=str, default='window', choices=['window', 'stateful'], help='Use a fixed trajectory window or persistent per-track Mamba state')
+    parser.add_argument('--mamba_uncertainty_mode', type=str, default='unified', choices=['none', 'unified', 'separate'], help='Implicit uncertainty input: disabled, one shared projection, or source-specific projections')
     parser.add_argument('--mamba_d_model', type=int, default=128)
     parser.add_argument('--mamba_d_state', type=int, default=16)
     parser.add_argument('--mamba_d_conv', type=int, default=4)
@@ -304,6 +305,7 @@ if __name__ == '__main__':
     print('Occupancy loss: edl')
     print('Motion model: {}'.format(args.motion_model))
     print('Motion loss: {}'.format(args.motion_loss))
+    print('Mamba uncertainty input: {}'.format(args.mamba_uncertainty_mode))
     print('Multi-task loss: {}'.format(args.multi_task_loss))
     
     torch.cuda.empty_cache()
@@ -439,6 +441,7 @@ if __name__ == '__main__':
             loss_type=args.motion_loss,
             evidential_lambda=args.evidential_lambda,
             evidential_head=args.evidential_head,
+            uncertainty_mode=args.mamba_uncertainty_mode,
         )
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
