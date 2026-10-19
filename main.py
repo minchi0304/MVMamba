@@ -265,11 +265,20 @@ if __name__ == '__main__':
     parser.add_argument('--high_cls_thres', type=float, default=0.4, help='Confidence threshold for high-confidence detections')
     parser.add_argument('--track_match_thresh', type=float, default=75, help='MVTrackTrans-style center-distance association threshold')
     parser.add_argument('--track_low_match_thresh', type=float, default=100, help='MVTrackTrans-style center-distance gate for unconfirmed tracks')
+    parser.add_argument('--motion_cost', type=str, default='euclidean', choices=['euclidean', 'mahalanobis'], help='Primary track-to-detection motion cost')
+    parser.add_argument('--mahalanobis_gate', type=float, default=5.991, help='Squared Mahalanobis gate for primary association')
+    parser.add_argument('--motion_cov_scale', type=float, default=1.0, help='Scale applied to NIW motion covariance during association')
+    parser.add_argument('--motion_cov_floor', type=float, default=1e-4, help='Minimum covariance eigenvalue during Mahalanobis association')
     parser.add_argument('--motion_model', type=str, default='mamba', choices=['kalman', 'mamba'], help='Motion prediction model used by the tracker')
     parser.add_argument('--motion_normalization',type=str, default='bev', choices=['bev', 'none'], help='Normalize learned-motion coordinates by BEV grid size or use raw grid coordinates.')
     parser.add_argument('--motion_history_len', type=int, default=10, help='Number of trajectory tokens used by learned motion models')
     parser.add_argument('--mamba_history_mode', type=str, default='window', choices=['window', 'stateful'], help='Use a fixed trajectory window or persistent per-track Mamba state')
     parser.add_argument('--mamba_uncertainty_mode', type=str, default='unified', choices=['none', 'unified', 'separate', 'separate_full'], help='Implicit uncertainty input: disabled, unified, uncertainty-only branches, or fully source-specific projections')
+    parser.add_argument('--mamba_uncertainty_gate', type=str, default='none', choices=['none', 'b', 'delta'], help='Explicit reliability gate on SSM B or positive delta')
+    parser.add_argument('--mamba_uncertainty_weight', type=str, default='cosine', choices=['linear', 'rational', 'cosine'], help='Detection reliability mapping, also used for motion when motion_uncertainty_weight=shared')
+    parser.add_argument('--motion_uncertainty_weight', type=str, default='shared', choices=['shared', 'tanh'], help='Motion reliability: shared mapping after trace/(trace+ref), or directly 1-tanh(trace)')
+    parser.add_argument('--motion_uncertainty_type', type=str, default='total', choices=['aleatoric', 'epistemic', 'total'], help='NIW covariance component whose trace drives the explicit motion gate')
+    parser.add_argument('--motion_uncertainty_ref', type=float, default=1e-4, help='Positive trace reference: u_motion = trace / (trace + ref), in model coordinate units squared')
     parser.add_argument('--mamba_d_model', type=int, default=128)
     parser.add_argument('--mamba_d_state', type=int, default=16)
     parser.add_argument('--mamba_d_conv', type=int, default=4)
@@ -302,10 +311,22 @@ if __name__ == '__main__':
     parser.add_argument('--optim', type=str, default='Adam', choices=['SGD', 'Adam'], help='Choose optimizer.(default : SGD)')
 
     args = parser.parse_args()
+    if args.mamba_uncertainty_gate != 'none':
+        if args.motion_model != 'mamba' or args.motion_loss != 'niw':
+            parser.error('explicit Mamba uncertainty gating requires --motion_model mamba --motion_loss niw')
+        if args.motion_uncertainty_weight == 'shared' and (
+            not np.isfinite(args.motion_uncertainty_ref) or args.motion_uncertainty_ref <= 0
+        ):
+            parser.error('--motion_uncertainty_ref must be finite and positive')
     print('Occupancy loss: edl')
     print('Motion model: {}'.format(args.motion_model))
     print('Motion loss: {}'.format(args.motion_loss))
+    print('Motion association cost: {}'.format(args.motion_cost))
     print('Mamba uncertainty input: {}'.format(args.mamba_uncertainty_mode))
+    print('Mamba explicit gate: {}, weight: {}, motion weight: {}, motion covariance: {}, trace reference: {}'.format(
+        args.mamba_uncertainty_gate, args.mamba_uncertainty_weight,
+        args.motion_uncertainty_weight, args.motion_uncertainty_type, args.motion_uncertainty_ref,
+    ))
     print('Multi-task loss: {}'.format(args.multi_task_loss))
     
     torch.cuda.empty_cache()
@@ -442,6 +463,11 @@ if __name__ == '__main__':
             evidential_lambda=args.evidential_lambda,
             evidential_head=args.evidential_head,
             uncertainty_mode=args.mamba_uncertainty_mode,
+            uncertainty_gate=args.mamba_uncertainty_gate,
+            motion_uncertainty_type=args.motion_uncertainty_type,
+            motion_uncertainty_ref=args.motion_uncertainty_ref,
+            uncertainty_weight=args.mamba_uncertainty_weight,
+            motion_uncertainty_weight=args.motion_uncertainty_weight,
         )
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

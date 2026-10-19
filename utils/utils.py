@@ -296,6 +296,11 @@ def build_tracker(args, dataset_config, tracker_device, motion_predictor=None):
         motion_history_len=int(args.motion_history_len),
         mamba_history_mode=getattr(args, 'mamba_history_mode', 'window'),
         mamba_uncertainty_mode=getattr(args, 'mamba_uncertainty_mode', 'none'),
+        mamba_uncertainty_gate=getattr(args, 'mamba_uncertainty_gate', 'none'),
+        motion_cost=getattr(args, 'motion_cost', 'euclidean'),
+        mahalanobis_gate=getattr(args, 'mahalanobis_gate', 5.991),
+        motion_cov_scale=getattr(args, 'motion_cov_scale', 1.0),
+        motion_cov_floor=getattr(args, 'motion_cov_floor', 1e-4),
     )
 
 

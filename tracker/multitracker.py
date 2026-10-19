@@ -26,11 +26,13 @@ class STrack:
         motion_history_len=5,
         detection_uncertainty=0.0,
         mamba_uncertainty_mode="none",
+        mamba_uncertainty_gate="none",
     ):
         self._xy = np.asarray(xy, dtype=np.float32).reshape(2)
         self.score = float(score)
         self.detection_uncertainty = float(detection_uncertainty)
         self.mamba_uncertainty_mode = mamba_uncertainty_mode
+        self.mamba_uncertainty_gate = mamba_uncertainty_gate
         self.buffer_size = buffer_size
         self.tracklet_len = 0
         self.track_id = 0
@@ -45,16 +47,19 @@ class STrack:
         self.mamba_state = None
         self.mamba_next_delta = None
         self.mamba_next_covariance = None
+        self.mamba_next_kappa = None
         self.motion_delta = None
         self.motion_covariance = None
+        self.motion_kappa = None
+        self.motion_position_covariance = None
         self.motion_prediction_xy = None
         self.motion_prediction_pending = False
 
     def _detection_condition(self, observed_xy, delta):
         kinematics = np.concatenate((observed_xy, delta)).astype(np.float32)
-        if self.mamba_uncertainty_mode == "none":
+        if self.mamba_uncertainty_mode == "none" and self.mamba_uncertainty_gate == "none":
             return kinematics
-        return np.concatenate((
+        condition = np.concatenate((
             kinematics,
             np.asarray([
                 self.detection_uncertainty,
@@ -65,10 +70,13 @@ class STrack:
                 0.0,
             ], dtype=np.float32),
         ))
+        if self.mamba_uncertainty_gate != "none":
+            condition = np.concatenate((condition, np.zeros(1, dtype=np.float32)))
+        return condition
 
     def _motion_condition(self, predicted_xy, delta):
         kinematics = np.concatenate((predicted_xy, delta)).astype(np.float32)
-        if self.mamba_uncertainty_mode == "none":
+        if self.mamba_uncertainty_mode == "none" and self.mamba_uncertainty_gate == "none":
             return kinematics
         covariance = self.motion_covariance
         if covariance is None:
@@ -79,12 +87,17 @@ class STrack:
                 covariance[1, 1],
                 covariance[0, 1],
             ], dtype=np.float32)
-        return np.concatenate((
+        condition = np.concatenate((
             kinematics,
             np.asarray([0.0], dtype=np.float32),
             covariance_values,
             np.asarray([0.0, 1.0], dtype=np.float32),
         ))
+        if self.mamba_uncertainty_gate != "none":
+            condition = np.concatenate((
+                condition, np.asarray([self.motion_kappa], dtype=np.float32),
+            ))
+        return condition
 
     @classmethod
     def next_id(cls):
@@ -133,6 +146,7 @@ class STrack:
             )
         else:
             self._update_motion_history(new_track.to_xy())
+            self.motion_position_covariance = None
         self.tracklet_len = 0
         self.state = TrackState.Tracked
         self.is_activated = True
@@ -179,6 +193,7 @@ class STrack:
             )
         else:
             self._update_motion_history(new_track.to_xy())
+            self.motion_position_covariance = None
 
         self.score = new_track.score
         self.state = TrackState.Tracked
@@ -206,8 +221,13 @@ class STrack:
             return
 
         conditions = [track.conds for track in stracks]
+        kappa = None
         with torch.no_grad():
-            if hasattr(model, "generate_distribution"):
+            if stracks[0].mamba_uncertainty_gate != "none":
+                motion, covariance, kappa = model.generate_distribution(
+                    conditions, bev_grid_shape=bev_grid_shape, return_kappa=True,
+                )
+            elif hasattr(model, "generate_distribution"):
                 motion, covariance = model.generate_distribution(
                     conditions,
                     bev_grid_shape=bev_grid_shape,
@@ -220,6 +240,7 @@ class STrack:
                 covariance = None
 
         for row_index, (track, delta) in enumerate(zip(stracks, motion)):
+            track.motion_kappa = None if kappa is None else float(kappa[row_index, 0])
             previous_xy = track.xy
             predicted_xy = previous_xy + np.asarray(delta, dtype=np.float32)
             track.motion_delta = np.asarray(delta, dtype=np.float32)
@@ -229,6 +250,13 @@ class STrack:
                 if covariance is None
                 else np.asarray(covariance[row_index], dtype=np.float32)
             )
+            if track.motion_covariance is not None:
+                if track.motion_position_covariance is None:
+                    track.motion_position_covariance = track.motion_covariance.copy()
+                else:
+                    track.motion_position_covariance = (
+                        track.motion_position_covariance + track.motion_covariance
+                    )
             track._xy = predicted_xy
             track.conds.append(track._motion_condition(
                 predicted_xy,
@@ -243,8 +271,14 @@ class STrack:
 
         tokens = np.asarray([track.conds[-1] for track in stracks], dtype=np.float32)
         states = [track.mamba_state for track in stracks]
+        kappa = None
         with torch.no_grad():
-            if hasattr(model, "stateful_step_distribution"):
+            if stracks[0].mamba_uncertainty_gate != "none":
+                motion, covariance, next_states, kappa = model.stateful_step_distribution(
+                    tokens, states=states, bev_grid_shape=bev_grid_shape,
+                    return_kappa=True,
+                )
+            elif hasattr(model, "stateful_step_distribution"):
                 motion, covariance, next_states = model.stateful_step_distribution(
                     tokens,
                     states=states,
@@ -259,6 +293,7 @@ class STrack:
                 covariance = None
 
         for row_index, (track, delta, state) in enumerate(zip(stracks, motion, next_states)):
+            track.mamba_next_kappa = None if kappa is None else float(kappa[row_index, 0])
             track.mamba_state = state
             track.mamba_next_delta = np.asarray(delta, dtype=np.float32)
             track.mamba_next_covariance = (
@@ -279,6 +314,7 @@ class STrack:
         STrack.commit_mamba_state(missing_state, model, bev_grid_shape)
 
         for track in stracks:
+            track.motion_kappa = track.mamba_next_kappa
             previous_xy = track.xy
             predicted_xy = previous_xy + track.mamba_next_delta
             track.motion_delta = track.mamba_next_delta.copy()
@@ -288,6 +324,13 @@ class STrack:
                 if track.mamba_next_covariance is None
                 else track.mamba_next_covariance.copy()
             )
+            if track.motion_covariance is not None:
+                if track.motion_position_covariance is None:
+                    track.motion_position_covariance = track.motion_covariance.copy()
+                else:
+                    track.motion_position_covariance = (
+                        track.motion_position_covariance + track.motion_covariance
+                    )
             track._xy = predicted_xy.astype(np.float32)
             track.conds.append(track._motion_condition(
                 track._xy,
@@ -320,6 +363,11 @@ class Tracker:
         motion_history_len=5,
         mamba_history_mode="window",
         mamba_uncertainty_mode="none",
+        motion_cost="euclidean",
+        mahalanobis_gate=5.991,
+        motion_cov_scale=1.0,
+        motion_cov_floor=1e-4,
+        mamba_uncertainty_gate="none",
     ):
         self.tracked_stracks: List[STrack] = []
         self.lost_stracks: List[STrack] = []
@@ -343,6 +391,11 @@ class Tracker:
             raise ValueError("mamba_history_mode must be 'window' or 'stateful'")
         self.mamba_history_mode = mamba_history_mode
         self.mamba_uncertainty_mode = mamba_uncertainty_mode
+        self.mamba_uncertainty_gate = mamba_uncertainty_gate
+        self.motion_cost = motion_cost
+        self.mahalanobis_gate = float(mahalanobis_gate)
+        self.motion_cov_scale = float(motion_cov_scale)
+        self.motion_cov_floor = float(motion_cov_floor)
 
         self.kalman_filter = KalmanFilter() if motion_model == "kalman" else None
         self.motion_predictor = None
@@ -365,6 +418,7 @@ class Tracker:
                 motion_history_len=self.motion_history_len,
                 detection_uncertainty=uncertainty,
                 mamba_uncertainty_mode=self.mamba_uncertainty_mode,
+                mamba_uncertainty_gate=self.mamba_uncertainty_gate,
             )
             for xy, score, uncertainty in zip(dets, scores, uncertainties)
         ]
@@ -379,6 +433,51 @@ class Tracker:
     def _linear_association(self, tracks, detections, thresh):
         dists = self._center_distance(tracks, detections)
         return matching.linear_assignment(dists, thresh=thresh)
+
+    def _mahalanobis_cost(self, tracks, detections):
+        if len(tracks) == 0 or len(detections) == 0:
+            return np.zeros((len(tracks), len(detections)), dtype=np.float32)
+        if any(track.motion_position_covariance is None for track in tracks):
+            return None
+
+        detection_xy = np.asarray(
+            [detection.xy for detection in detections],
+            dtype=np.float64,
+        )
+        costs = np.empty((len(tracks), len(detections)), dtype=np.float32)
+        for track_index, track in enumerate(tracks):
+            covariance = np.asarray(
+                track.motion_position_covariance,
+                dtype=np.float64,
+            )
+            covariance = 0.5 * (covariance + covariance.T)
+            eigenvalues, eigenvectors = np.linalg.eigh(
+                covariance * self.motion_cov_scale
+            )
+            eigenvalues = np.maximum(eigenvalues, self.motion_cov_floor)
+            precision = (
+                eigenvectors
+                @ np.diag(1.0 / eigenvalues)
+                @ eigenvectors.T
+            )
+            residuals = detection_xy - track.xy.astype(np.float64)
+            costs[track_index] = np.einsum(
+                "ni,ij,nj->n",
+                residuals,
+                precision,
+                residuals,
+            ).astype(np.float32)
+        return costs
+
+    def _primary_association(self, tracks, detections):
+        if self.motion_model == "mamba" and self.motion_cost == "mahalanobis":
+            costs = self._mahalanobis_cost(tracks, detections)
+            if costs is not None:
+                return matching.linear_assignment(
+                    costs,
+                    thresh=self.mahalanobis_gate,
+                )
+        return self._linear_association(tracks, detections, self.match_thresh)
 
     def update(
         self,
@@ -446,8 +545,8 @@ class Tracker:
 
         predicted_tracks = list(strack_pool)
 
-        matches_idx, unmatched_tracks_idx, unmatched_detections_idx = self._linear_association(
-            strack_pool, detections, self.match_thresh
+        matches_idx, unmatched_tracks_idx, unmatched_detections_idx = (
+            self._primary_association(strack_pool, detections)
         )
         matches = [(strack_pool[int(i)], detections[int(j)]) for i, j in matches_idx]
         matched_prediction_ids = {id(track) for track, _ in matches}

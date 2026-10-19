@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import triton.language as triton_language
 from mamba_ssm import Mamba
 from mamba_ssm.modules import mamba_simple
+from tracker.uncertainty_gated_mamba import UncertaintyGatedMamba
 from utils.losses_evidential import (
     evidential_niw_loss_2d,
     niw_predictive_covariance_2d,
@@ -18,19 +19,28 @@ if not hasattr(triton_language, "math"):
 
 
 class ResidualMambaBlock(nn.Module):
-    def __init__(self, d_model, d_state, d_conv, expand, dropout):
+    def __init__(self, d_model, d_state, d_conv, expand, dropout, uncertainty_gate="none"):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
-        self.mamba = Mamba(
+        mamba_class = Mamba if uncertainty_gate == "none" else UncertaintyGatedMamba
+        gate_kwargs = {} if uncertainty_gate == "none" else {"gate_mode": uncertainty_gate}
+        self.mamba = mamba_class(
             d_model=d_model,
             d_state=d_state,
             d_conv=d_conv,
             expand=expand,
+            **gate_kwargs,
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, sequence):
-        return sequence + self.dropout(self.mamba(self.norm(sequence)))
+    def forward(self, sequence, reliability=None):
+        normalized = self.norm(sequence)
+        output = (
+            self.mamba(normalized)
+            if reliability is None
+            else self.mamba(normalized, reliability=reliability)
+        )
+        return sequence + self.dropout(output)
 
 
 class MambaMotionPredictor(nn.Module):
@@ -38,7 +48,9 @@ class MambaMotionPredictor(nn.Module):
 
     The baseline history token is ``[x, y, dx, dy]``. Implicit uncertainty
     modes use ``[x, y, dx, dy, u_det, cov_xx, cov_yy, cov_xy, is_det,
-    is_motion]``. Coordinates, displacements, and covariance are normalized by
+    is_motion]``. Explicit gating appends NIW kappa as an eleventh field;
+    kappa is used only to split total covariance, never projected as a feature.
+    Coordinates, displacements, and covariance are normalized by
     the BEV size inside this module. The prediction returned by :meth:`generate`
     is converted back to world-grid units so the tracker can update its state as
     ``previous_xy + predicted_delta``.
@@ -59,6 +71,11 @@ class MambaMotionPredictor(nn.Module):
         evidential_lambda=1e-3,
         evidential_head="separate",
         uncertainty_mode="none",
+        uncertainty_gate="none",
+        motion_uncertainty_type="total",
+        motion_uncertainty_ref=1e-4,
+        uncertainty_weight="cosine",
+        motion_uncertainty_weight="shared",
     ):
         super().__init__()
 
@@ -69,6 +86,11 @@ class MambaMotionPredictor(nn.Module):
         self.evidential_lambda = float(evidential_lambda)
         self.evidential_head_type = evidential_head
         self.uncertainty_mode = uncertainty_mode
+        self.uncertainty_gate = uncertainty_gate
+        self.motion_uncertainty_type = motion_uncertainty_type
+        self.motion_uncertainty_ref = float(motion_uncertainty_ref)
+        self.uncertainty_weight = uncertainty_weight
+        self.motion_uncertainty_weight = motion_uncertainty_weight
         self.last_loss_stats = {}
         self.input_projection = nn.Linear(4, d_model)
         if self.uncertainty_mode == "unified":
@@ -98,6 +120,7 @@ class MambaMotionPredictor(nn.Module):
                     d_conv=d_conv,
                     expand=expand,
                     dropout=dropout,
+                    uncertainty_gate=uncertainty_gate,
                 )
                 for _ in range(num_layers)
             ]
@@ -187,7 +210,7 @@ class MambaMotionPredictor(nn.Module):
         history = history.clone()
         history[..., :2] = history[..., :2] / scale
         history[..., 2:4] = history[..., 2:4] / scale
-        if history.size(-1) == 10:
+        if history.size(-1) >= 10:
             scale_x = scale[..., 0]
             scale_y = scale[..., 1]
             history[..., 5] = history[..., 5] / scale_x.square()
@@ -196,12 +219,16 @@ class MambaMotionPredictor(nn.Module):
         return history
 
     def _canonicalize_history(self, history):
-        if self.uncertainty_mode == "none":
+        if self.uncertainty_mode == "none" and self.uncertainty_gate == "none":
             return history[..., :4]
-        if history.size(-1) == 10:
-            return history
+        width = 10 if self.uncertainty_gate == "none" else 11
+        if history.size(-1) >= width:
+            return history[..., :width]
+        if history.size(-1) != 4:
+            raise ValueError("explicit uncertainty histories require NIW kappa as field 11")
 
-        zeros = history.new_zeros((*history.shape[:-1], 6))
+        # GT histories have no uncertainty: treat them as reliable observations.
+        zeros = history.new_zeros((*history.shape[:-1], width - 4))
         zeros[..., 4] = 1.0
         return torch.cat((history[..., :4], zeros), dim=-1)
 
@@ -211,7 +238,7 @@ class MambaMotionPredictor(nn.Module):
         if self.uncertainty_mode == "none":
             return projected
         if self.uncertainty_mode == "unified":
-            return projected + self.uncertainty_input_projection(history[..., 4:])
+            return projected + self.uncertainty_input_projection(history[..., 4:10])
         if self.uncertainty_mode == "separate_full":
             detection_input = torch.cat((kinematics, history[..., 4:5]), dim=-1)
             motion_input = torch.cat((kinematics, history[..., 5:8]), dim=-1)
@@ -229,6 +256,40 @@ class MambaMotionPredictor(nn.Module):
             + history[..., 8:9] * detection_features
             + history[..., 9:10] * motion_features
         )
+
+    def _history_reliability(self, history):
+        """Reduce covariance after BEV normalization; return one gate per token."""
+        if self.uncertainty_gate == "none":
+            return None
+        trace = (history[..., 5] + history[..., 6]).clamp_min(0.0)
+        kappa = history[..., 10]
+        if self.motion_uncertainty_type == "epistemic":
+            trace = trace / (kappa + 1.0)
+        elif self.motion_uncertainty_type == "aleatoric":
+            trace = trace * kappa / (kappa + 1.0)
+        if self.motion_uncertainty_weight == "tanh":
+            # Use the selected covariance trace directly: no reference scaling
+            # and no additional linear/rational/cosine mapping for motion.
+            detection_weight = self._uncertainty_to_weight(history[..., 4].clamp(0.0, 1.0))
+            motion_weight = 1.0 - torch.tanh(trace)
+            return (
+                history[..., 8] * detection_weight
+                + history[..., 9] * motion_weight
+            )
+
+        motion_u = trace / (trace + self.motion_uncertainty_ref)
+        uncertainty = (
+            history[..., 8] * history[..., 4]
+            + history[..., 9] * motion_u
+        ).clamp(0.0, 1.0)
+        return self._uncertainty_to_weight(uncertainty)
+
+    def _uncertainty_to_weight(self, uncertainty):
+        if self.uncertainty_weight == "linear":
+            return 1.0 - uncertainty
+        if self.uncertainty_weight == "rational":
+            return (1.0 - uncertainty) / (1.0 + uncertainty)
+        return 0.5 * (1.0 + torch.cos(torch.pi * uncertainty))
 
     def _normalize_delta(self, delta, bev_grid_shape):
         if self.motion_normalization == "none":
@@ -260,12 +321,13 @@ class MambaMotionPredictor(nn.Module):
         history = self._canonicalize_history(history)
         history = self._pad_history(history)
         history = self._normalize_history(history, bev_grid_shape)
+        reliability = self._history_reliability(history)
         last_velocity = history[:, -1, 2:4]
         sequence = self._project_history(history)
         if self.history_mode == "window":
             sequence = sequence + self.temporal_embedding
         for block in self.blocks:
-            sequence = block(sequence)
+            sequence = block(sequence, reliability=reliability)
         features = self.output_norm(sequence[:, -1])
         return features, last_velocity
 
@@ -307,7 +369,7 @@ class MambaMotionPredictor(nn.Module):
         return mean
 
     @torch.no_grad()
-    def _stateful_step(self, tokens, states=None, bev_grid_shape=None):
+    def _stateful_step(self, tokens, states=None, bev_grid_shape=None, return_kappa=False):
         """Consume one token per track and return its next displacement.
 
         ``states`` contains one cache per track. Each cache stores the
@@ -336,6 +398,7 @@ class MambaMotionPredictor(nn.Module):
             bev_grid_shape,
         ).squeeze(1)
         last_velocity = normalized_tokens[:, 2:4]
+        reliability = self._history_reliability(normalized_tokens)
         sequence = self._project_history(normalized_tokens).unsqueeze(1)
         layer_states = []
 
@@ -365,16 +428,18 @@ class MambaMotionPredictor(nn.Module):
                     cached_ssm.to(device=ssm_state.device, dtype=ssm_state.dtype)
                 )
 
+            gate_kwargs = {} if reliability is None else {"reliability": reliability}
             mamba_output, conv_state, ssm_state = block.mamba.step(
                 block.norm(sequence),
                 conv_state,
                 ssm_state,
+                **gate_kwargs,
             )
             sequence = sequence + block.dropout(mamba_output)
             layer_states.append((conv_state, ssm_state))
 
         features = self.output_norm(sequence[:, -1])
-        normalized_delta, normalized_covariance, _, _, _ = (
+        normalized_delta, normalized_covariance, kappa, _, _ = (
             self._predict_distribution_from_features(features, last_velocity)
         )
         delta = self._denormalize_delta(normalized_delta, bev_grid_shape)
@@ -398,7 +463,10 @@ class MambaMotionPredictor(nn.Module):
         covariance_numpy = None
         if covariance is not None:
             covariance_numpy = covariance.detach().cpu().numpy()
-        return delta.detach().cpu().numpy(), covariance_numpy, next_states
+        result = (delta.detach().cpu().numpy(), covariance_numpy, next_states)
+        if return_kappa:
+            return (*result, None if kappa is None else kappa.detach().cpu().numpy())
+        return result
 
     def stateful_step(self, tokens, states=None, bev_grid_shape=None):
         delta, _, next_states = self._stateful_step(
@@ -408,11 +476,14 @@ class MambaMotionPredictor(nn.Module):
         )
         return delta, next_states
 
-    def stateful_step_distribution(self, tokens, states=None, bev_grid_shape=None):
+    def stateful_step_distribution(
+        self, tokens, states=None, bev_grid_shape=None, return_kappa=False,
+    ):
         return self._stateful_step(
             tokens,
             states=states,
             bev_grid_shape=bev_grid_shape,
+            return_kappa=return_kappa,
         )
 
     def forward(self, history, target_delta, bev_grid_shape=None):
@@ -439,9 +510,10 @@ class MambaMotionPredictor(nn.Module):
         delta, _ = self.generate_distribution(histories, bev_grid_shape)
         return delta
 
-    def generate_distribution(self, histories, bev_grid_shape=None):
+    def generate_distribution(self, histories, bev_grid_shape=None, return_kappa=False):
         if len(histories) == 0:
-            return np.empty((0, 2), dtype=np.float32), None
+            result = (np.empty((0, 2), dtype=np.float32), None)
+            return (*result, None) if return_kappa else result
 
         device = next(self.parameters()).device
         prepared = []
@@ -458,7 +530,7 @@ class MambaMotionPredictor(nn.Module):
             prepared.append(self._pad_history(history_tensor.unsqueeze(0)))
 
         history_batch = torch.cat(prepared, dim=0)
-        normalized_delta, normalized_covariance, _, _, _ = self.predict_normalized_distribution(
+        normalized_delta, normalized_covariance, kappa, _, _ = self.predict_normalized_distribution(
             history_batch,
             bev_grid_shape,
         )
@@ -470,4 +542,7 @@ class MambaMotionPredictor(nn.Module):
                 bev_grid_shape,
             )
             covariance_numpy = covariance.detach().cpu().numpy()
-        return delta.detach().cpu().numpy(), covariance_numpy
+        result = (delta.detach().cpu().numpy(), covariance_numpy)
+        if return_kappa:
+            return (*result, None if kappa is None else kappa.detach().cpu().numpy())
+        return result
