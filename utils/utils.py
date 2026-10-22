@@ -23,10 +23,10 @@ def _nms(heat, kernel=3):
     return heat * keep
 
 
-def decoder(center_e, offset_e, K=60, return_inds=False):
+def decoder(center_e, K=60, return_inds=False):
     """
     center_e: B,1,H,W
-    offset_e: B,2,H,W, or B,C,H,W where channels 0:2 are offset means
+    Returns BEV cell coordinates in the reduced grid.
     """
 
     batch, cat, height, width = center_e.size()
@@ -35,10 +35,8 @@ def decoder(center_e, offset_e, K=60, return_inds=False):
     scores, inds, ys, xs = _topk(center_e, K=K)  # B,K
 
     scores = scores.unsqueeze(2)  # B,K,1
-    offset = _transpose_and_gather_feat(offset_e, inds)  # B,K,2
-
-    xs = xs.view(batch, K, 1) + offset[:, :, 0:1]
-    ys = ys.view(batch, K, 1) + offset[:, :, 1:2]
+    xs = xs.view(batch, K, 1)
+    ys = ys.view(batch, K, 1)
     xy = torch.cat((xs, ys), dim=2)  # batch,K,2
 
     if return_inds:
@@ -140,12 +138,6 @@ def tracking_score_text(score_key):
     return "idf1/mota: {:.1f}%/{:.1f}%".format(score_key[0], score_key[1])
 
 
-def get_offset_mean(bev_offset):
-    if bev_offset.dim() != 4 or bev_offset.size(1) < 2:
-        raise ValueError("offset head output must be [B,C,H,W] with C >= 2")
-    return bev_offset[:, 0:2]
-
-
 def split_occupancy_params(bev_occupancy):
     evidence = F.softplus(bev_occupancy) + 1.0
     alpha = evidence[:, 0:1]
@@ -224,14 +216,12 @@ def get_decode_topk(args):
 def decode_frame(model, dataset, item, batch_idx, device, args):
     data = item['img'].to(device)
     with torch.no_grad():
-        bev_occupancy, bev_offset = model(dataset, item['root'], data, item.get('proj_mats'))
+        bev_occupancy = model(dataset, item['root'], data, item.get('proj_mats'))
 
         bev_center = get_occupancy_prob(bev_occupancy)
         occupancy_uncertainty = get_occupancy_uncertainty(bev_occupancy)
-        bev_offset_mean = get_offset_mean(bev_offset)
         xy, scores, inds = decoder(
             bev_center,
-            bev_offset_mean,
             K=get_decode_topk(args),
             return_inds=True,
         )

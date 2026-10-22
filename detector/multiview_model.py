@@ -16,7 +16,6 @@ class MultiView_Detection(nn.Module):
         device=torch.device('cuda'),
         multi_task_loss="plain",
         view_pool="avg",
-        use_offset=True,
         use_motion_loss=False,
     ):
         super().__init__()
@@ -30,12 +29,9 @@ class MultiView_Detection(nn.Module):
         self.base_arch = nn.Sequential(*list(backbone_model.children())[:-2]).to(self.device)
         self.multi_task_loss = multi_task_loss
         self.view_pool = view_pool
-        self.use_offset = bool(use_offset)
         self.use_motion_loss = bool(use_motion_loss)
         if self.multi_task_loss == "uncertainty":
             self.instance_weight = nn.Parameter(torch.tensor(0.0), requires_grad=True)
-            if self.use_offset:
-                self.offset_weight = nn.Parameter(torch.tensor(0.0), requires_grad=True)
             if self.use_motion_loss:
                 self.motion_weight = nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
@@ -43,21 +39,10 @@ class MultiView_Detection(nn.Module):
    
 
         shared_out_channels = self.out_channel
-        offset_out_channels = 2
 
         self.decoder = Decoder(in_channels=latent_dim,).to(self.device)
  
         # Ground Plane Convolution
-        if self.use_offset:
-            self.instance_offset_head = nn.Sequential(
-                nn.Conv2d(shared_out_channels, shared_out_channels, kernel_size=3, padding=1, bias=False),
-                nn.InstanceNorm2d(shared_out_channels),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(shared_out_channels, shared_out_channels, kernel_size=3, padding=1, bias=False),
-                nn.InstanceNorm2d(shared_out_channels),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(shared_out_channels, offset_out_channels, kernel_size=1, padding=0),
-            ).to(self.device)
     
         center_out_channels = 2
         self.instance_center_head = nn.Sequential(
@@ -88,8 +73,7 @@ class MultiView_Detection(nn.Module):
                 sample_proj_mats = None if proj_mats is None else proj_mats[batch_idx:batch_idx + 1]
                 outputs.append(self.forward(dataset, [sample_dataset_name], imgs[batch_idx:batch_idx + 1], sample_proj_mats))
 
-            bev_occupancy, bev_offset = zip(*outputs)
-            return torch.cat(bev_occupancy, dim=0), torch.cat(bev_offset, dim=0)
+            return torch.cat(outputs, dim=0)
 
         sample_dataset_name = dataset_name[0] if isinstance(dataset_name, (list, tuple)) else dataset_name
         config_dict = dataset.dicts[sample_dataset_name]
@@ -129,11 +113,4 @@ class MultiView_Detection(nn.Module):
 
 
         bev_occupancy = self.instance_center_head(bev_features)
-        if self.use_offset:
-            bev_offset = self.instance_offset_head(bev_features)
-        else:
-            bev_offset = bev_features.new_zeros(
-                (bev_features.size(0), 2, bev_features.size(2), bev_features.size(3))
-            )
-
-        return bev_occupancy, bev_offset
+        return bev_occupancy

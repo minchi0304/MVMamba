@@ -245,7 +245,6 @@ class GetDataset(VisionDataset):
         Y, X = self.reducedgrid_shape
         center = torch.zeros((1, Y, X), dtype=torch.float32)
         valid_mask = torch.zeros((1, Y, X), dtype=torch.bool)
-        offset = torch.zeros((2, Y, X), dtype=torch.float32)
         person_ids = torch.zeros((1, Y, X), dtype=torch.long)
         for pt, pid in zip(world_pts, pids):
             ct = torch.tensor(pt[:2], dtype=torch.float32) / self.grid_reduce
@@ -254,9 +253,8 @@ class GetDataset(VisionDataset):
                 continue
             basic.draw_umich_gaussian(center[0], ct_int, sigma=self.bev_gaussian_sigma)
             valid_mask[:, ct_int[1], ct_int[0]] = 1
-            offset[:, ct_int[1], ct_int[0]] = ct - ct_int
             person_ids[:, ct_int[1], ct_int[0]] = pid
-        return center, valid_mask, person_ids, offset
+        return center, valid_mask, person_ids
 
     def get_img_gt(self, img_pts, img_pids, H, W, sx=1.0, sy=1.0, crop=(0, 0, 0, 0)):
 
@@ -265,7 +263,6 @@ class GetDataset(VisionDataset):
         scale_y = sy / self.img_reduce
 
         # center = torch.zeros((2, H, W), dtype=torch.float32)
-        # offset = torch.zeros((2, H, W), dtype=torch.float32)
         valid_mask = torch.zeros((1, H, W), dtype=torch.bool)
         person_ids = torch.zeros((1, H, W), dtype=torch.long)
 
@@ -284,9 +281,7 @@ class GetDataset(VisionDataset):
                 continue
             # basic.draw_umich_gaussian(center[0], ct_int, sigma=1.5)
             valid_mask[:, ct_int[1], ct_int[0]] = 1
-            # offset[:, ct_int[1], ct_int[0]] = ct - ct_int
             person_ids[:, ct_int[1], ct_int[0]] = pid
-        # return center, offset, person_ids, valid_mask
         return person_ids, valid_mask
 
     def __getitem__(self, index):
@@ -315,28 +310,24 @@ class GetDataset(VisionDataset):
         worldgrid_pts, world_pids = self.world_gt[frame]
         worldgrid_pts_original = worldgrid_pts.astype(np.float32)
         worldgrid_pts = self.apply_bev_augmentation(worldgrid_pts_original, bev_aug_mat)
-        center_bev, valid_bev, pid_bev, offset_bev = self.get_bev_gt(worldgrid_pts, world_pids)
+        center_bev, valid_bev, pid_bev = self.get_bev_gt(worldgrid_pts, world_pids)
 
         _, _, H, W = imgs.shape
         H, W = H // self.img_reduce, W // self.img_reduce
-        center_imgs, offset_imgs, pid_imgs, valid_imgs = [], [], [], []
+        pid_imgs, valid_imgs = [], []
         for cam in range(self.num_cam):
             img_pts, img_pids = self.imgs_gt[frame][cam]
             if len(img_pts) == 0:
                 # center_img = torch.zeros((2, H, W), dtype=torch.float32)
-                # offset_img = torch.zeros((2, H, W), dtype=torch.float32)
                 pid_img = torch.zeros((1, H, W), dtype=torch.long)
                 valid_img = torch.zeros((1, H, W), dtype=torch.bool)
             else:
-                # center_img, offset_img, pid_img, valid_img = self.get_img_gt(img_pts, img_pids, H, W)
                 sx, sy, crop = img_aug_params[cam]
                 pid_img, valid_img = self.get_img_gt(img_pts, img_pids, H, W, sx=sx, sy=sy, crop=crop)
             # center_imgs.append(center_img)
-            # offset_imgs.append(offset_img)
             pid_imgs.append(pid_img)
             valid_imgs.append(valid_img)
         # center_imgs = torch.stack(center_imgs)
-        # offset_imgs = torch.stack(offset_imgs)
         pid_imgs = torch.stack(pid_imgs)
         valid_imgs = torch.stack(valid_imgs)
 
@@ -381,7 +372,6 @@ class GetDataset(VisionDataset):
             'center_bev': center_bev, #gaussian heatmap gt
             'valid_bev': valid_bev, # binary center heatmap gt
             'pid_bev': pid_bev, # person ID center heatmap gt
-            'offset_bev': offset_bev, # offset gt
             
             'pid_img': pid_imgs,
             'valid_img': valid_imgs,

@@ -43,6 +43,92 @@ python main.py \
 
 Replace `wildtrack` with `multiviewx`, `citytrack`, `mvcrowdtrack`, or `gmvd_train` as needed.
 
+With `--multi_task_loss uncertainty`, each active task uses
+`exp(-s_task) * loss_task + s_task`, including NIW motion loss. The active tasks
+are occupancy detection and motion.
+`--multi_task_loss plain` sums their losses with coefficient `1` each.
+
+### Training Mamba with detection histories
+
+`--motion_train_history gt` keeps the existing GT-history training.
+`--motion_train_history detection` jointly trains the detector and Mamba using
+actual detector observations, with autoregressive motion predictions at missed
+observations (`--motion_history_missing motion`, the default). Initialize from a
+trained checkpoint using `--train_from` (unlike `--resume`, this starts training
+with a new optimizer/scheduler). Use the same Mamba architecture/head/projection
+options as the source checkpoint to continue its motion weights. Missing and
+unused checkpoint keys are printed.
+
+For example, with a joint-head, separate-full Wildtrack checkpoint:
+
+```bash
+python main.py -d wildtrack --data_root /dataset \
+  --train_from logs/<SOURCE_RUN>/Best_Multiview_Tracking_wildtrack.pth \
+  --motion_train_history detection --motion_history_missing motion \
+  --multi_task_loss uncertainty --batch_size 1 --epochs 50 \
+  --motion_model mamba --motion_normalization bev --motion_history_len 10 \
+  --motion_loss niw --evidential_head joint --mamba_history_mode window \
+  --mamba_uncertainty_mode separate_full --mamba_uncertainty_gate none \
+  --track_match_thresh 50 --track_low_match_thresh 80 \
+  --bev_gaussian_sigma 1.5
+```
+
+At the start of **each epoch**, the current detector runs on the training split
+to refresh detections and Beta uncertainty. The latest snapshot is stored in
+`motion_detections_train.pt` under the new log directory. This adds one detector
+inference pass per epoch. Image augmentation is disabled in this mode, even if
+`--aug` is supplied. `--batch_size` still counts image frames. Histories are
+attached by sequence/target frame, so image batches can remain shuffled.
+
+`--motion_detection_cache <PATH>` optionally creates or reuses an initial cache
+for epoch 1. Reuse checks the current detector parameters/buffers, checkpoint
+hash, training GT/frame range, camera projections, and decoder settings. Later
+epochs refresh the run-local cache; they do not overwrite the external cache.
+
+Detection candidates use the tracker's confidence floor
+`max(0, high_cls_thres - 0.1)`. They are matched one-to-one to GT identities using
+a metric distance gate: 1 m by default, or 2 m for CityTrack/MVCrowdTrack. Override
+it with `--motion_detection_match_thresh` (meters, not the grid-unit tracking
+association thresholds). Unmatched detections are not training trajectories.
+
+Detection tokens are `[x, y, dx, dy, u_det, 0, 0, 0, 1, 0, 0]`. When detection is
+missing after initialization, the current Mamba predicts the next position and
+NIW distribution. The token becomes
+`[x, y, dx, dy, 0, cov_xx, cov_yy, cov_xy, 0, 1, kappa]`. Consecutive misses
+feed these predictions back; a matched detection replaces the predicted state
+at its time and restores the detection token. Covariance is the one-step total
+predictive covariance, in grid units squared, as in tracking history. Mamba
+applies its existing BEV normalization and optional covariance decomposition.
+
+GT provides identity assignment and the next-position target, never replacement
+input coordinates. The displacement target is
+`next_GT_xy - last_history_xy`, including when the last history state is a motion
+prediction. Detection positions use the BEV cell coordinates directly, without
+sub-grid correction. The target frame needs GT but does not need detection.
+
+Training uses bounded trajectory windows. Each window starts from an actual
+detection, with the existing repeated-first-state padding before that observation.
+Windows with no detection to initialize from, or gaps in the dataset timestamps,
+are excluded. Time steps with missing detections after initialization are filled
+by motion, not compressed. `--motion_history_missing skip` retains the
+detection-only experiment, excluding incomplete windows instead. Stateful tracking
+still uses persistent state at inference; training samples remain bounded windows.
+
+Cached detector observations and autoregressive generation are detached. The
+final trajectory loss trains Mamba, including its detection/motion uncertainty
+projections and gated blocks; occupancy loss trains the detector. Gradients do
+not pass through detection decoding/GT assignment or through the earlier rollout
+predictions. Identity assignment uses GT, so this does not simulate tracker ID
+switches. No artificial detection dropout is added: a dataset with few misses
+will provide few motion tokens.
+
+`motion_training_samples_epoch_<N>.json` records cache hashes, matching settings,
+sample counts, and exclusions. The training log records task weights, losses,
+detection/motion token counts, mean Beta uncertainty, and mean motion covariance
+trace. Per-epoch tracking evaluation and best-checkpoint outputs remain available.
+To test explicit gating, use `--mamba_uncertainty_mode none` with
+`--mamba_uncertainty_gate b` or `delta`.
+
 ## Test
 
 Pass a trained checkpoint through `--resume` to run testing:
@@ -82,7 +168,6 @@ The main tracking controls are:
 - `--motion_loss`: `niw` predicts a correlated 2D offset distribution; `smooth_l1` keeps the deterministic baseline
 - `--evidential_lambda`: NIW evidence regularization coefficient (default: `1e-3`)
 - `--evidential_head`: `separate` uses independent mean/evidence MLPs; `joint` uses one MLP with seven outputs
-- `--use_offset`: `1` to use BEV sub-grid offsets, `0` to disable them
 
 The Mamba predictor estimates the normalized forward displacement. During tracking it is converted back to world-grid units and applied as
 `predicted_xy = previous_xy + predicted_delta`. A matched detection then replaces the predicted state and becomes the newest trajectory observation.
@@ -103,12 +188,12 @@ squared BEV axis scales before entering Mamba. Short histories retain the
 existing padding rule: the first state and source fields are repeated at the
 front, while only the repeated `dx, dy` values are set to zero.
 
-The current GT motion samples contain only kinematics. They are converted to
+With `--motion_train_history gt`, motion samples contain only kinematics. They are converted to
 detection-source tokens with zero uncertainty during training. The uncertainty
 projections therefore start from zero so that a checkpoint is not perturbed by
 untrained uncertainty weights. Training the uncertainty response itself
-requires detector/motion-derived historical tokens rather than the current
-GT-only motion histories.
+requires detector/motion-derived historical tokens. Detection-history training
+above supplies real Beta uncertainty to the detection inputs and explicit gates.
 
 In `separate_full`, detection tokens use a `5 -> d_model` projection over
 `[x, y, dx, dy, u_det]`, while motion tokens use a separate `7 -> d_model`
