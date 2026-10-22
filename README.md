@@ -53,35 +53,39 @@ are occupancy detection and motion.
 `--motion_train_history gt` keeps the existing GT-history training.
 `--motion_train_history detection` jointly trains the detector and Mamba using
 actual detector observations, with autoregressive motion predictions at missed
-observations (`--motion_history_missing motion`, the default). Initialize from a
-trained checkpoint using `--train_from` (unlike `--resume`, this starts training
-with a new optimizer/scheduler). Use the same Mamba architecture/head/projection
-options as the source checkpoint to continue its motion weights. Missing and
-unused checkpoint keys are printed.
+observations (`--motion_history_missing motion`, the default). Both models train
+from epoch 1, using the initial detector's observations even while its performance
+is poor. No trained detector checkpoint or detector-only warm-up stage is required.
+`--train_from` optionally initializes weights from a checkpoint with a new
+optimizer/scheduler (`--resume` is test-only). When using it, select the same Mamba
+architecture/head/projection options to continue its motion weights. Missing and
+unused checkpoint keys are printed. `-pr` initializes the ImageNet backbone only.
 
-For example, with a joint-head, separate-full Wildtrack checkpoint:
+For example, to train both models on MultiviewX from the beginning:
 
 ```bash
-python main.py -d wildtrack --data_root /dataset \
-  --train_from logs/<SOURCE_RUN>/Best_Multiview_Tracking_wildtrack.pth \
+python main.py -d multiviewx -pr --data_root /dataset \
   --motion_train_history detection --motion_history_missing motion \
-  --multi_task_loss uncertainty --batch_size 1 --epochs 50 \
+  --multi_task_loss uncertainty --batch_size 1 --epochs 100 \
   --motion_model mamba --motion_normalization bev --motion_history_len 10 \
-  --motion_loss niw --evidential_head joint --mamba_history_mode window \
+  --motion_loss niw --evidential_head separate --mamba_history_mode window \
   --mamba_uncertainty_mode separate_full --mamba_uncertainty_gate none \
   --track_match_thresh 50 --track_low_match_thresh 80 \
-  --bev_gaussian_sigma 1.5
+  --bev_gaussian_sigma 1.5 --aug
 ```
 
 At the start of **each epoch**, the current detector runs on the training split
 to refresh detections and Beta uncertainty. The latest snapshot is stored in
 `motion_detections_train.pt` under the new log directory. This adds one detector
-inference pass per epoch. Image augmentation is disabled in this mode, even if
-`--aug` is supplied. `--batch_size` still counts image frames. Histories are
-attached by sequence/target frame, so image batches can remain shuffled.
+inference pass per epoch. Only this snapshot pass uses unaugmented frames to keep
+history coordinates consistent. Detector training still uses `--aug` when supplied;
+its augmented targets and the independent motion histories keep their respective
+coordinate systems. Detector updates within an epoch appear in the next epoch's
+snapshot. `--batch_size` still counts image frames. Histories are attached by
+sequence/target frame, so image batches can remain shuffled.
 
 `--motion_detection_cache <PATH>` optionally creates or reuses an initial cache
-for epoch 1. Reuse checks the current detector parameters/buffers, checkpoint
+for epoch 1. Reuse checks the current detector parameters/buffers, optional checkpoint
 hash, training GT/frame range, camera projections, and decoder settings. Later
 epochs refresh the run-local cache; they do not overwrite the external cache.
 
@@ -109,7 +113,10 @@ sub-grid correction. The target frame needs GT but does not need detection.
 Training uses bounded trajectory windows. Each window starts from an actual
 detection, with the existing repeated-first-state padding before that observation.
 Windows with no detection to initialize from, or gaps in the dataset timestamps,
-are excluded. Time steps with missing detections after initialization are filled
+are excluded. A batch without a motion history has no motion loss or motion task
+weight update; an entirely empty snapshot does not abort training. This is based
+on available samples, not a scheduled warm-up or a detector performance target.
+Time steps with missing detections after initialization are filled
 by motion, not compressed. `--motion_history_missing skip` retains the
 detection-only experiment, excluding incomplete windows instead. Stateful tracking
 still uses persistent state at inference; training samples remain bounded windows.

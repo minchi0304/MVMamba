@@ -264,7 +264,7 @@ if __name__ == '__main__':
     parser.add_argument('--motion_history_len', type=int, default=10, help='Number of trajectory tokens used by learned motion models')
     parser.add_argument('--motion_train_history', choices=['gt', 'detection'], default='gt', help='Joint detector/Mamba training using GT histories or current-detector histories')
     parser.add_argument('--motion_history_missing', choices=['motion', 'skip'], default='motion', help='Detection-history training: fill misses with current Mamba predictions or exclude incomplete windows')
-    parser.add_argument('--train_from', type=str, default=None, help='Initialize training weights from a checkpoint; required for detection-history training')
+    parser.add_argument('--train_from', type=str, default=None, help='Optionally initialize training weights from a checkpoint with a new optimizer/scheduler')
     parser.add_argument('--motion_detection_cache', type=str, default=None, help='Optional first-epoch detection cache; later epochs refresh detections in the current log directory')
     parser.add_argument('--motion_detection_match_thresh', type=float, default=None, help='Detection-to-GT identity matching distance in meters (default: 2 for CityTrack/MVCrowdTrack, 1 otherwise)')
     parser.add_argument('--mamba_history_mode', type=str, default='window', choices=['window', 'stateful'], help='Use a fixed trajectory window or persistent per-track Mamba state')
@@ -308,8 +308,8 @@ if __name__ == '__main__':
     if args.train_from and args.resume:
         parser.error('--train_from trains from weights; --resume is test-only. Choose one')
     if args.motion_train_history == 'detection' and not args.resume:
-        if args.motion_model != 'mamba' or not args.train_from:
-            parser.error('detection-history training requires --motion_model mamba and --train_from CHECKPOINT')
+        if args.motion_model != 'mamba':
+            parser.error('detection-history training requires --motion_model mamba')
         if args.dataset == 'gmvd_test':
             parser.error('use gmvd_train for detection-history training; gmvd_test contains test splits')
     if args.motion_detection_match_thresh is not None and (
@@ -354,8 +354,8 @@ if __name__ == '__main__':
     print(vars(args))
     print('Motion training history: {}'.format(args.motion_train_history))
     if args.motion_train_history == 'detection' and not args.resume:
-        print('Joint detector/Mamba training; detection snapshots refresh each epoch; missing history: {}'.format(args.motion_history_missing))
-        print('Detection histories use unaugmented training frames; --aug is disabled in this mode')
+        print('Joint detector/Mamba training from epoch 1; detection snapshots refresh each epoch; missing history: {}'.format(args.motion_history_missing))
+        print('History snapshots use unaugmented frames; detector training augmentation: {}'.format(args.aug))
     
      # Dataset
     normalize = T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
@@ -399,7 +399,7 @@ if __name__ == '__main__':
             if data_row[0]=='train':
                 # Train data
                 # dataset_obj = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=4, train_ratio=train_ratio, sample_require=sample_require)
-                dataset_obj = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=8, train_ratio=train_ratio, sample_require=sample_require, data_aug=args.aug and args.motion_train_history == 'gt', build_motion_samples=args.motion_model == 'mamba' and args.motion_train_history == 'gt', motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
+                dataset_obj = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=8, train_ratio=train_ratio, sample_require=sample_require, data_aug=args.aug, build_motion_samples=args.motion_model == 'mamba' and args.motion_train_history == 'gt', motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
                 train_dataset_list.append(dataset_obj)
                 
             else:
@@ -426,7 +426,7 @@ if __name__ == '__main__':
     elif args.dataset in ['wildtrack', 'multiviewx', 'citytrack', 'mvcrowdtrack']:
         grid_reduce = int(getattr(base0, 'default_grid_reduce', 4))
         img_reduce = int(getattr(base0, 'default_img_reduce', 8))
-        train_dataset_ = GetDataset(base0, train=True, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=args.aug and args.motion_train_history == 'gt', build_motion_samples=args.motion_model == 'mamba' and args.motion_train_history == 'gt', motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
+        train_dataset_ = GetDataset(base0, train=True, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=args.aug, build_motion_samples=args.motion_model == 'mamba' and args.motion_train_history == 'gt', motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
         test_dataset_ = GetDataset(base0, train=False, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=False, bev_gaussian_sigma=args.bev_gaussian_sigma)
 
         print("Training datasets")

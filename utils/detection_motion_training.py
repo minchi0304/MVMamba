@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from collections import defaultdict
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -174,10 +175,13 @@ def motion_inputs(model, item, device):
 
 
 def _cache_signature(dataset, args, model):
-    checkpoint_hash = hashlib.sha256()
-    with open(args.train_from, 'rb') as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b''):
-            checkpoint_hash.update(chunk)
+    checkpoint_sha256 = None
+    if args.train_from:
+        checkpoint_hash = hashlib.sha256()
+        with open(args.train_from, 'rb') as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                checkpoint_hash.update(chunk)
+        checkpoint_sha256 = checkpoint_hash.hexdigest()
     detector_hash = hashlib.sha256()
     for name, value in sorted(model.state_dict().items()):
         if name.startswith('motion_predictor.') or name in ('instance_weight', 'motion_weight'):
@@ -202,7 +206,7 @@ def _cache_signature(dataset, args, model):
             'projection': dataset.dicts[sub.root]['proj_mats'].tolist(),
         })
     return {
-        'version': 3, 'checkpoint_sha256': checkpoint_hash.hexdigest(),
+        'version': 3, 'checkpoint_sha256': checkpoint_sha256,
         'detector_sha256': detector_hash.hexdigest(),
         'view_pool': args.view_pool,
         'topk': utils.get_decode_topk(args), 'augmentation': False,
@@ -210,11 +214,22 @@ def _cache_signature(dataset, args, model):
     }
 
 
+@contextmanager
+def _unaugmented_frames(dataset):
+    """Keep cached positions in one coordinate frame without changing training augmentation."""
+    augmentation = [sub.data_aug for sub in dataset.datasets]
+    for sub in dataset.datasets:
+        sub.data_aug = False
+    try:
+        yield
+    finally:
+        for sub, enabled in zip(dataset.datasets, augmentation):
+            sub.data_aug = enabled
+
+
 def prepare_detection_motion_dataset(model, dataset, args, device, logdir, epoch=1):
     if any(not sub.train for sub in dataset.datasets):
         raise ValueError('Detection-history training requires training splits, not test splits')
-    for sub in dataset.datasets:
-        sub.data_aug = False
     signature = _cache_signature(dataset, args, model)
     # An external cache may initialize epoch 1 only. Later epochs use the
     # current detector and overwrite the run-local snapshot, not the source cache.
@@ -240,22 +255,23 @@ def prepare_detection_motion_dataset(model, dataset, args, device, logdir, epoch
             }
             sequences.append(sequence)
             by_root[sub.root] = (sequence, sub)
-        loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=args.num_workers, pin_memory=True)
-        model.eval()
-        for index, (item, _) in enumerate(tqdm(loader, desc='Epoch {} training detections'.format(epoch))):
-            decoded = utils.decode_frame(model, dataset, item, index, device, args)
-            root, frame, _ = utils.get_frame_metadata(loader, item)
-            sequence, sub = by_root[root]
-            gt_xy, gt_ids = sub.world_gt[frame]
-            sequence['records'].append({
-                'frame': frame,
-                # Tracker x/y order, in original grid units, with no evaluator-axis swap.
-                'xy': decoded['xy_all'].detach().cpu().numpy() * float(sub.grid_reduce),
-                'scores': decoded['scores_all'].detach().cpu().numpy().reshape(-1),
-                'uncertainty': decoded['uncertainty_all'].detach().cpu().numpy().reshape(-1),
-                'gt_xy': np.asarray(gt_xy, dtype=np.float32).reshape(-1, 2),
-                'gt_ids': np.asarray(gt_ids, dtype=np.int64),
-            })
+        with _unaugmented_frames(dataset):
+            loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+            model.eval()
+            for index, (item, _) in enumerate(tqdm(loader, desc='Epoch {} training detections'.format(epoch))):
+                decoded = utils.decode_frame(model, dataset, item, index, device, args)
+                root, frame, _ = utils.get_frame_metadata(loader, item)
+                sequence, sub = by_root[root]
+                gt_xy, gt_ids = sub.world_gt[frame]
+                sequence['records'].append({
+                    'frame': frame,
+                    # Tracker x/y order, in original grid units, with no evaluator-axis swap.
+                    'xy': decoded['xy_all'].detach().cpu().numpy() * float(sub.grid_reduce),
+                    'scores': decoded['scores_all'].detach().cpu().numpy().reshape(-1),
+                    'uncertainty': decoded['uncertainty_all'].detach().cpu().numpy().reshape(-1),
+                    'gt_xy': np.asarray(gt_xy, dtype=np.float32).reshape(-1, 2),
+                    'gt_ids': np.asarray(gt_ids, dtype=np.int64),
+                })
         os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
         torch.save({'signature': signature, 'sequences': sequences}, cache_path)
         print('Saved current training detections: {}'.format(cache_path))
@@ -270,11 +286,12 @@ def prepare_detection_motion_dataset(model, dataset, args, device, logdir, epoch
             'epoch': epoch,
             'history_source': 'detection', 'history_len': args.motion_history_len,
             'missing_history': getattr(args, 'motion_history_missing', 'motion'),
-            'cache': os.path.abspath(cache_path), 'checkpoint': os.path.abspath(args.train_from),
+            'cache': os.path.abspath(cache_path),
+            'checkpoint': os.path.abspath(args.train_from) if args.train_from else None,
             'checkpoint_sha256': signature['checkpoint_sha256'],
             'detector_sha256': signature['detector_sha256'],
             'high_cls_thres': args.high_cls_thres, 'sequences': motion_dataset.summary,
         }, output, indent=2)
     if not len(motion_dataset):
-        raise ValueError('No motion training histories: check the checkpoint, detection threshold, GT matching distance, and history length')
+        print('Epoch {}: no matched detection histories; motion loss has no samples in this snapshot'.format(epoch))
     return motion_dataset

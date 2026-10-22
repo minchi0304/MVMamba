@@ -1,5 +1,8 @@
 import contextlib
 import io
+import json
+import runpy
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -205,6 +208,67 @@ class JointTrainingTests(unittest.TestCase):
                     self.assertIsNone(model.instance_weight.grad)
                     self.assertIsNone(model.motion_weight.grad)
 
+    def test_empty_history_batch_does_not_update_motion_or_abort_training(self):
+        import main
+
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.occupancy = nn.Parameter(torch.zeros(1, 2, 1, 1))
+                self.motion_predictor = TinyMotion()
+                self.instance_weight = nn.Parameter(torch.tensor(0.))
+                self.motion_weight = nn.Parameter(torch.tensor(0.))
+
+            def forward(self, dataset, roots, images, projection):
+                return self.occupancy
+
+        empty_sequence = sequence()
+        for record in empty_sequence['records']:
+            record['scores'] = np.zeros_like(record['scores'])
+        empty = DetectionMotionDataset([empty_sequence], 2, .4, missing='motion')
+        available = DetectionMotionDataset([sequence()], 2, .4, missing='motion')
+        item = {'img': torch.ones(1, 1), 'root': ['train'], 'frame': torch.tensor([15])}
+        targets = {'center_bev': torch.ones(1, 1, 1, 1), 'valid_bev': torch.ones(1, 1, 1, 1)}
+        args = SimpleNamespace(motion_model='mamba', multi_task_loss='uncertainty')
+        model = Model()
+        optimizer = torch.optim.Adam(model.parameters(), lr=.001, weight_decay=.01)
+        criterion = lambda raw, valid, target: .5 * (raw - 1.).square().mean()
+        with patch.multiple(main, args=args, device=torch.device('cpu'), train_dataset=None,
+                            criterion=criterion, create=True), contextlib.redirect_stdout(io.StringIO()):
+            # A batch with no observation does not prevent subsequent joint updates.
+            main.train(model, 1, [(item, targets)], optimizer, 1, motion_dataset=empty)
+            self.assertGreater(model.occupancy.abs().sum().item(), 0)
+            self.assertEqual(model.motion_predictor.projection.weight.abs().sum().item(), 0)
+            self.assertEqual(model.motion_weight.item(), 0)
+            main.train(model, 1, [(item, targets)], optimizer, 1, motion_dataset=available)
+            self.assertGreater(model.motion_predictor.projection.weight.abs().sum().item(), 0)
+            motion_before = model.motion_predictor.projection.weight.detach().clone()
+            weight_before = model.motion_weight.detach().clone()
+            # Momentum/weight decay must not advance a task absent from the next batch.
+            main.train(model, 1, [(item, targets)], optimizer, 1, motion_dataset=empty)
+            torch.testing.assert_close(model.motion_predictor.projection.weight, motion_before)
+            torch.testing.assert_close(model.motion_weight, weight_before)
+
+    def test_detection_history_cli_keeps_aug_without_checkpoint(self):
+        class ReachedTrainingDataset(Exception):
+            pass
+
+        command = ('main.py -d multiviewx -pr --data_root /dataset --motion_model mamba '
+                   '--motion_normalization bev --multi_task_loss uncertainty --epochs 100 '
+                   '--track_match_thresh 50 --track_low_match_thresh 80 --bev_gaussian_sigma 1.5 '
+                   '--motion_loss niw --evidential_head separate --mamba_history_mode window '
+                   '--mamba_uncertainty_mode separate_full --mamba_uncertainty_gate none '
+                   '--aug --motion_train_history detection')
+        with contextlib.redirect_stdout(io.StringIO()) as output, \
+             patch.object(sys, 'argv', command.split()), patch('os.makedirs'), \
+             patch('utils.logger.Logger', return_value=output), \
+             patch('dataloader.multiviewx.MultiviewX', return_value=SimpleNamespace()), \
+             patch('dataloader.dataloader.GetDataset', side_effect=ReachedTrainingDataset) as get_dataset:
+            with self.assertRaises(ReachedTrainingDataset):
+                runpy.run_path(str(Path(__file__).resolve().parents[1] / 'main.py'), run_name='__main__')
+        self.assertTrue(get_dataset.call_args.kwargs['data_aug'])
+        self.assertFalse(get_dataset.call_args.kwargs['build_motion_samples'])
+
 
 class CacheTests(unittest.TestCase):
     def test_cache_creation_uses_real_decode_units_and_beta_uncertainty(self):
@@ -226,6 +290,8 @@ class CacheTests(unittest.TestCase):
                 return 4
 
             def __getitem__(self, index):
+                if self.data_aug:
+                    raise AssertionError('History snapshot must use original coordinates')
                 return {'img': torch.tensor([float(index)]), 'root': self.root, 'frame': index * 5}, {}
 
         class Detector(nn.Module):
@@ -243,13 +309,17 @@ class CacheTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             checkpoint = Path(directory) / 'source.pth'
             torch.save({}, checkpoint)
-            args = SimpleNamespace(train_from=str(checkpoint), view_pool='max', dataset='wildtrack',
+            args = SimpleNamespace(train_from=None, view_pool='max', dataset='wildtrack',
                 num_workers=0, motion_detection_cache=None, motion_history_len=2,
                 high_cls_thres=.4, motion_detection_match_thresh=None, motion_history_missing='skip')
             dataset = Frames()
             detector = Detector()
             with contextlib.redirect_stdout(io.StringIO()):
                 data = prepare_detection_motion_dataset(detector, dataset, args, 'cpu', directory)
+            self.assertTrue(dataset.data_aug)
+            metadata = json.loads((Path(directory) / 'motion_training_samples_epoch_1.json').read_text())
+            self.assertIsNone(metadata['checkpoint'])
+            self.assertIsNone(metadata['checkpoint_sha256'])
             self.assertEqual(len(data), 1)
             history = data[0]['motion_condition']
             torch.testing.assert_close(history[:, :2], torch.tensor([[12., 12.], [16., 12.]]))
@@ -264,6 +334,15 @@ class CacheTests(unittest.TestCase):
                 refreshed = prepare_detection_motion_dataset(detector, dataset, args, 'cpu', directory, epoch=2)
             self.assertFalse(torch.equal(history[:, 4], refreshed[0]['motion_condition'][:, 4]))
             self.assertTrue((Path(directory) / 'motion_training_samples_epoch_2.json').exists())
+            self.assertTrue(dataset.data_aug)
+            # Checkpoint initialization remains optional and still participates in cache identity.
+            args.train_from = str(checkpoint)
+            self.assertIsNotNone(_cache_signature(dataset, args, detector)['checkpoint_sha256'])
+            # A failed snapshot must not permanently turn off detector augmentation either.
+            with patch('utils.detection_motion_training.utils.decode_frame', side_effect=RuntimeError('decode failed')):
+                with self.assertRaisesRegex(RuntimeError, 'decode failed'):
+                    prepare_detection_motion_dataset(detector, dataset, args, 'cpu', directory, epoch=3)
+            self.assertTrue(dataset.data_aug)
 
     def test_matching_cache_is_reused_and_mismatched_cache_rejected(self):
         seq = sequence()
@@ -281,11 +360,31 @@ class CacheTests(unittest.TestCase):
                  contextlib.redirect_stdout(io.StringIO()):
                 data = prepare_detection_motion_dataset(model, dataset, args, 'cpu', directory)
             self.assertEqual(len(data), 5)
-            self.assertFalse(dataset.datasets[0].data_aug)
+            self.assertTrue(dataset.datasets[0].data_aug)
             self.assertTrue((Path(directory) / 'motion_training_samples_epoch_1.json').exists())
             with patch('utils.detection_motion_training._cache_signature', return_value={'split': 'other'}):
                 with self.assertRaisesRegex(ValueError, 'does not match'):
                     prepare_detection_motion_dataset(model, dataset, args, 'cpu', directory)
+
+    def test_empty_initial_cache_is_allowed_and_logged(self):
+        seq = sequence()
+        for record in seq['records']:
+            record['scores'] = np.zeros_like(record['scores'])
+        dataset = SimpleNamespace(datasets=[SimpleNamespace(train=True, data_aug=True)])
+        signature = {'checkpoint_sha256': None, 'detector_sha256': 'initial-detector'}
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / 'detections.pt'
+            torch.save({'signature': signature, 'sequences': [seq]}, cache)
+            args = SimpleNamespace(motion_detection_cache=str(cache), train_from=None,
+                motion_history_len=2, high_cls_thres=.4, motion_detection_match_thresh=None)
+            with patch('utils.detection_motion_training._cache_signature', return_value=signature), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                data = prepare_detection_motion_dataset(nn.Module(), dataset, args, 'cpu', directory)
+            self.assertEqual(len(data), 0)
+            self.assertTrue(dataset.datasets[0].data_aug)
+            metadata = json.loads((Path(directory) / 'motion_training_samples_epoch_1.json').read_text())
+            self.assertEqual(metadata['sequences'][0]['samples'], 0)
+            self.assertIsNone(metadata['checkpoint'])
 
     def test_test_split_cannot_become_training_cache(self):
         dataset = SimpleNamespace(datasets=[SimpleNamespace(train=False)])
