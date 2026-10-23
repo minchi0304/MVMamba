@@ -65,7 +65,6 @@ class MambaMotionPredictor(nn.Module):
         expand=2,
         num_layers=2,
         dropout=0.0,
-        motion_normalization="bev",
         history_mode="window",
         loss_type="smooth_l1",
         evidential_lambda=1e-3,
@@ -80,7 +79,6 @@ class MambaMotionPredictor(nn.Module):
         super().__init__()
 
         self.history_len = int(history_len)
-        self.motion_normalization = motion_normalization
         self.history_mode = history_mode
         self.loss_type = loss_type
         self.evidential_lambda = float(evidential_lambda)
@@ -202,8 +200,6 @@ class MambaMotionPredictor(nn.Module):
         raise ValueError("bev_grid_shape must be [2] or [batch, 2]")
 
     def _normalize_history(self, history, bev_grid_shape):
-        if self.motion_normalization == "none":
-            return history
         scale = self._coordinate_scale(bev_grid_shape, history)
         if scale.dim() == 2:
             scale = scale.unsqueeze(1)
@@ -292,18 +288,12 @@ class MambaMotionPredictor(nn.Module):
         return 0.5 * (1.0 + torch.cos(torch.pi * uncertainty))
 
     def _normalize_delta(self, delta, bev_grid_shape):
-        if self.motion_normalization == "none":
-            return delta
         return delta / self._coordinate_scale(bev_grid_shape, delta)
 
     def _denormalize_delta(self, delta, bev_grid_shape):
-        if self.motion_normalization == "none":
-            return delta
         return delta * self._coordinate_scale(bev_grid_shape, delta)
 
     def _denormalize_covariance(self, covariance, bev_grid_shape):
-        if self.motion_normalization == "none":
-            return covariance
         scale = self._coordinate_scale(bev_grid_shape, covariance)
         return covariance * scale.unsqueeze(-1) * scale.unsqueeze(-2)
 
@@ -384,7 +374,7 @@ class MambaMotionPredictor(nn.Module):
         if tokens.dim() == 1:
             tokens = tokens.unsqueeze(0)
         tokens = self._canonicalize_history(tokens)
-        if self.motion_normalization == "bev" and bev_grid_shape is None:
+        if bev_grid_shape is None:
             raise ValueError("bev_grid_shape is required for BEV normalization")
 
         batch_size = tokens.size(0)

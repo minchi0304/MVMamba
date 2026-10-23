@@ -59,16 +59,17 @@ class ReliabilityTests(unittest.TestCase):
         torch.testing.assert_close(padded[0, :2, 2:4], torch.zeros(2, 2))
         torch.testing.assert_close(padded[0, :, 4:], token[0, :, 4:].expand(3, -1))
 
-    def test_no_bev_normalization_uses_raw_covariance(self):
+    def test_shared_motion_weight_choices_use_bev_covariance(self):
         token = torch.tensor([[[10, 20, 1, 2, 0, 4, 9, 1, 0, 1, 3.0]]])
+        # Normalized trace equals the reference: 4/200^2 + 9/100^2 = .001.
         for weighting, expected in (("linear", .5), ("rational", 1 / 3), ("cosine", .5)):
             with self.subTest(weighting=weighting):
                 predictor = self.predictor(
-                    motion_normalization="none", motion_uncertainty_ref=13,
+                    motion_uncertainty_ref=.001,
                     uncertainty_weight=weighting,
                 )
                 self.assertAlmostEqual(predictor._history_reliability(
-                    predictor._normalize_history(token, None)
+                    predictor._normalize_history(token, (100, 200))
                 ).item(), expected)
 
     def test_direct_tanh_ignores_reference_and_detection_mapping_for_motion(self):
