@@ -41,13 +41,11 @@ class ReliabilityTests(unittest.TestCase):
         token = torch.tensor([[[10, 20, 1, 2, 0.9, 4, 9, 1, 0, 1, 3.0]]])
         for component, trace in (("total", .001), ("aleatoric", .00075), ("epistemic", .00025)):
             with self.subTest(component=component):
-                predictor = self.predictor(
-                    motion_uncertainty_type=component, motion_uncertainty_ref=.001,
-                )
+                predictor = self.predictor(motion_uncertainty_type=component)
                 normalized = predictor._normalize_history(token, (100, 200))
                 self.assertEqual(normalized[0, 0, 10].item(), 3.0)
                 self.assertAlmostEqual(normalized[0, 0, 7].item(), 1 / 20000)
-                expected = (1 + math.cos(math.pi * trace / (trace + .001))) / 2
+                expected = 1 - math.tanh(trace)
                 self.assertAlmostEqual(predictor._history_reliability(normalized).item(), expected, places=6)
 
     def test_gt_gate_one_and_padding_preserves_uncertainty(self):
@@ -59,32 +57,16 @@ class ReliabilityTests(unittest.TestCase):
         torch.testing.assert_close(padded[0, :2, 2:4], torch.zeros(2, 2))
         torch.testing.assert_close(padded[0, :, 4:], token[0, :, 4:].expand(3, -1))
 
-    def test_shared_motion_weight_choices_use_bev_covariance(self):
-        token = torch.tensor([[[10, 20, 1, 2, 0, 4, 9, 1, 0, 1, 3.0]]])
-        # Normalized trace equals the reference: 4/200^2 + 9/100^2 = .001.
-        for weighting, expected in (("linear", .5), ("rational", 1 / 3), ("cosine", .5)):
-            with self.subTest(weighting=weighting):
-                predictor = self.predictor(
-                    motion_uncertainty_ref=.001,
-                    uncertainty_weight=weighting,
-                )
-                self.assertAlmostEqual(predictor._history_reliability(
-                    predictor._normalize_history(token, (100, 200))
-                ).item(), expected)
-
-    def test_direct_tanh_ignores_reference_and_detection_mapping_for_motion(self):
+    def test_motion_tanh_ignores_detection_mapping(self):
         history = torch.zeros(1, 4, 11)
         history[..., 4] = .9  # Inactive detection uncertainty must be ignored.
         history[..., 5] = torch.tensor([0.0, .5, 1.0, 10.0])
         history[..., 9] = 1
         history[..., 10] = 3
         expected = torch.tensor([[1.0, .53788284274, .23840584404, 0.0]])
-        for weighting, reference in product(("linear", "rational", "cosine"), (1e-4, 100.0)):
-            with self.subTest(weighting=weighting, reference=reference):
-                predictor = self.predictor(
-                    motion_uncertainty_weight="tanh", uncertainty_weight=weighting,
-                    motion_uncertainty_ref=reference,
-                )
+        for weighting in ("linear", "rational", "cosine"):
+            with self.subTest(weighting=weighting):
+                predictor = self.predictor(uncertainty_weight=weighting)
                 torch.testing.assert_close(predictor._history_reliability(history), expected)
 
     def test_linear_detection_and_tanh_motion_use_correct_source_and_covariance(self):
@@ -101,7 +83,7 @@ class ReliabilityTests(unittest.TestCase):
         ):
             with self.subTest(component=component):
                 predictor = self.predictor(
-                    motion_uncertainty_weight="tanh", uncertainty_weight="linear",
+                    uncertainty_weight="linear",
                     motion_uncertainty_type=component,
                 )
                 normalized = predictor._normalize_history(history, (3, 2))
@@ -233,17 +215,16 @@ class GatedMambaCudaTests(unittest.TestCase):
             [11, 22, 1, 2, 0, 4, 9, 1, 0, 1, 3],
             [12, 24, 1, 2, .7, 0, 0, 0, 1, 0, 0],
         ], dtype=np.float32)
-        for mode, weighting, motion_weighting in product(
-            ("b", "delta"), ("linear", "rational", "cosine"), ("shared", "tanh"),
+        for mode, weighting in product(
+            ("b", "delta"), ("linear", "rational", "cosine"),
         ):
             for implicit in ("none", "unified", "separate", "separate_full"):
                 with self.subTest(
-                    mode=mode, implicit=implicit, weighting=weighting, motion_weighting=motion_weighting,
+                    mode=mode, implicit=implicit, weighting=weighting,
                 ), torch.no_grad():
                     predictor = self.predictor(
                         mode, history_mode="stateful", uncertainty_mode=implicit,
                         uncertainty_weight=weighting,
-                        motion_uncertainty_weight=motion_weighting,
                     )
                     torch.nn.init.normal_(predictor.delta_head[-1].weight, std=.01)
                     torch.nn.init.normal_(predictor.evidence_head[-1].weight, std=.01)
@@ -257,12 +238,11 @@ class GatedMambaCudaTests(unittest.TestCase):
                         np.testing.assert_allclose(a, b, atol=2e-5, rtol=2e-4)
 
     def test_tracker_routes_current_covariance_through_misses_and_reacquisition(self):
-        for mode, motion_weighting in product(("b", "delta"), ("shared", "tanh")):
+        for mode in ("b", "delta"):
             for history_mode in ("window", "stateful"):
-                with self.subTest(mode=mode, history_mode=history_mode, motion_weighting=motion_weighting):
+                with self.subTest(mode=mode, history_mode=history_mode):
                     predictor = self.predictor(
                         mode, history_mode=history_mode, uncertainty_weight="linear",
-                        motion_uncertainty_weight=motion_weighting,
                     )
                     tracker = Tracker(
                         motion_model="mamba", bev_grid_shape=(100, 200), device="cuda",

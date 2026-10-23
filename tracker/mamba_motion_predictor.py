@@ -69,28 +69,22 @@ class MambaMotionPredictor(nn.Module):
         dropout=0.0,
         history_mode="window",
         loss_type="smooth_l1",
-        evidential_lambda=1e-3,
         evidential_head="separate",
         uncertainty_mode="none",
         uncertainty_gate="none",
         motion_uncertainty_type="total",
-        motion_uncertainty_ref=1e-4,
         uncertainty_weight="cosine",
-        motion_uncertainty_weight="shared",
     ):
         super().__init__()
 
         self.history_len = int(history_len)
         self.history_mode = history_mode
         self.loss_type = loss_type
-        self.evidential_lambda = float(evidential_lambda)
         self.evidential_head_type = evidential_head
         self.uncertainty_mode = uncertainty_mode
         self.uncertainty_gate = uncertainty_gate
         self.motion_uncertainty_type = motion_uncertainty_type
-        self.motion_uncertainty_ref = float(motion_uncertainty_ref)
         self.uncertainty_weight = uncertainty_weight
-        self.motion_uncertainty_weight = motion_uncertainty_weight
         self.last_loss_stats = {}
         self.input_projection = nn.Linear(4, d_model)
         if self.uncertainty_mode == "unified":
@@ -265,22 +259,12 @@ class MambaMotionPredictor(nn.Module):
             trace = trace / (kappa + 1.0)
         elif self.motion_uncertainty_type == "aleatoric":
             trace = trace * kappa / (kappa + 1.0)
-        if self.motion_uncertainty_weight == "tanh":
-            # Use the selected covariance trace directly: no reference scaling
-            # and no additional linear/rational/cosine mapping for motion.
-            detection_weight = self._uncertainty_to_weight(history[..., 4].clamp(0.0, 1.0))
-            motion_weight = 1.0 - torch.tanh(trace)
-            return (
-                history[..., 8] * detection_weight
-                + history[..., 9] * motion_weight
-            )
-
-        motion_u = trace / (trace + self.motion_uncertainty_ref)
-        uncertainty = (
-            history[..., 8] * history[..., 4]
-            + history[..., 9] * motion_u
-        ).clamp(0.0, 1.0)
-        return self._uncertainty_to_weight(uncertainty)
+        detection_weight = self._uncertainty_to_weight(history[..., 4].clamp(0.0, 1.0))
+        motion_weight = 1.0 - torch.tanh(trace)
+        return (
+            history[..., 8] * detection_weight
+            + history[..., 9] * motion_weight
+        )
 
     def _uncertainty_to_weight(self, uncertainty):
         if self.uncertainty_weight == "linear":
@@ -494,7 +478,7 @@ class MambaMotionPredictor(nn.Module):
                 kappa,
                 nu,
                 scale_tril,
-                lambda_evi=self.evidential_lambda,
+                lambda_evi=1e-3,
             )
             return loss
 

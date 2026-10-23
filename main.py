@@ -29,7 +29,8 @@ from tracker.bimamba_motion_predictor import BiMambaMotionPredictor
 ###################################################################################################################################
 score = []
 best_detection_key, best_detection_idx = None, 0
-best_tracking_key, best_tracking_idx = None, 0
+best_tracking_keys = {'idf1': None, 'mota': None}
+best_tracking_indices = {'idf1': 0, 'mota': 0}
 
 
 def init_fn(worker_id):
@@ -247,10 +248,8 @@ if __name__ == '__main__':
     parser.add_argument('--mamba_history_mode', type=str, default='window', choices=['window', 'stateful'], help='Use a fixed trajectory window or persistent per-track Mamba state')
     parser.add_argument('--mamba_uncertainty_mode', type=str, default='unified', choices=['none', 'unified', 'separate', 'separate_full'], help='Implicit uncertainty input: disabled, unified, uncertainty-only branches, or fully source-specific projections')
     parser.add_argument('--mamba_uncertainty_gate', type=str, default='none', choices=['none', 'b', 'delta'], help='Explicit reliability gate on SSM B or positive delta')
-    parser.add_argument('--mamba_uncertainty_weight', type=str, default='cosine', choices=['linear', 'rational', 'cosine'], help='Detection reliability mapping, also used for motion when motion_uncertainty_weight=shared')
-    parser.add_argument('--motion_uncertainty_weight', type=str, default='shared', choices=['shared', 'tanh'], help='Motion reliability: shared mapping after trace/(trace+ref), or directly 1-tanh(trace)')
+    parser.add_argument('--mamba_uncertainty_weight', type=str, default='cosine', choices=['linear', 'rational', 'cosine'], help='Detection reliability mapping; motion always uses 1-tanh(trace)')
     parser.add_argument('--motion_uncertainty_type', type=str, default='total', choices=['aleatoric', 'epistemic', 'total'], help='NIW covariance component whose trace drives the explicit motion gate')
-    parser.add_argument('--motion_uncertainty_ref', type=float, default=1e-4, help='Positive trace reference: u_motion = trace / (trace + ref), in model coordinate units squared')
     parser.add_argument('--mamba_d_model', type=int, default=64)
     parser.add_argument('--mamba_d_state', type=int, default=16)
     parser.add_argument('--mamba_d_conv', type=int, default=4)
@@ -258,7 +257,6 @@ if __name__ == '__main__':
     parser.add_argument('--mamba_layers', type=int, default=6)
     parser.add_argument('--mamba_dropout', type=float, default=0.0)
     parser.add_argument('--motion_loss', type=str, default='niw', choices=['smooth_l1', 'niw'], help='Motion prediction loss and output head')
-    parser.add_argument('--evidential_lambda', type=float, default=1e-3, help='Evidence regularization coefficient for NIW motion loss')
     parser.add_argument('--evidential_head', type=str, default='separate', choices=['separate', 'joint'], help='Use separate mean/evidence MLPs or one joint NIW MLP')
     parser.add_argument('--bev_gaussian_sigma', type=float, default=2.0, help='Gaussian sigma used to generate BEV occupancy targets')
     parser.add_argument('--multi_task_loss', type=str, default='uncertainty', choices=['plain', 'uncertainty'], help='Choose plain summed loss or learned uncertainty weights for each active task')
@@ -286,18 +284,14 @@ if __name__ == '__main__':
     if args.mamba_uncertainty_gate != 'none':
         if args.motion_model not in ('mamba', 'bimamba') or args.motion_loss != 'niw':
             parser.error('explicit uncertainty gating requires --motion_model mamba or bimamba with --motion_loss niw')
-        if args.motion_uncertainty_weight == 'shared' and (
-            not np.isfinite(args.motion_uncertainty_ref) or args.motion_uncertainty_ref <= 0
-        ):
-            parser.error('--motion_uncertainty_ref must be finite and positive')
     print('Occupancy loss: edl')
     print('Motion model: {}'.format(args.motion_model))
     print('Motion loss: {}'.format(args.motion_loss))
     print('Motion association cost: {}'.format(args.motion_cost))
     print('Mamba uncertainty input: {}'.format(args.mamba_uncertainty_mode))
-    print('Mamba explicit gate: {}, weight: {}, motion weight: {}, motion covariance: {}, trace reference: {}'.format(
+    print('Mamba explicit gate: {}, detection weight: {}, motion weight: tanh, motion covariance: {}'.format(
         args.mamba_uncertainty_gate, args.mamba_uncertainty_weight,
-        args.motion_uncertainty_weight, args.motion_uncertainty_type, args.motion_uncertainty_ref,
+        args.motion_uncertainty_type,
     ))
     print('Multi-task loss: {}'.format(args.multi_task_loss))
     
@@ -431,14 +425,11 @@ if __name__ == '__main__':
             dropout=args.mamba_dropout,
             history_mode=args.mamba_history_mode,
             loss_type=args.motion_loss,
-            evidential_lambda=args.evidential_lambda,
             evidential_head=args.evidential_head,
             uncertainty_mode=args.mamba_uncertainty_mode,
             uncertainty_gate=args.mamba_uncertainty_gate,
             motion_uncertainty_type=args.motion_uncertainty_type,
-            motion_uncertainty_ref=args.motion_uncertainty_ref,
             uncertainty_weight=args.mamba_uncertainty_weight,
-            motion_uncertainty_weight=args.motion_uncertainty_weight,
         )
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -489,7 +480,6 @@ if __name__ == '__main__':
             criterion.eta,
         )
     )
-    best_tracking_pred_path = os.path.join(logdir, 'mota_pred_best_tracking.txt')
     for epoch in tqdm.tqdm(range(1, args.epochs+1)):
         print('Training...')
         train(
@@ -523,35 +513,41 @@ if __name__ == '__main__':
                 )
             )
 
-        current_tracking_score_key = utils.tracking_score_key(score[-1])
-        if utils.isbest(current_tracking_score_key, best_tracking_key):
-            best_tracking_key = current_tracking_score_key
-            best_tracking_idx = len(score) - 1
-            torch.save(model.state_dict(), os.path.join(logdir, 'Best_Multiview_Tracking_'+str(args.dataset)+'.pth'))
-            current_mota_pred_path = os.path.join(logdir, 'mota_pred.txt')
-            if os.path.exists(current_mota_pred_path):
-                shutil.copyfile(current_mota_pred_path, best_tracking_pred_path)
-            current_uncertainty_path = os.path.join(
-                logdir,
-                'motion_uncertainty_epoch_{}.csv'.format(epoch),
-            )
-            if os.path.exists(current_uncertainty_path):
-                shutil.copyfile(
-                    current_uncertainty_path,
-                    os.path.join(logdir, 'motion_uncertainty_best_tracking.csv'),
+        for metric in best_tracking_keys:
+            current_tracking_score_key = utils.tracking_score_key(score[-1], metric)
+            if utils.isbest(current_tracking_score_key, best_tracking_keys[metric]):
+                best_tracking_keys[metric] = current_tracking_score_key
+                best_tracking_indices[metric] = len(score) - 1
+                checkpoint_name = 'Best_Multiview_Tracking_{}_{}.pth'.format(metric.upper(), args.dataset)
+                torch.save(model.state_dict(), os.path.join(logdir, checkpoint_name))
+                current_mota_pred_path = os.path.join(logdir, 'mota_pred.txt')
+                if os.path.exists(current_mota_pred_path):
+                    shutil.copyfile(
+                        current_mota_pred_path,
+                        os.path.join(logdir, 'mota_pred_best_tracking_{}.txt'.format(metric)),
+                    )
+                current_uncertainty_path = os.path.join(
+                    logdir,
+                    'motion_uncertainty_epoch_{}.csv'.format(epoch),
                 )
-            print(
-                "Saved best tracking checkpoint by {}".format(
-                    utils.tracking_score_text(current_tracking_score_key)
+                if os.path.exists(current_uncertainty_path):
+                    shutil.copyfile(
+                        current_uncertainty_path,
+                        os.path.join(logdir, 'motion_uncertainty_best_tracking_{}.csv'.format(metric)),
+                    )
+                print(
+                    "Saved best tracking checkpoint by {}: {}".format(
+                        metric.upper(), utils.tracking_score_text(current_tracking_score_key, metric)
+                    )
                 )
-            )
         
     moda, modp, prec, rec, idf1, mota, motp_raw, motp, mt, ml = score[best_detection_idx]
     print(f'####### best detection epoch: {best_detection_idx + 1} ,moda: {moda:.1f}%, modp: {modp:.1f}%, prec: {prec:.1f}%, recall: {rec:.1f}% #######')
-    moda, modp, prec, rec, idf1, mota, motp_raw, motp, mt, ml = score[best_tracking_idx]
-    print(f'####### best tracking epoch: {best_tracking_idx + 1} ,idf1: {idf1:.1f}%, mota: {mota:.1f}%, motp_raw: {motp_raw:.4f}, motp: {motp:.1f}%, mt: {mt:.1f}%, ml: {ml:.1f}% #######')
+    for metric, best_tracking_idx in best_tracking_indices.items():
+        moda, modp, prec, rec, idf1, mota, motp_raw, motp, mt, ml = score[best_tracking_idx]
+        print(f'####### best tracking by {metric.upper()} epoch: {best_tracking_idx + 1} ,idf1: {idf1:.1f}%, mota: {mota:.1f}%, motp_raw: {motp_raw:.4f}, motp: {motp:.1f}%, mt: {mt:.1f}%, ml: {ml:.1f}% #######')
     
     print("Training Completed..")
 
-    retain_epochs = [best_detection_idx + 1, best_tracking_idx + 1]
+    retain_epochs = [best_detection_idx + 1] + [idx + 1 for idx in best_tracking_indices.values()]
     utils.cleanup(logdir, retain_epochs)

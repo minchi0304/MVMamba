@@ -111,6 +111,14 @@ python main.py \
 
 Test outputs are saved under `logs/`.
 
+Training saves two independent best tracking checkpoints in the run directory:
+
+- `Best_Multiview_Tracking_IDF1_<dataset>.pth`: highest IDF1, with MOTA as the tie-breaker.
+- `Best_Multiview_Tracking_MOTA_<dataset>.pth`: highest MOTA, with IDF1 as the tie-breaker.
+
+The existing MODA-based detection checkpoint is also saved. The final training
+summary reports the selected epoch and metrics for each tracking criterion.
+
 The BEV occupancy head uses a two-parameter Beta evidential prediction at every
 cell. Detection confidence is `alpha / (alpha + beta)`, while raw occupancy
 uncertainty is `2 / (alpha + beta)` and is retained for each decoded detection.
@@ -125,26 +133,28 @@ The main tracking controls are:
 - `--mamba_history_mode`: `window` uses the fixed trajectory window; `stateful` keeps each track's unidirectional Mamba convolution and SSM state across frames. BiMamba supports `window` only.
 - `--mamba_uncertainty_mode`: `none` uses `[x, y, dx, dy]`; `unified` projects kinematics, source masks, detection uncertainty, and motion covariance together; `separate` adds source-specific uncertainty projections to a shared kinematic projection; `separate_full` independently projects the full detection and motion tokens
 - `--mamba_uncertainty_gate`: explicit SSM gating, `none` (default), `b`, or `delta`
-- `--mamba_uncertainty_weight`: detection reliability mapping, `linear`, `rational`, or `cosine` (default); also used for motion in `shared` mode
-- `--motion_uncertainty_weight`: `shared` (default) preserves the common mapping; `tanh` uses `1 - tanh(trace)` directly for motion
+- `--mamba_uncertainty_weight`: detection reliability mapping, `linear`, `rational`, or `cosine` (default); motion always uses `1 - tanh(trace)`
 - `--motion_uncertainty_type`: `aleatoric`, `epistemic`, or `total` (default) covariance trace for the explicit motion gate
-- `--motion_uncertainty_ref`: positive trace reference for mapping motion uncertainty to `[0, 1)` (initial default: `1e-4`)
 - `--motion_cost`: `euclidean` keeps center-distance association; `mahalanobis` uses the NIW covariance for the primary association stage
 - `--mahalanobis_gate`: squared Mahalanobis gate (default: `5.991`, the 95% threshold for two dimensions)
 - `--motion_cov_scale`: calibration multiplier applied to NIW covariance before association
 - `--motion_cov_floor`: minimum covariance eigenvalue used when computing the inverse
 - `--motion_loss`: `niw` predicts a correlated 2D offset distribution; `smooth_l1` keeps the deterministic baseline
-- `--evidential_lambda`: NIW evidence regularization coefficient (default: `1e-3`)
 - `--evidential_head`: `separate` uses independent mean/evidence MLPs; `joint` uses one MLP with seven outputs
 
 Motion coordinates, displacements, and covariance are always normalized by the
 BEV width/height. The Mamba predictor estimates the normalized forward displacement. During tracking it is converted back to world-grid units and applied as
 `predicted_xy = previous_xy + predicted_delta`. A matched detection then replaces the predicted state and becomes the newest trajectory observation.
 
+The NIW evidence regularization coefficient is fixed at `1e-3` for both Mamba and BiMamba.
+
 With `--motion_loss niw`, the predictive covariance is converted to world-grid
 units and recorded without changing association. Per-epoch values are written to
-`motion_uncertainty_epoch_<epoch>.csv`; the file for the best tracking checkpoint
-is copied to `motion_uncertainty_best_tracking.csv`. The CSV contains the predicted
+`motion_uncertainty_epoch_<epoch>.csv`; the files for the two best tracking checkpoints
+are copied to `motion_uncertainty_best_tracking_idf1.csv` and
+`motion_uncertainty_best_tracking_mota.csv`. Corresponding tracking predictions
+are saved as `mota_pred_best_tracking_idf1.txt` and `mota_pred_best_tracking_mota.txt`.
+The CSV contains the predicted
 position, mean displacement, full symmetric 2D covariance, and whether the motion
 prediction matched a detection.
 
@@ -190,7 +200,7 @@ For persistent recurrent inference, add `--mamba_history_mode stateful`. In this
 
 ### Explicit uncertainty gates
 
-Both window and stateful inference support three fixed reliability mappings:
+Both window and stateful inference support three detection reliability mappings:
 
 ```text
 linear:   r = 1 - u
@@ -198,13 +208,12 @@ rational: r = (1 - u) / (1 + u)
 cosine:   r = (1 + cos(pi * u)) / 2
 
 detection: u = Beta occupancy uncertainty
-motion:    u = s / (s + motion_uncertainty_ref), s = trace(selected covariance)
+motion:    r = 1 - tanh(s), s = trace(selected covariance)
 ```
 
 All three mappings decrease from `r = 1` at `u = 0` to `r = 0` at `u = 1`.
-With `--motion_uncertainty_weight shared` (default), the same selected mapping
-applies to detection and motion, independently of the `b`/`delta` gate location
-and covariance component. All existing mappings remain available.
+The selected mapping applies only to detection. Motion always uses `1 - tanh(s)`,
+independently of the `b`/`delta` gate location and covariance component.
 
 For NIW parameters `Psi = L @ L.T`, `kappa`, and `nu` in two dimensions:
 
@@ -216,9 +225,7 @@ total covariance     = aleatoric + epistemic
 
 The selected covariance is expressed in the same coordinate system as the
 motion model before taking its trace. The BEV-normalized trace is
-`cov_xx / W^2 + cov_yy / H^2`. The initial reference `1e-4` is a tunable starting value, not a
-calibrated uncertainty threshold; `s = reference` gives `u = 0.5`, hence
-`r = 0.5` for linear/cosine and `r = 1/3` for rational.
+`cov_xx / W^2 + cov_yy / H^2`.
 Detection uncertainty uses its existing `[0, 1]` scale directly.
 
 For the detection-linear / motion-tanh experiment, use:
@@ -226,18 +233,16 @@ For the detection-linear / motion-tanh experiment, use:
 ```bash
 --motion_model mamba --motion_loss niw \
 --mamba_uncertainty_mode none --mamba_uncertainty_gate b \
---mamba_uncertainty_weight linear --motion_uncertainty_weight tanh \
+--mamba_uncertainty_weight linear \
 --motion_uncertainty_type total
 ```
 
 This applies `r_det = 1 - u_det` and `r_motion = 1 - tanh(s)` directly.
-The tanh mode uses the selected covariance trace in model coordinates (after
-BEV normalization), with no additional scale parameter,
-`trace/(trace+ref)` transform, or second weighting function. Consequently,
-`--motion_uncertainty_ref` is unused in this mode. If the normalized trace is
+Motion uses the selected covariance trace in model coordinates (after
+BEV normalization), with no additional scale parameter or second weighting function.
+If the normalized trace is
 small, motion weights remain close to one (e.g. `s = 0.001` gives about `0.999`).
-Use `--motion_uncertainty_weight shared` to return to the previous motion
-mapping. Detection can still independently select linear, rational, or cosine.
+Detection can independently select linear, rational, or cosine.
 
 The two gate locations are separate experiments. Here `delta` is the positive
 SSM time step after softplus, **not** the predicted spatial displacement:
@@ -270,10 +275,10 @@ training or test command:
 --mamba_uncertainty_mode none --motion_cost euclidean \
 --mamba_uncertainty_gate b \
 --mamba_uncertainty_weight cosine \
---motion_uncertainty_type total --motion_uncertainty_ref 1e-4
+--motion_uncertainty_type total
 ```
 
-Replace `cosine` with `linear` or `rational` to compare reliability mappings.
+Replace `cosine` with `linear` or `rational` to compare detection reliability mappings.
 Replace `b` with `delta` to change the gate location, and select `aleatoric`,
 `epistemic`, or `total` for the covariance ablation. Use
 `--mamba_uncertainty_gate none` for the ungated baseline. The implicit modes

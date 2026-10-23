@@ -125,17 +125,20 @@ def detection_score_key(metrics):
     return (metrics[0],)
 
 
-def tracking_score_key(metrics):
+def tracking_score_key(metrics, criterion='idf1'):
     # score layout: [moda, modp, prec, rec, idf1, mota, motp_raw, motp, mt, ml]
-    return (metrics[4], metrics[5])
+    # Break ties in the selected metric using the other tracking metric.
+    indices = {'idf1': (4, 5), 'mota': (5, 4)}[criterion]
+    return tuple(metrics[index] for index in indices)
 
 
 def detection_score_text(score_key):
     return "moda: {:.1f}%".format(score_key[0])
 
 
-def tracking_score_text(score_key):
-    return "idf1/mota: {:.1f}%/{:.1f}%".format(score_key[0], score_key[1])
+def tracking_score_text(score_key, criterion='idf1'):
+    labels = {'idf1': 'idf1/mota', 'mota': 'mota/idf1'}[criterion]
+    return "{}: {:.1f}%/{:.1f}%".format(labels, score_key[0], score_key[1])
 
 
 def split_occupancy_params(bev_occupancy):
