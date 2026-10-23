@@ -356,7 +356,6 @@ class Tracker:
         unconfirmed_match_thresh=100.0,
         duplicate_thresh=6.0,
         motion_model="kalman",
-        motion_normalization="bev",
         bev_grid_shape=None,
         device=None,
         motion_predictor=None,
@@ -401,7 +400,7 @@ class Tracker:
         self.motion_predictor = None
         self.last_motion_predictions = []
         if motion_model == "mamba":
-            if motion_normalization == "bev" and bev_grid_shape is None:
+            if bev_grid_shape is None:
                 raise ValueError("bev_grid_shape is required for BEV-normalized learned motion")
             if motion_predictor is None:
                 raise ValueError("a trained motion predictor is required")

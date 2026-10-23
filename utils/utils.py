@@ -279,7 +279,6 @@ def build_tracker(args, dataset_config, tracker_device, motion_predictor=None):
         match_thresh=float(args.track_match_thresh),
         unconfirmed_match_thresh=float(args.track_low_match_thresh),
         motion_model=args.motion_model,
-        motion_normalization=args.motion_normalization,
         bev_grid_shape=tuple(base_dataset.world_grid_shape),
         device=tracker_device,
         motion_predictor=motion_predictor,
