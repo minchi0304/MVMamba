@@ -15,16 +15,20 @@ class MultiView_Detection(nn.Module):
         latent_dim=512,
         device=torch.device('cuda'),
         multi_task_loss="plain",
+        view_pool="avg",
         use_motion_loss=False,
     ):
         super().__init__()
         if multi_task_loss not in ["plain", "uncertainty"]:
             raise ValueError("multi_task_loss must be 'plain' or 'uncertainty'")
+        if view_pool not in ["avg", "max"]:
+            raise ValueError("view_pool must be 'avg' or 'max'")
         self.logdir = logdir
         self.device = device
         self.feat2d = 128
         self.base_arch = nn.Sequential(*list(backbone_model.children())[:-2]).to(self.device)
         self.multi_task_loss = multi_task_loss
+        self.view_pool = view_pool
         self.use_motion_loss = bool(use_motion_loss)
         if self.multi_task_loss == "uncertainty":
             self.instance_weight = nn.Parameter(torch.tensor(0.0), requires_grad=True)
@@ -92,7 +96,10 @@ class MultiView_Detection(nn.Module):
         proj_mats = proj_mats.float().to(self.device)
         world_features = warp_perspective(img_features, proj_mats, reducedgrid_shape) #(N, 512, Hg/4, Wg/4)
 
-        world_features = torch.max(world_features, dim=0, keepdim=True).values  # (1, 512, Hg/4, Wg/4)
+        if self.view_pool == "avg":
+            world_features = torch.mean(world_features, dim=0, keepdim=True)  # (1, 512, Hg/4, Wg/4)
+        else:
+            world_features = torch.max(world_features, dim=0, keepdim=True).values  # (1, 512, Hg/4, Wg/4)
         world_features = torch.cat([world_features, coord_map.repeat([B, 1, 1, 1]).to(self.device)], dim=1)
 
         # fig = plt.figure()

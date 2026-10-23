@@ -3,10 +3,10 @@ import time
 import csv
 import numpy as np
 import random
+import argparse
 import sys
 import datetime
 import shutil
-import json
 import tqdm
 import torch
 import torch.optim as optim
@@ -24,8 +24,9 @@ from utils.loss import EvidentialOccupancyLoss
 from detector.multiview_model import MultiView_Detection
 from detector.encoder import resnet18
 from tracker.mamba_motion_predictor import MambaMotionPredictor
-from utils.training_stages import load_detector_weights, freeze_detector
-from utils.arguments import create_parser, parse_args
+from utils.detection_motion_training import (
+    motion_inputs, prepare_detection_motion_dataset,
+)
     
 ###################################################################################################################################
 score = []
@@ -62,18 +63,21 @@ def train(
     data_loader,
     optimizer,
     log_interval,
-    *, dataset, device, criterion, args,
+    motion_dataset=None,
 ):
     model.train()
     tic = time.time()
 
     losses = 0
+    history_counts = {'samples': 0, 'detection_tokens': 0, 'motion_tokens': 0}
+    detection_uncertainty_sum = 0.0
+    motion_trace_sum = 0.0
 
     for batch_idx, (item, target) in enumerate(data_loader):
         optimizer.zero_grad()
         data = item['img'].to(device)
                 
-        bev_occupancy = model(dataset, item['root'], data, item.get('proj_mats'))
+        bev_occupancy = model(train_dataset, item['root'], data, item.get('proj_mats'))
         bev_center = utils.get_occupancy_prob(bev_occupancy)
 
         # occupancy gt
@@ -82,17 +86,23 @@ def train(
 
         occ_loss = criterion(bev_occupancy, gt_valid_bev.float(), gt_occ)
 
-        has_motion_sample = args.motion_model == 'mamba' and item['motion_bev_grid_shape'].size(0) > 0
+        motion_item = motion_dataset.batch_for_frames(item['root'], item['frame']) if motion_dataset is not None else item
+        has_motion_sample = args.motion_model == 'mamba' and motion_item['motion_bev_grid_shape'].size(0) > 0
         if has_motion_sample:
-            motion_condition = item['motion_condition'].to(device)
-            motion_target = item['motion_target'].to(device)
-            motion_bev_grid_shape = item['motion_bev_grid_shape'].to(device)
+            motion_condition, motion_target, motion_bev_grid_shape = motion_inputs(model, motion_item, bev_center.device)
             motion_loss = model.motion_predictor(
                 motion_condition,
                 motion_target,
                 bev_grid_shape=motion_bev_grid_shape,
             )
             motion_stats = model.motion_predictor.last_loss_stats
+            if motion_dataset is not None:
+                is_det, is_motion = motion_condition[..., 8].bool(), motion_condition[..., 9].bool()
+                history_counts['samples'] += motion_condition.size(0)
+                history_counts['detection_tokens'] += int(is_det.sum())
+                history_counts['motion_tokens'] += int(is_motion.sum())
+                detection_uncertainty_sum += float(motion_condition[..., 4][is_det].sum())
+                motion_trace_sum += float((motion_condition[..., 5] + motion_condition[..., 6])[is_motion].sum())
         else:
             motion_loss = occ_loss.new_zeros(())
             motion_stats = {}
@@ -128,6 +138,11 @@ def train(
     print('Train Epoch: {}, Batch:{}/{},\t occ_loss: {:.3f}, motion_loss: {:.6f}{}{}, \tTime: {:.3f} (min), maxima: {:.3f}'.format(
                     epoch, (batch_idx + 1), len(data_loader), occ_loss.item(), motion_loss.item(), task_weight_text, motion_stats_text, (time.time()-tic)/60, bev_center.max()))
 
+    if motion_dataset is not None:
+        history_counts['mean_detection_uncertainty'] = detection_uncertainty_sum / max(history_counts['detection_tokens'], 1)
+        history_counts['mean_motion_covariance_trace_grid2'] = motion_trace_sum / max(history_counts['motion_tokens'], 1)
+        print('Epoch {} training history: {}'.format(epoch, history_counts))
+
     return losses / len(data_loader)
 
 
@@ -142,7 +157,6 @@ def test(
     visualize_all_frames=False,
     plot_tracking_videos=False,
     plot_tracking_seq_ids=None,
-    detection_only=False,
 ):
     model.eval()
 
@@ -176,18 +190,6 @@ def test(
             )
 
         if res_fpath is not None:
-            if detection_only:
-                config = data_loader.dataset.dicts[root_name]
-                xy = decoded['eval_xy']
-                if config['base'].base.indexing != 'xy':
-                    xy = xy[:, [1, 0]]
-                all_res_rows.append(torch.cat((
-                    xy.new_full((len(xy), 1), frame_id),
-                    xy * float(config['base'].grid_reduce),
-                    decoded['eval_scores'],
-                    xy.new_full((len(xy), 1), dataset_idx),
-                ), dim=1))
-                continue
             result_rows, realtime_elapsed = utils.update_tracking_for_frame(
                 data_loader,
                 item,
@@ -212,14 +214,7 @@ def test(
                 if realtime_elapsed > 0.0:
                     realtime_fps_by_frame[(dataset_idx, frame_id)] = 1.0 / realtime_elapsed
 
-    if detection_only and res_fpath is not None:
-        all_res = utils.stack_detection_results(all_res_rows, device)
-        np.savetxt(res_fpath, all_res.cpu().numpy(), '%.8f')
-        metrics = utils.evaluate_detection_results(logdir, epoch, data_loader, all_res)
-        score.append(list(metrics))
-        moda, modp, precision, recall = metrics
-        print(f'####### moda: {moda:.1f}%, modp: {modp:.1f}%, prec: {precision:.1f}%, recall: {recall:.1f}% #######')
-    elif res_fpath is not None:
+    if res_fpath is not None:
         moda = utils.finalize_results(
             epoch,
             data_loader,
@@ -254,24 +249,89 @@ def test(
     return np.average(moda)
 
 
-def run(stage='joint', train_epoch=None, argv=None):
-    global args, device, logdir, score
-    args = parse_args(stage, argv)
-    score = []
-    best_detection_key = best_tracking_key = None
-    best_detection_idx = best_tracking_idx = 0
-    train_epoch = train if train_epoch is None else train_epoch
+###################################################################################################################################
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Multiview detector')
+    parser.add_argument('--high_cls_thres', type=float, default=0.4, help='Confidence threshold for high-confidence detections')
+    parser.add_argument('--track_match_thresh', type=float, default=75, help='MVTrackTrans-style center-distance association threshold')
+    parser.add_argument('--track_low_match_thresh', type=float, default=100, help='MVTrackTrans-style center-distance gate for unconfirmed tracks')
+    parser.add_argument('--motion_cost', type=str, default='euclidean', choices=['euclidean', 'mahalanobis'], help='Primary track-to-detection motion cost')
+    parser.add_argument('--mahalanobis_gate', type=float, default=5.991, help='Squared Mahalanobis gate for primary association')
+    parser.add_argument('--motion_cov_scale', type=float, default=1.0, help='Scale applied to NIW motion covariance during association')
+    parser.add_argument('--motion_cov_floor', type=float, default=1e-4, help='Minimum covariance eigenvalue during Mahalanobis association')
+    parser.add_argument('--motion_model', type=str, default='mamba', choices=['kalman', 'mamba'], help='Motion prediction model used by the tracker')
+    parser.add_argument('--motion_normalization',type=str, default='bev', choices=['bev', 'none'], help='Normalize learned-motion coordinates by BEV grid size or use raw grid coordinates.')
+    parser.add_argument('--motion_history_len', type=int, default=10, help='Number of trajectory tokens used by learned motion models')
+    parser.add_argument('--motion_train_history', choices=['gt', 'detection'], default='gt', help='Joint detector/Mamba training using GT histories or current-detector histories')
+    parser.add_argument('--motion_history_missing', choices=['motion', 'skip'], default='motion', help='Detection-history training: fill misses with current Mamba predictions or exclude incomplete windows')
+    parser.add_argument('--train_from', type=str, default=None, help='Optionally initialize training weights from a checkpoint with a new optimizer/scheduler')
+    parser.add_argument('--motion_detection_cache', type=str, default=None, help='Optional first-epoch detection cache; later epochs refresh detections in the current log directory')
+    parser.add_argument('--motion_detection_match_thresh', type=float, default=None, help='Detection-to-GT identity matching distance in meters (default: 2 for CityTrack/MVCrowdTrack, 1 otherwise)')
+    parser.add_argument('--mamba_history_mode', type=str, default='window', choices=['window', 'stateful'], help='Use a fixed trajectory window or persistent per-track Mamba state')
+    parser.add_argument('--mamba_uncertainty_mode', type=str, default='unified', choices=['none', 'unified', 'separate', 'separate_full'], help='Implicit uncertainty input: disabled, unified, uncertainty-only branches, or fully source-specific projections')
+    parser.add_argument('--mamba_uncertainty_gate', type=str, default='none', choices=['none', 'b', 'delta'], help='Explicit reliability gate on SSM B or positive delta')
+    parser.add_argument('--mamba_uncertainty_weight', type=str, default='cosine', choices=['linear', 'rational', 'cosine'], help='Detection reliability mapping, also used for motion when motion_uncertainty_weight=shared')
+    parser.add_argument('--motion_uncertainty_weight', type=str, default='shared', choices=['shared', 'tanh'], help='Motion reliability: shared mapping after trace/(trace+ref), or directly 1-tanh(trace)')
+    parser.add_argument('--motion_uncertainty_type', type=str, default='total', choices=['aleatoric', 'epistemic', 'total'], help='NIW covariance component whose trace drives the explicit motion gate')
+    parser.add_argument('--motion_uncertainty_ref', type=float, default=1e-4, help='Positive trace reference: u_motion = trace / (trace + ref), in model coordinate units squared')
+    parser.add_argument('--mamba_d_model', type=int, default=128)
+    parser.add_argument('--mamba_d_state', type=int, default=16)
+    parser.add_argument('--mamba_d_conv', type=int, default=4)
+    parser.add_argument('--mamba_expand', type=int, default=2)
+    parser.add_argument('--mamba_layers', type=int, default=2)
+    parser.add_argument('--mamba_dropout', type=float, default=0.0)
+    parser.add_argument('--motion_loss', type=str, default='niw', choices=['smooth_l1', 'niw'], help='Motion prediction loss and output head')
+    parser.add_argument('--evidential_lambda', type=float, default=1e-3, help='Evidence regularization coefficient for NIW motion loss')
+    parser.add_argument('--evidential_head', type=str, default='separate', choices=['separate', 'joint'], help='Use separate mean/evidence MLPs or one joint NIW MLP')
+    parser.add_argument('--bev_gaussian_sigma', type=float, default=2.0, help='Gaussian sigma used to generate BEV occupancy targets')
+    parser.add_argument('--multi_task_loss', type=str, default='uncertainty', choices=['plain', 'uncertainty'], help='Choose plain summed loss or learned uncertainty weights for each active task')
+    parser.add_argument('--data_root', type=str, default='/dataset/Multiview_datasets', help='Root containing dataset folders')
+    parser.add_argument('-d', '--dataset', type=str, default='wildtrack', choices=['wildtrack', 'multiviewx', 'citytrack', 'mvcrowdtrack', 'gmvd_test','gmvd_train'], help='Choose dataset wildtrack/multiviewx/citytrack/mvcrowdtrack/gmvd (default: wildtrack)')
+    parser.add_argument('-pr', '--pretrained', default=False, action='store_true', help='Use pretrained weights (default: True)')
+    parser.add_argument('-j', '--num_workers', type=int, default=4)
+    parser.add_argument('-b', '--batch_size', type=int, default=1, metavar='N', help='input batch size for training (default: 2)')
+    parser.add_argument('--epochs', type=int, default=120, metavar='N', help='number of epochs to train')
+    parser.add_argument('--lr', type=float, default=1e-4, metavar='LR', help='learning rate (default: 1e-3)')
+    parser.add_argument('--min_lr', type=float, default=1e-6, metavar='min LR', help='minimum learning rate for cosine scheduler')
+    parser.add_argument('--weight_decay', type=float, default=5e-4)
+    parser.add_argument('--momentum', type=float, default=0.5, metavar='M', help='SGD momentum (default: 0.5)')
+    parser.add_argument('--log_interval', type=int, default=200, metavar='N', help='how many batches to wait before logging training status')
+    parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--visualize_all_frames', action='store_true', help='Save per-frame map images under maps_{epoch} during test')
+    parser.add_argument('--plot_tracking_videos', action='store_true', help='Also save tracking trajectory and camera videos during test')
+    parser.add_argument('--seed', type=int, default=1, help='random seed (default: 1)')
+    parser.add_argument('--aug', action='store_true', help='Use train-time random resize/crop augmentation')
+    parser.add_argument('--view_pool', type=str, default='max', choices=['avg', 'max'], help='Camera-view pooling mode')
+    parser.add_argument('--optim', type=str, default='Adam', choices=['SGD', 'Adam'], help='Choose optimizer.(default : SGD)')
+
+    args = parser.parse_args()
+    if args.train_from and args.resume:
+        parser.error('--train_from trains from weights; --resume is test-only. Choose one')
+    if args.motion_train_history == 'detection' and not args.resume:
+        if args.motion_model != 'mamba':
+            parser.error('detection-history training requires --motion_model mamba')
+        if args.dataset == 'gmvd_test':
+            parser.error('use gmvd_train for detection-history training; gmvd_test contains test splits')
+    if args.motion_detection_match_thresh is not None and (
+        not np.isfinite(args.motion_detection_match_thresh) or args.motion_detection_match_thresh <= 0
+    ):
+        parser.error('--motion_detection_match_thresh must be finite and positive')
+    if args.mamba_uncertainty_gate != 'none':
+        if args.motion_model != 'mamba' or args.motion_loss != 'niw':
+            parser.error('explicit Mamba uncertainty gating requires --motion_model mamba --motion_loss niw')
+        if args.motion_uncertainty_weight == 'shared' and (
+            not np.isfinite(args.motion_uncertainty_ref) or args.motion_uncertainty_ref <= 0
+        ):
+            parser.error('--motion_uncertainty_ref must be finite and positive')
     print('Occupancy loss: edl')
-    print('Training stage: {}'.format(stage))
-    if stage != 'detector':
-        print('Motion model: {}'.format(args.motion_model))
-        print('Motion loss: {}'.format(args.motion_loss))
-        print('Motion association cost: {}'.format(args.motion_cost))
-        print('Mamba uncertainty input: {}'.format(args.mamba_uncertainty_mode))
-        print('Mamba explicit gate: {}, weight: {}, motion weight: {}, motion covariance: {}, trace reference: {}'.format(
-            args.mamba_uncertainty_gate, args.mamba_uncertainty_weight,
-            args.motion_uncertainty_weight, args.motion_uncertainty_type, args.motion_uncertainty_ref,
-        ))
+    print('Motion model: {}'.format(args.motion_model))
+    print('Motion loss: {}'.format(args.motion_loss))
+    print('Motion association cost: {}'.format(args.motion_cost))
+    print('Mamba uncertainty input: {}'.format(args.mamba_uncertainty_mode))
+    print('Mamba explicit gate: {}, weight: {}, motion weight: {}, motion covariance: {}, trace reference: {}'.format(
+        args.mamba_uncertainty_gate, args.mamba_uncertainty_weight,
+        args.motion_uncertainty_weight, args.motion_uncertainty_type, args.motion_uncertainty_ref,
+    ))
     print('Multi-task loss: {}'.format(args.multi_task_loss))
     
     torch.cuda.empty_cache()
@@ -287,15 +347,16 @@ def run(stage='joint', train_epoch=None, argv=None):
         torch.backends.cudnn.benchmark = True
         
     #Logging
-    logdir = args.output_dir or f'logs/{args.dataset}_{stage}_' + datetime.datetime.today().strftime('%d_%m_%Y_%H_%M_%S_%f')
+    logdir = f'logs/{args.dataset}_'+datetime.datetime.today().strftime('%d_%m_%Y_%H_%M_%S')
     os.makedirs(logdir, exist_ok=True)
     sys.stdout = Logger(os.path.join(logdir, 'log.txt'), )
     print('Settings:')
     print(vars(args))
-    with open(os.path.join(logdir, 'settings.json'), 'w') as settings_file:
-        json.dump({'stage': stage, **vars(args)}, settings_file, indent=2)
-    print('Motion training history: {}'.format('GT' if stage == 'joint' else 'frozen detector' if stage == 'motion' else 'not used'))
-
+    print('Motion training history: {}'.format(args.motion_train_history))
+    if args.motion_train_history == 'detection' and not args.resume:
+        print('Joint detector/Mamba training from epoch 1; detection snapshots refresh each epoch; missing history: {}'.format(args.motion_history_missing))
+        print('History snapshots use unaugmented frames; detector training augmentation: {}'.format(args.aug))
+    
      # Dataset
     normalize = T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
     train_transform = T.Compose([T.ToTensor(), normalize])
@@ -329,7 +390,7 @@ def run(stage='joint', train_epoch=None, argv=None):
             train_ratio = float(data_row[2])
             sample_require = int(data_row[3])
             sub_path = str(data_row[1]).lstrip('.')
-            path = os.path.expanduser(os.path.join(args.data_root, sub_path.lstrip('/\\')))
+            path = os.path.expanduser("/dataset/Multiview_datasets"+sub_path)
             if data_row[1].split('/')[-1]!='Wildtrack':
                 base = MultiviewX(path)
             else:
@@ -338,7 +399,7 @@ def run(stage='joint', train_epoch=None, argv=None):
             if data_row[0]=='train':
                 # Train data
                 # dataset_obj = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=4, train_ratio=train_ratio, sample_require=sample_require)
-                dataset_obj = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=8, train_ratio=train_ratio, sample_require=sample_require, data_aug=args.aug, build_motion_samples=stage == 'joint' and args.motion_model == 'mamba', motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
+                dataset_obj = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=8, train_ratio=train_ratio, sample_require=sample_require, data_aug=args.aug, build_motion_samples=args.motion_model == 'mamba' and args.motion_train_history == 'gt', motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
                 train_dataset_list.append(dataset_obj)
                 
             else:
@@ -365,7 +426,7 @@ def run(stage='joint', train_epoch=None, argv=None):
     elif args.dataset in ['wildtrack', 'multiviewx', 'citytrack', 'mvcrowdtrack']:
         grid_reduce = int(getattr(base0, 'default_grid_reduce', 4))
         img_reduce = int(getattr(base0, 'default_img_reduce', 8))
-        train_dataset_ = GetDataset(base0, train=True, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=args.aug, build_motion_samples=stage == 'joint' and args.motion_model == 'mamba', motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
+        train_dataset_ = GetDataset(base0, train=True, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=args.aug, build_motion_samples=args.motion_model == 'mamba' and args.motion_train_history == 'gt', motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
         test_dataset_ = GetDataset(base0, train=False, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=False, bev_gaussian_sigma=args.bev_gaussian_sigma)
 
         print("Training datasets")
@@ -374,11 +435,10 @@ def run(stage='joint', train_epoch=None, argv=None):
         test_dataset = ConcatDataset(test_dataset_)
     
     # Train and Test Data Loader 
-    if stage != 'motion':
-        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
-                                                num_workers=args.num_workers, pin_memory=True, worker_init_fn=init_fn,
-                                                collate_fn=motion_joint_collate if args.motion_model == 'mamba' else None)
-
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                                            num_workers=args.num_workers, pin_memory=True, worker_init_fn=init_fn,
+                                            collate_fn=motion_joint_collate if args.motion_model == 'mamba' else None)
+    
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False,
                                             num_workers=args.num_workers, pin_memory=True, worker_init_fn=init_fn)
 
@@ -388,13 +448,12 @@ def run(stage='joint', train_epoch=None, argv=None):
     print(f'Test Data : {len(test_loader)}')
     
     # Model
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     resnet_model = resnet18(pretrained=args.pretrained, replace_stride_with_dilation=[False, True, True])
     model = MultiView_Detection(
         resnet_model,
         logdir,
-        device=device,
         multi_task_loss=args.multi_task_loss,
+        view_pool=args.view_pool,
         use_motion_loss=args.motion_model == 'mamba',
     )
     if args.motion_model == 'mamba':
@@ -406,6 +465,7 @@ def run(stage='joint', train_epoch=None, argv=None):
             expand=args.mamba_expand,
             num_layers=args.mamba_layers,
             dropout=args.mamba_dropout,
+            motion_normalization=args.motion_normalization,
             history_mode=args.mamba_history_mode,
             loss_type=args.motion_loss,
             evidential_lambda=args.evidential_lambda,
@@ -418,22 +478,19 @@ def run(stage='joint', train_epoch=None, argv=None):
             motion_uncertainty_weight=args.motion_uncertainty_weight,
         )
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
 
     print(model)
 
-    if stage == 'motion':
-        load_detector_weights(model, args.detector_checkpoint)
-        freeze_detector(model)
-        from utils.motion_training_data import prepare_motion_dataset
-        cache_start = time.perf_counter()
-        motion_dataset = prepare_motion_dataset(model, train_dataset, args, device, logdir)
-        cache_seconds = time.perf_counter() - cache_start
-        with open(os.path.join(logdir, 'history_preparation.json'), 'w') as output:
-            json.dump({'seconds': cache_seconds, 'samples': len(motion_dataset)}, output, indent=2)
-        train_loader = torch.utils.data.DataLoader(motion_dataset, batch_size=args.batch_size, shuffle=True,
-                                                  num_workers=0, pin_memory=True)
-        print('Frozen detector; motion samples: {}; history preparation: {:.1f}s'.format(len(motion_dataset), cache_seconds))
+    if args.train_from:
+        loaded = model.load_state_dict(torch.load(args.train_from, map_location='cpu'), strict=False)
+        missing_detector = [name for name in loaded.missing_keys if not name.startswith('motion_predictor.')
+                            and name not in ('instance_weight', 'motion_weight')]
+        if missing_detector:
+            raise ValueError('Training checkpoint is missing detector weights: {}'.format(missing_detector))
+        print('Initialized training weights: {}'.format(args.train_from))
+        print('Checkpoint missing keys: {}; unused keys: {}'.format(loaded.missing_keys, loaded.unexpected_keys))
 
     if args.resume is not None:
         model.load_state_dict(torch.load(args.resume, map_location=device),strict=False)
@@ -469,24 +526,30 @@ def run(stage='joint', train_epoch=None, argv=None):
         eta_min=args.min_lr,
     )
     
-    # Separate stages each optimize one unweighted task loss.
-    criterion = None if stage == 'motion' else EvidentialOccupancyLoss().to(device)
-    if criterion is not None:
-        print('Occupancy EDL lambda_reg: {}, gamma: {}, eta: {}'.format(criterion.lambda_reg, criterion.gamma, criterion.eta))
-    metric_names = ['moda', 'modp', 'precision', 'recall']
-    if stage != 'detector':
-        metric_names += ['idf1', 'mota', 'motp_raw', 'motp', 'mt', 'ml']
-    metrics_path = os.path.join(logdir, 'metrics.csv')
-    with open(metrics_path, 'w', newline='') as output:
-        csv.writer(output).writerow(['epoch', 'train_loss', 'lr', 'train_seconds', 'eval_seconds'] + metric_names)
+    # Loss
+    criterion = EvidentialOccupancyLoss().to(device)
+    print(
+        'Occupancy EDL lambda_reg: {}, gamma: {}, eta: {}'.format(
+            criterion.lambda_reg,
+            criterion.gamma,
+            criterion.eta,
+        )
+    )
     best_tracking_pred_path = os.path.join(logdir, 'mota_pred_best_tracking.txt')
     for epoch in tqdm.tqdm(range(1, args.epochs+1)):
+        motion_dataset = None
+        if args.motion_train_history == 'detection':
+            motion_dataset = prepare_detection_motion_dataset(model, train_dataset, args, device, logdir, epoch=epoch)
         print('Training...')
-        train_start = time.perf_counter()
-        train_loss = train_epoch(model, epoch, train_loader, optimizer, args.log_interval,
-                                 dataset=train_dataset, device=device, criterion=criterion, args=args)
-        train_seconds = time.perf_counter() - train_start
-        eval_start = time.perf_counter()
+        train(
+            model,
+            epoch,
+            train_loader,
+            optimizer,
+            args.log_interval,
+            motion_dataset=motion_dataset,
+        )
+        
         print('Testing...')
         test(
             model,
@@ -494,20 +557,13 @@ def run(stage='joint', train_epoch=None, argv=None):
             test_loader,
             os.path.join(logdir, 'test_'+str(args.dataset)+'_'+str(epoch)+'.txt'),
             visualize=True,
-            detection_only=stage == 'detector',
         )
             
-        eval_seconds = time.perf_counter() - eval_start
-        with open(metrics_path, 'a', newline='') as output:
-            csv.writer(output).writerow([epoch, train_loss, optimizer.param_groups[0]['lr'], train_seconds, eval_seconds] + list(score[-1]))
-        torch.save(model.state_dict(), os.path.join(logdir, 'Last_Multiview_{}.pth'.format(args.dataset)))
-        if stage == 'motion':
-            torch.save(model.motion_predictor.state_dict(), os.path.join(logdir, 'Last_Motion_{}.pth'.format(args.dataset)))
         scheduler.step()
         
         # Save Dictionary
         current_detection_score_key = utils.detection_score_key(score[-1])
-        if stage != 'motion' and utils.isbest(current_detection_score_key, best_detection_key):
+        if utils.isbest(current_detection_score_key, best_detection_key):
             best_detection_key = current_detection_score_key
             best_detection_idx = len(score) - 1
             torch.save(model.state_dict(), os.path.join(logdir, 'Best_Multiview_Detection_'+str(args.dataset)+'.pth'))
@@ -517,38 +573,35 @@ def run(stage='joint', train_epoch=None, argv=None):
                 )
             )
 
-        if stage != 'detector':
-            current_tracking_score_key = utils.tracking_score_key(score[-1])
-            if utils.isbest(current_tracking_score_key, best_tracking_key):
-                best_tracking_key = current_tracking_score_key
-                best_tracking_idx = len(score) - 1
-                torch.save(model.state_dict(), os.path.join(logdir, 'Best_Multiview_Tracking_'+str(args.dataset)+'.pth'))
-                if stage == 'motion':
-                    torch.save(model.motion_predictor.state_dict(), os.path.join(logdir, 'Best_Motion_{}.pth'.format(args.dataset)))
-                current_mota_pred_path = os.path.join(logdir, 'mota_pred.txt')
-                if os.path.exists(current_mota_pred_path):
-                    shutil.copyfile(current_mota_pred_path, best_tracking_pred_path)
-                current_uncertainty_path = os.path.join(
-                    logdir,
-                    'motion_uncertainty_epoch_{}.csv'.format(epoch),
+        current_tracking_score_key = utils.tracking_score_key(score[-1])
+        if utils.isbest(current_tracking_score_key, best_tracking_key):
+            best_tracking_key = current_tracking_score_key
+            best_tracking_idx = len(score) - 1
+            torch.save(model.state_dict(), os.path.join(logdir, 'Best_Multiview_Tracking_'+str(args.dataset)+'.pth'))
+            current_mota_pred_path = os.path.join(logdir, 'mota_pred.txt')
+            if os.path.exists(current_mota_pred_path):
+                shutil.copyfile(current_mota_pred_path, best_tracking_pred_path)
+            current_uncertainty_path = os.path.join(
+                logdir,
+                'motion_uncertainty_epoch_{}.csv'.format(epoch),
+            )
+            if os.path.exists(current_uncertainty_path):
+                shutil.copyfile(
+                    current_uncertainty_path,
+                    os.path.join(logdir, 'motion_uncertainty_best_tracking.csv'),
                 )
-                if os.path.exists(current_uncertainty_path):
-                    shutil.copyfile(
-                        current_uncertainty_path,
-                        os.path.join(logdir, 'motion_uncertainty_best_tracking.csv'),
-                    )
-                print(
-                    "Saved best tracking checkpoint by {}".format(
-                        utils.tracking_score_text(current_tracking_score_key)
-                    )
+            print(
+                "Saved best tracking checkpoint by {}".format(
+                    utils.tracking_score_text(current_tracking_score_key)
                 )
+            )
+        
+    moda, modp, prec, rec, idf1, mota, motp_raw, motp, mt, ml = score[best_detection_idx]
+    print(f'####### best detection epoch: {best_detection_idx + 1} ,moda: {moda:.1f}%, modp: {modp:.1f}%, prec: {prec:.1f}%, recall: {rec:.1f}% #######')
+    moda, modp, prec, rec, idf1, mota, motp_raw, motp, mt, ml = score[best_tracking_idx]
+    print(f'####### best tracking epoch: {best_tracking_idx + 1} ,idf1: {idf1:.1f}%, mota: {mota:.1f}%, motp_raw: {motp_raw:.4f}, motp: {motp:.1f}%, mt: {mt:.1f}%, ml: {ml:.1f}% #######')
+    
+    print("Training Completed..")
 
-    if stage != 'motion':
-        print('Best detection epoch: {}, {}'.format(best_detection_idx + 1, utils.detection_score_text(best_detection_key)))
-    if stage != 'detector':
-        print('Best tracking epoch: {}, {}'.format(best_tracking_idx + 1, utils.tracking_score_text(best_tracking_key)))
-    print('Training Completed..')
-
-
-if __name__ == '__main__':
-    run()
+    retain_epochs = [best_detection_idx + 1, best_tracking_idx + 1]
+    utils.cleanup(logdir, retain_epochs)

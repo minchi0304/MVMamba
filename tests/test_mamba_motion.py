@@ -88,6 +88,7 @@ class MambaMotionPredictorTest(unittest.TestCase):
             history_len=5,
             d_model=8,
             num_layers=1,
+            motion_normalization="bev",
         )
         history = [
             np.asarray([100.0, 200.0, 10.0, -20.0], dtype=np.float32)
@@ -102,6 +103,7 @@ class MambaMotionPredictorTest(unittest.TestCase):
             history_len=2,
             d_model=8,
             num_layers=1,
+            motion_normalization="bev",
         )
         history = torch.tensor(
             [[[100.0, 200.0, 5.0, -2.0], [105.0, 198.0, 5.0, -2.0]]]
@@ -117,6 +119,7 @@ class MambaMotionPredictorTest(unittest.TestCase):
             history_len=3,
             d_model=8,
             num_layers=1,
+            motion_normalization="bev",
             uncertainty_mode="unified",
         )
         history = torch.tensor([[[
@@ -136,6 +139,7 @@ class MambaMotionPredictorTest(unittest.TestCase):
             history_len=1,
             d_model=8,
             num_layers=1,
+            motion_normalization="bev",
             uncertainty_mode="unified",
         )
         history = torch.tensor([[[
@@ -155,6 +159,7 @@ class MambaMotionPredictorTest(unittest.TestCase):
             history_len=2,
             d_model=8,
             num_layers=1,
+            motion_normalization="bev",
             uncertainty_mode="separate",
         )
         history = torch.tensor([[
@@ -181,6 +186,7 @@ class MambaMotionPredictorTest(unittest.TestCase):
             history_len=2,
             d_model=8,
             num_layers=1,
+            motion_normalization="bev",
             uncertainty_mode="separate_full",
         )
         history = torch.tensor([[
@@ -208,6 +214,7 @@ class MambaMotionPredictorTest(unittest.TestCase):
             history_len=2,
             d_model=8,
             num_layers=1,
+            motion_normalization="bev",
             uncertainty_mode="unified",
         )
         history = np.asarray([
@@ -224,6 +231,7 @@ class MambaMotionPredictorTest(unittest.TestCase):
             history_len=2,
             d_model=8,
             num_layers=1,
+            motion_normalization="bev",
             loss_type="niw",
             evidential_head=head_type,
         )
@@ -275,6 +283,7 @@ class MambaMotionPredictorTest(unittest.TestCase):
             high_cls_thres=0.4,
             match_thresh=30.0,
             motion_model="mamba",
+            motion_normalization="bev",
             bev_grid_shape=(100, 200),
             motion_predictor=predictor,
             motion_history_len=5,
@@ -302,6 +311,7 @@ class MambaMotionPredictorTest(unittest.TestCase):
             high_cls_thres=0.4,
             match_thresh=30.0,
             motion_model="mamba",
+            motion_normalization="bev",
             bev_grid_shape=(100, 200),
             motion_predictor=predictor,
             motion_history_len=5,
@@ -329,6 +339,7 @@ class MambaMotionPredictorTest(unittest.TestCase):
             high_cls_thres=0.4,
             match_thresh=30.0,
             motion_model="mamba",
+            motion_normalization="bev",
             bev_grid_shape=(100, 200),
             motion_predictor=predictor,
             motion_cost="mahalanobis",
@@ -365,6 +376,7 @@ class MambaMotionPredictorTest(unittest.TestCase):
             high_cls_thres=0.4,
             match_thresh=30.0,
             motion_model="mamba",
+            motion_normalization="bev",
             bev_grid_shape=(100, 200),
             motion_predictor=predictor,
             motion_history_len=5,
@@ -405,6 +417,7 @@ class MambaMotionPredictorTest(unittest.TestCase):
             d_state=3,
             d_conv=2,
             num_layers=2,
+            motion_normalization="bev",
             history_mode="stateful",
         )
 
@@ -429,6 +442,7 @@ class MambaMotionPredictorTest(unittest.TestCase):
             history_len=5,
             d_model=8,
             num_layers=1,
+            motion_normalization="bev",
             history_mode="stateful",
             uncertainty_mode="unified",
         )
@@ -451,6 +465,7 @@ class MambaMotionPredictorTest(unittest.TestCase):
             high_cls_thres=0.4,
             match_thresh=30.0,
             motion_model="mamba",
+            motion_normalization="bev",
             bev_grid_shape=(100, 200),
             motion_predictor=predictor,
             motion_history_len=5,

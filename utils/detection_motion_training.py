@@ -1,8 +1,9 @@
-"""Build motion training histories once from a frozen detector, with GT future positions."""
+"""Build detector/motion histories for joint training with GT future positions."""
 
 import hashlib
 import json
 import os
+from collections import defaultdict
 from contextlib import contextmanager
 
 import numpy as np
@@ -36,7 +37,7 @@ def match_detections_to_gt(record, metric_scale, match_threshold, score_threshol
 class DetectionMotionDataset(Dataset):
     """Cached observations; optionally roll out the current Mamba over misses."""
 
-    def __init__(self, sequences, history_len, high_cls_thres, missing='skip'):
+    def __init__(self, sequences, history_len, high_cls_thres, match_threshold=None, missing='skip'):
         conditions, targets, shapes, sample_keys = [], [], [], []
         rollout_observations = []
         self.missing = missing
@@ -46,8 +47,9 @@ class DetectionMotionDataset(Dataset):
             frames = np.asarray([row['frame'] for row in records], dtype=np.int64)
             steps = np.diff(frames)
             step = int(steps[steps > 0].min()) if np.any(steps > 0) else 1
-            # Fixed training identity gate in meters; GMVD also uses 1 m.
-            threshold = 2.0 if sequence['dataset_name'].lower() in ('citytrack', 'mvcrowdtrack') else 1.0
+            threshold = match_threshold
+            if threshold is None:
+                threshold = 2.0 if sequence['dataset_name'].lower() in ('citytrack', 'mvcrowdtrack') else 1.0
             # Use the same candidate confidence floor as tracking history updates.
             matched = [match_detections_to_gt(
                 row, sequence['metric_scale'], threshold, max(0.0, high_cls_thres - 0.1),
@@ -108,6 +110,9 @@ class DetectionMotionDataset(Dataset):
         self.targets = torch.from_numpy(np.asarray(targets, dtype=np.float32).reshape(-1, 2))
         self.grid_shapes = torch.from_numpy(np.asarray(shapes, dtype=np.float32).reshape(-1, 2))
         self.sample_keys = sample_keys
+        self.indices_by_frame = defaultdict(list)
+        for index, (sequence_index, frame, _) in enumerate(sample_keys):
+            self.indices_by_frame[(sequences[sequence_index]['root'], frame)].append(index)
 
     def __len__(self):
         return len(self.targets)
@@ -124,6 +129,13 @@ class DetectionMotionDataset(Dataset):
             'motion_target': self.targets[index],
             'motion_bev_grid_shape': self.grid_shapes[index],
         }
+
+    def batch_for_frames(self, roots, frames):
+        """Attach histories to shuffled image batches using their target frame."""
+        indices = [index for root, frame in zip(roots, frames)
+                   for index in self.indices_by_frame.get((root, int(frame)), ())]
+        return self[torch.tensor(indices, dtype=torch.long)]
+
 
 @torch.no_grad()
 def rollout_detection_history(predictor, observations, grid_shapes):
@@ -164,9 +176,9 @@ def motion_inputs(model, item, device):
 
 def _cache_signature(dataset, args, model):
     checkpoint_sha256 = None
-    if args.detector_checkpoint:
+    if args.train_from:
         checkpoint_hash = hashlib.sha256()
-        with open(args.detector_checkpoint, 'rb') as source:
+        with open(args.train_from, 'rb') as source:
             for chunk in iter(lambda: source.read(1024 * 1024), b''):
                 checkpoint_hash.update(chunk)
         checkpoint_sha256 = checkpoint_hash.hexdigest()
@@ -196,7 +208,7 @@ def _cache_signature(dataset, args, model):
     return {
         'version': 3, 'checkpoint_sha256': checkpoint_sha256,
         'detector_sha256': detector_hash.hexdigest(),
-        'view_pool': 'max',  # Keep existing max-pooling caches compatible.
+        'view_pool': args.view_pool,
         'topk': utils.get_decode_topk(args), 'augmentation': False,
         'sequences': sequences,
     }
@@ -215,18 +227,21 @@ def _unaugmented_frames(dataset):
             sub.data_aug = enabled
 
 
-def prepare_motion_dataset(model, dataset, args, device, logdir):
+def prepare_detection_motion_dataset(model, dataset, args, device, logdir, epoch=1):
     if any(not sub.train for sub in dataset.datasets):
         raise ValueError('Detection-history training requires training splits, not test splits')
     signature = _cache_signature(dataset, args, model)
-    cache_path = args.motion_detection_cache or os.path.join(logdir, 'motion_detections_train.pt')
+    # An external cache may initialize epoch 1 only. Later epochs use the
+    # current detector and overwrite the run-local snapshot, not the source cache.
+    external_cache = args.motion_detection_cache if epoch == 1 else None
+    cache_path = external_cache or os.path.join(logdir, 'motion_detections_train.pt')
     sequences = None
     if os.path.exists(cache_path):
         cache = torch.load(cache_path, map_location='cpu')
         if cache['signature'] == signature:
             sequences = cache['sequences']
-            print('Loaded frozen-detector training detections: {}'.format(cache_path))
-        else:
+            print('Loaded training detections for epoch {}: {}'.format(epoch, cache_path))
+        elif external_cache:
             raise ValueError('Detection cache does not match the checkpoint, training split, or decoder settings; use a new cache path')
     if sequences is None:
         sequences = []
@@ -243,7 +258,7 @@ def prepare_motion_dataset(model, dataset, args, device, logdir):
         with _unaugmented_frames(dataset):
             loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=args.num_workers, pin_memory=True)
             model.eval()
-            for index, (item, _) in enumerate(tqdm(loader, desc='Frozen detector: building training histories')):
+            for index, (item, _) in enumerate(tqdm(loader, desc='Epoch {} training detections'.format(epoch))):
                 decoded = utils.decode_frame(model, dataset, item, index, device, args)
                 root, frame, _ = utils.get_frame_metadata(loader, item)
                 sequence, sub = by_root[root]
@@ -259,23 +274,24 @@ def prepare_motion_dataset(model, dataset, args, device, logdir):
                 })
         os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
         torch.save({'signature': signature, 'sequences': sequences}, cache_path)
-        print('Saved frozen-detector training detections: {}'.format(cache_path))
+        print('Saved current training detections: {}'.format(cache_path))
     motion_dataset = DetectionMotionDataset(
-        sequences, args.motion_history_len, args.high_cls_thres,
+        sequences, args.motion_history_len, args.high_cls_thres, args.motion_detection_match_thresh,
         missing=getattr(args, 'motion_history_missing', 'motion'),
     )
     for summary in motion_dataset.summary:
         print('Detection history: {}'.format(json.dumps(summary)))
-    with open(os.path.join(logdir, 'motion_training_samples.json'), 'w') as output:
+    with open(os.path.join(logdir, 'motion_training_samples_epoch_{}.json'.format(epoch)), 'w') as output:
         json.dump({
+            'epoch': epoch,
             'history_source': 'detection', 'history_len': args.motion_history_len,
             'missing_history': getattr(args, 'motion_history_missing', 'motion'),
             'cache': os.path.abspath(cache_path),
-            'checkpoint': os.path.abspath(args.detector_checkpoint),
+            'checkpoint': os.path.abspath(args.train_from) if args.train_from else None,
             'checkpoint_sha256': signature['checkpoint_sha256'],
             'detector_sha256': signature['detector_sha256'],
             'high_cls_thres': args.high_cls_thres, 'sequences': motion_dataset.summary,
         }, output, indent=2)
     if not len(motion_dataset):
-        raise ValueError('No motion training samples from the frozen detector: check the checkpoint, confidence threshold, coordinate alignment, and history length')
+        print('Epoch {}: no matched detection histories; motion loss has no samples in this snapshot'.format(epoch))
     return motion_dataset
