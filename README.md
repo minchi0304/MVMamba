@@ -65,6 +65,39 @@ Training uses independent trajectory windows. During tracking, matched detection
 update the history and missed detections use autoregressive motion predictions.
 This also applies when stateful Mamba tracking is selected.
 
+### Bidirectional Mamba
+
+Select `--motion_model bimamba --mamba_history_mode window` to encode the available
+past trajectory in both directions. Each residual block has independent forward
+and backward Mamba branches. The backward output is returned to chronological
+order, and their average is added to the residual. The final history features
+are mean-pooled before the existing Smooth L1 or NIW head. The velocity skip
+still uses the most recent chronological token.
+
+The forward/reverse alignment follows the bidirectional scan pattern in
+[Vision Mamba](https://github.com/hustvl/Vim/blob/main/mamba-1p1p1/mamba_ssm/modules/mamba_simple.py).
+This implementation gives each direction its own full Mamba parameters and uses
+the installed kernels; it is not the shared-projection Vim implementation.
+`--mamba_layers` counts bidirectional blocks, each containing two Mamba branches.
+
+GT training, BEV normalization, repeated-first-state padding, implicit uncertainty
+inputs, explicit B/delta gates, and covariance-based association remain available.
+Reliability values are reversed with their tokens on the backward branch. Only
+the supplied history is used; the next-frame target is never part of the input.
+
+BiMamba recomputes the window for each prediction and requires `window` mode.
+It cannot use the one-token `stateful` cache. Select the same motion model when
+training and evaluating its checkpoint; Mamba and BiMamba have different block
+parameters. No Docker dependency change is required.
+
+```bash
+python main.py -d multiviewx -pr --data_root /dataset --aug \
+  --motion_model bimamba --mamba_history_mode window \
+  --motion_loss niw --evidential_head separate --multi_task_loss uncertainty \
+  --mamba_uncertainty_mode separate_full --mamba_uncertainty_gate none \
+  --track_match_thresh 50 --track_low_match_thresh 80 --bev_gaussian_sigma 1.5
+```
+
 ## Test
 
 Pass a trained checkpoint through `--resume` to run testing:
@@ -87,9 +120,9 @@ uncertainty is `2 / (alpha + beta)` and is retained for each decoded detection.
 The main tracking controls are:
 
 - `--high_cls_thres`: confidence threshold for high-confidence detections
-- `--motion_model`: `mamba` or `kalman` (`mamba` is the default)
+- `--motion_model`: `mamba`, `bimamba`, or `kalman` (`mamba` is the default)
 - `--motion_history_len`: number of trajectory tokens (default: `10`)
-- `--mamba_history_mode`: `window` uses the fixed trajectory window; `stateful` keeps each track's Mamba convolution and SSM state across frames
+- `--mamba_history_mode`: `window` uses the fixed trajectory window; `stateful` keeps each track's unidirectional Mamba convolution and SSM state across frames. BiMamba supports `window` only.
 - `--mamba_uncertainty_mode`: `none` uses `[x, y, dx, dy]`; `unified` projects kinematics, source masks, detection uncertainty, and motion covariance together; `separate` adds source-specific uncertainty projections to a shared kinematic projection; `separate_full` independently projects the full detection and motion tokens
 - `--mamba_uncertainty_gate`: explicit SSM gating, `none` (default), `b`, or `delta`
 - `--mamba_uncertainty_weight`: detection reliability mapping, `linear`, `rational`, or `cosine` (default); also used for motion in `shared` mode

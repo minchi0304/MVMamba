@@ -381,13 +381,15 @@ class Tracker:
         self.unconfirmed_match_thresh = float(unconfirmed_match_thresh)
         self.duplicate_thresh = float(duplicate_thresh)
 
-        if motion_model not in ("kalman", "mamba"):
-            raise ValueError("motion_model must be 'kalman' or 'mamba'")
+        if motion_model not in ("kalman", "mamba", "bimamba"):
+            raise ValueError("motion_model must be 'kalman', 'mamba', or 'bimamba'")
         self.motion_model = motion_model
         self.bev_grid_shape = bev_grid_shape
         self.motion_history_len = int(motion_history_len)
         if mamba_history_mode not in ("window", "stateful"):
             raise ValueError("mamba_history_mode must be 'window' or 'stateful'")
+        if motion_model == "bimamba" and mamba_history_mode != "window":
+            raise ValueError("BiMamba requires mamba_history_mode='window'")
         self.mamba_history_mode = mamba_history_mode
         self.mamba_uncertainty_mode = mamba_uncertainty_mode
         self.mamba_uncertainty_gate = mamba_uncertainty_gate
@@ -399,7 +401,7 @@ class Tracker:
         self.kalman_filter = KalmanFilter() if motion_model == "kalman" else None
         self.motion_predictor = None
         self.last_motion_predictions = []
-        if motion_model == "mamba":
+        if motion_model in ("mamba", "bimamba"):
             if bev_grid_shape is None:
                 raise ValueError("bev_grid_shape is required for BEV-normalized learned motion")
             if motion_predictor is None:
@@ -469,7 +471,7 @@ class Tracker:
         return costs
 
     def _primary_association(self, tracks, detections):
-        if self.motion_model == "mamba" and self.motion_cost == "mahalanobis":
+        if self.motion_model in ("mamba", "bimamba") and self.motion_cost == "mahalanobis":
             costs = self._mahalanobis_cost(tracks, detections)
             if costs is not None:
                 return matching.linear_assignment(

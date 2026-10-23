@@ -4,6 +4,7 @@ import runpy
 import sys
 import unittest
 from pathlib import Path
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -66,11 +67,11 @@ class GTJointTrainingTests(unittest.TestCase):
                                    torch.tensor([[[2., 20., 2., 0.], [4., 20., 2., 0.]]]))
         torch.testing.assert_close(item['motion_condition'][:, -1, :2] + item['motion_target'],
                                    torch.tensor([[6., 20.]]))
-        for weighting in ('uncertainty', 'plain'):
-            with self.subTest(weighting=weighting):
+        for motion_model, weighting in product(('mamba', 'bimamba'), ('uncertainty', 'plain')):
+            with self.subTest(motion_model=motion_model, weighting=weighting):
                 model = Model()
                 before = model.detector.weight.detach().clone()
-                args = SimpleNamespace(motion_model='mamba', multi_task_loss=weighting)
+                args = SimpleNamespace(motion_model=motion_model, multi_task_loss=weighting)
                 optimizer = torch.optim.SGD(model.parameters(), lr=.001)
                 with patch.multiple(main, args=args, device=torch.device('cpu'), train_dataset=None,
                                     criterion=occupancy_loss, create=True), contextlib.redirect_stdout(io.StringIO()):

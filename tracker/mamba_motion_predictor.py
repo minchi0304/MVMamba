@@ -56,6 +56,8 @@ class MambaMotionPredictor(nn.Module):
     ``previous_xy + predicted_delta``.
     """
 
+    block_class = ResidualMambaBlock
+
     def __init__(
         self,
         history_len=5,
@@ -112,7 +114,7 @@ class MambaMotionPredictor(nn.Module):
         )
         self.blocks = nn.ModuleList(
             [
-                ResidualMambaBlock(
+                self.block_class(
                     d_model=d_model,
                     d_state=d_state,
                     d_conv=d_conv,
@@ -318,8 +320,11 @@ class MambaMotionPredictor(nn.Module):
             sequence = sequence + self.temporal_embedding
         for block in self.blocks:
             sequence = block(sequence, reliability=reliability)
-        features = self.output_norm(sequence[:, -1])
+        features = self.output_norm(self._readout_history(sequence))
         return features, last_velocity
+
+    def _readout_history(self, sequence):
+        return sequence[:, -1]
 
     def _predict_distribution_from_features(self, features, last_velocity):
         if self.joint_head is not None:

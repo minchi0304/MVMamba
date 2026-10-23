@@ -24,6 +24,7 @@ from utils.loss import EvidentialOccupancyLoss
 from detector.multiview_model import MultiView_Detection
 from detector.encoder import resnet18
 from tracker.mamba_motion_predictor import MambaMotionPredictor
+from tracker.bimamba_motion_predictor import BiMambaMotionPredictor
     
 ###################################################################################################################################
 score = []
@@ -79,7 +80,7 @@ def train(
 
         occ_loss = criterion(bev_occupancy, gt_valid_bev.float(), gt_occ)
 
-        has_motion_sample = args.motion_model == 'mamba' and item['motion_bev_grid_shape'].size(0) > 0
+        has_motion_sample = args.motion_model in ('mamba', 'bimamba') and item['motion_bev_grid_shape'].size(0) > 0
         if has_motion_sample:
             motion_condition = item['motion_condition'].to(bev_center.device)
             motion_target = item['motion_target'].to(bev_center.device)
@@ -241,7 +242,7 @@ if __name__ == '__main__':
     parser.add_argument('--mahalanobis_gate', type=float, default=5.991, help='Squared Mahalanobis gate for primary association')
     parser.add_argument('--motion_cov_scale', type=float, default=1.0, help='Scale applied to NIW motion covariance during association')
     parser.add_argument('--motion_cov_floor', type=float, default=1e-4, help='Minimum covariance eigenvalue during Mahalanobis association')
-    parser.add_argument('--motion_model', type=str, default='mamba', choices=['kalman', 'mamba'], help='Motion prediction model used by the tracker')
+    parser.add_argument('--motion_model', type=str, default='mamba', choices=['kalman', 'mamba', 'bimamba'], help='Motion prediction model; bimamba uses bidirectional history windows')
     parser.add_argument('--motion_history_len', type=int, default=10, help='Number of trajectory tokens used by learned motion models')
     parser.add_argument('--mamba_history_mode', type=str, default='window', choices=['window', 'stateful'], help='Use a fixed trajectory window or persistent per-track Mamba state')
     parser.add_argument('--mamba_uncertainty_mode', type=str, default='unified', choices=['none', 'unified', 'separate', 'separate_full'], help='Implicit uncertainty input: disabled, unified, uncertainty-only branches, or fully source-specific projections')
@@ -250,11 +251,11 @@ if __name__ == '__main__':
     parser.add_argument('--motion_uncertainty_weight', type=str, default='shared', choices=['shared', 'tanh'], help='Motion reliability: shared mapping after trace/(trace+ref), or directly 1-tanh(trace)')
     parser.add_argument('--motion_uncertainty_type', type=str, default='total', choices=['aleatoric', 'epistemic', 'total'], help='NIW covariance component whose trace drives the explicit motion gate')
     parser.add_argument('--motion_uncertainty_ref', type=float, default=1e-4, help='Positive trace reference: u_motion = trace / (trace + ref), in model coordinate units squared')
-    parser.add_argument('--mamba_d_model', type=int, default=128)
+    parser.add_argument('--mamba_d_model', type=int, default=64)
     parser.add_argument('--mamba_d_state', type=int, default=16)
     parser.add_argument('--mamba_d_conv', type=int, default=4)
     parser.add_argument('--mamba_expand', type=int, default=2)
-    parser.add_argument('--mamba_layers', type=int, default=2)
+    parser.add_argument('--mamba_layers', type=int, default=6)
     parser.add_argument('--mamba_dropout', type=float, default=0.0)
     parser.add_argument('--motion_loss', type=str, default='niw', choices=['smooth_l1', 'niw'], help='Motion prediction loss and output head')
     parser.add_argument('--evidential_lambda', type=float, default=1e-3, help='Evidence regularization coefficient for NIW motion loss')
@@ -280,9 +281,11 @@ if __name__ == '__main__':
     parser.add_argument('--optim', type=str, default='Adam', choices=['SGD', 'Adam'], help='Choose optimizer.(default : SGD)')
 
     args = parser.parse_args()
+    if args.motion_model == 'bimamba' and args.mamba_history_mode != 'window':
+        parser.error('--motion_model bimamba requires --mamba_history_mode window')
     if args.mamba_uncertainty_gate != 'none':
-        if args.motion_model != 'mamba' or args.motion_loss != 'niw':
-            parser.error('explicit Mamba uncertainty gating requires --motion_model mamba --motion_loss niw')
+        if args.motion_model not in ('mamba', 'bimamba') or args.motion_loss != 'niw':
+            parser.error('explicit uncertainty gating requires --motion_model mamba or bimamba with --motion_loss niw')
         if args.motion_uncertainty_weight == 'shared' and (
             not np.isfinite(args.motion_uncertainty_ref) or args.motion_uncertainty_ref <= 0
         ):
@@ -360,7 +363,7 @@ if __name__ == '__main__':
             if data_row[0]=='train':
                 # Train data
                 # dataset_obj = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=4, train_ratio=train_ratio, sample_require=sample_require)
-                dataset_obj = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=8, train_ratio=train_ratio, sample_require=sample_require, data_aug=args.aug, build_motion_samples=args.motion_model == 'mamba', motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
+                dataset_obj = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=8, train_ratio=train_ratio, sample_require=sample_require, data_aug=args.aug, build_motion_samples=args.motion_model in ('mamba', 'bimamba'), motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
                 train_dataset_list.append(dataset_obj)
                 
             else:
@@ -387,7 +390,7 @@ if __name__ == '__main__':
     elif args.dataset in ['wildtrack', 'multiviewx', 'citytrack', 'mvcrowdtrack']:
         grid_reduce = int(getattr(base0, 'default_grid_reduce', 4))
         img_reduce = int(getattr(base0, 'default_img_reduce', 8))
-        train_dataset_ = GetDataset(base0, train=True, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=args.aug, build_motion_samples=args.motion_model == 'mamba', motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
+        train_dataset_ = GetDataset(base0, train=True, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=args.aug, build_motion_samples=args.motion_model in ('mamba', 'bimamba'), motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
         test_dataset_ = GetDataset(base0, train=False, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=False, bev_gaussian_sigma=args.bev_gaussian_sigma)
 
         print("Training datasets")
@@ -398,7 +401,7 @@ if __name__ == '__main__':
     # Train and Test Data Loader 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                                             num_workers=args.num_workers, pin_memory=True, worker_init_fn=init_fn,
-                                            collate_fn=motion_joint_collate if args.motion_model == 'mamba' else None)
+                                            collate_fn=motion_joint_collate if args.motion_model in ('mamba', 'bimamba') else None)
     
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False,
                                             num_workers=args.num_workers, pin_memory=True, worker_init_fn=init_fn)
@@ -414,10 +417,11 @@ if __name__ == '__main__':
         resnet_model,
         logdir,
         multi_task_loss=args.multi_task_loss,
-        use_motion_loss=args.motion_model == 'mamba',
+        use_motion_loss=args.motion_model in ('mamba', 'bimamba'),
     )
-    if args.motion_model == 'mamba':
-        model.motion_predictor = MambaMotionPredictor(
+    if args.motion_model in ('mamba', 'bimamba'):
+        predictor_class = BiMambaMotionPredictor if args.motion_model == 'bimamba' else MambaMotionPredictor
+        model.motion_predictor = predictor_class(
             history_len=args.motion_history_len,
             d_model=args.mamba_d_model,
             d_state=args.mamba_d_state,
