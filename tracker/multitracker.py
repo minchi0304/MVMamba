@@ -51,7 +51,6 @@ class STrack:
         self.motion_delta = None
         self.motion_covariance = None
         self.motion_kappa = None
-        self.motion_position_covariance = None
         self.motion_prediction_xy = None
         self.motion_prediction_pending = False
 
@@ -146,7 +145,6 @@ class STrack:
             )
         else:
             self._update_motion_history(new_track.to_xy())
-            self.motion_position_covariance = None
         self.tracklet_len = 0
         self.state = TrackState.Tracked
         self.is_activated = True
@@ -193,7 +191,6 @@ class STrack:
             )
         else:
             self._update_motion_history(new_track.to_xy())
-            self.motion_position_covariance = None
 
         self.score = new_track.score
         self.state = TrackState.Tracked
@@ -250,13 +247,6 @@ class STrack:
                 if covariance is None
                 else np.asarray(covariance[row_index], dtype=np.float32)
             )
-            if track.motion_covariance is not None:
-                if track.motion_position_covariance is None:
-                    track.motion_position_covariance = track.motion_covariance.copy()
-                else:
-                    track.motion_position_covariance = (
-                        track.motion_position_covariance + track.motion_covariance
-                    )
             track._xy = predicted_xy
             track.conds.append(track._motion_condition(
                 predicted_xy,
@@ -324,13 +314,6 @@ class STrack:
                 if track.mamba_next_covariance is None
                 else track.mamba_next_covariance.copy()
             )
-            if track.motion_covariance is not None:
-                if track.motion_position_covariance is None:
-                    track.motion_position_covariance = track.motion_covariance.copy()
-                else:
-                    track.motion_position_covariance = (
-                        track.motion_position_covariance + track.motion_covariance
-                    )
             track._xy = predicted_xy.astype(np.float32)
             track.conds.append(track._motion_condition(
                 track._xy,
@@ -346,7 +329,7 @@ class STrack:
 
 
 class Tracker:
-    """MVTrackTrans-style BEV association using current detections."""
+    """MVTrackTrans-style BEV association using Euclidean center distance."""
 
     def __init__(
         self,
@@ -362,10 +345,6 @@ class Tracker:
         motion_history_len=5,
         mamba_history_mode="window",
         mamba_uncertainty_mode="none",
-        motion_cost="euclidean",
-        mahalanobis_gate=5.991,
-        motion_cov_scale=1.0,
-        motion_cov_floor=1e-4,
         mamba_uncertainty_gate="none",
     ):
         self.tracked_stracks: List[STrack] = []
@@ -393,10 +372,6 @@ class Tracker:
         self.mamba_history_mode = mamba_history_mode
         self.mamba_uncertainty_mode = mamba_uncertainty_mode
         self.mamba_uncertainty_gate = mamba_uncertainty_gate
-        self.motion_cost = motion_cost
-        self.mahalanobis_gate = float(mahalanobis_gate)
-        self.motion_cov_scale = float(motion_cov_scale)
-        self.motion_cov_floor = float(motion_cov_floor)
 
         self.kalman_filter = KalmanFilter() if motion_model == "kalman" else None
         self.motion_predictor = None
@@ -434,51 +409,6 @@ class Tracker:
     def _linear_association(self, tracks, detections, thresh):
         dists = self._center_distance(tracks, detections)
         return matching.linear_assignment(dists, thresh=thresh)
-
-    def _mahalanobis_cost(self, tracks, detections):
-        if len(tracks) == 0 or len(detections) == 0:
-            return np.zeros((len(tracks), len(detections)), dtype=np.float32)
-        if any(track.motion_position_covariance is None for track in tracks):
-            return None
-
-        detection_xy = np.asarray(
-            [detection.xy for detection in detections],
-            dtype=np.float64,
-        )
-        costs = np.empty((len(tracks), len(detections)), dtype=np.float32)
-        for track_index, track in enumerate(tracks):
-            covariance = np.asarray(
-                track.motion_position_covariance,
-                dtype=np.float64,
-            )
-            covariance = 0.5 * (covariance + covariance.T)
-            eigenvalues, eigenvectors = np.linalg.eigh(
-                covariance * self.motion_cov_scale
-            )
-            eigenvalues = np.maximum(eigenvalues, self.motion_cov_floor)
-            precision = (
-                eigenvectors
-                @ np.diag(1.0 / eigenvalues)
-                @ eigenvectors.T
-            )
-            residuals = detection_xy - track.xy.astype(np.float64)
-            costs[track_index] = np.einsum(
-                "ni,ij,nj->n",
-                residuals,
-                precision,
-                residuals,
-            ).astype(np.float32)
-        return costs
-
-    def _primary_association(self, tracks, detections):
-        if self.motion_model in ("mamba", "bimamba") and self.motion_cost == "mahalanobis":
-            costs = self._mahalanobis_cost(tracks, detections)
-            if costs is not None:
-                return matching.linear_assignment(
-                    costs,
-                    thresh=self.mahalanobis_gate,
-                )
-        return self._linear_association(tracks, detections, self.match_thresh)
 
     def update(
         self,
@@ -547,7 +477,7 @@ class Tracker:
         predicted_tracks = list(strack_pool)
 
         matches_idx, unmatched_tracks_idx, unmatched_detections_idx = (
-            self._primary_association(strack_pool, detections)
+            self._linear_association(strack_pool, detections, self.match_thresh)
         )
         matches = [(strack_pool[int(i)], detections[int(j)]) for i, j in matches_idx]
         matched_prediction_ids = {id(track) for track, _ in matches}

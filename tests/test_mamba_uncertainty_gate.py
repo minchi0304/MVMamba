@@ -252,7 +252,7 @@ class GatedMambaCudaTests(unittest.TestCase):
                     track = tracker.update([[10, 20]], scores=[.9], uncertainties=[.25])[0]
                     track_id = track.track_id
                     self.assertEqual(len(track.conds[-1]), 11)
-                    for index in range(2):
+                    for _ in range(2):
                         cached_kappa = track.mamba_next_kappa
                         tracker.update([], scores=[], uncertainties=[])
                         token = track.conds[-1]
@@ -262,12 +262,9 @@ class GatedMambaCudaTests(unittest.TestCase):
                         self.assertAlmostEqual(token[10], track.motion_kappa, places=6)
                         if history_mode == "stateful":
                             self.assertAlmostEqual(token[10], cached_kappa, places=6)
-                        if index == 1:
-                            self.assertGreater(np.trace(track.motion_position_covariance), np.trace(covariance))
                     tracks = tracker.update([track.xy], scores=[.9], uncertainties=[.6])
                     self.assertEqual(tracks[0].track_id, track_id)
                     np.testing.assert_allclose(track.conds[-1][4:], [.6, 0, 0, 0, 1, 0, 0])
-                    self.assertIsNone(track.motion_position_covariance)
 
 
 if __name__ == "__main__":

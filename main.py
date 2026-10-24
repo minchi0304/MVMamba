@@ -239,10 +239,6 @@ if __name__ == '__main__':
     parser.add_argument('--high_cls_thres', type=float, default=0.4, help='Confidence threshold for high-confidence detections')
     parser.add_argument('--track_match_thresh', type=float, default=75, help='MVTrackTrans-style center-distance association threshold')
     parser.add_argument('--track_low_match_thresh', type=float, default=100, help='MVTrackTrans-style center-distance gate for unconfirmed tracks')
-    parser.add_argument('--motion_cost', type=str, default='euclidean', choices=['euclidean', 'mahalanobis'], help='Primary track-to-detection motion cost')
-    parser.add_argument('--mahalanobis_gate', type=float, default=5.991, help='Squared Mahalanobis gate for primary association')
-    parser.add_argument('--motion_cov_scale', type=float, default=1.0, help='Scale applied to NIW motion covariance during association')
-    parser.add_argument('--motion_cov_floor', type=float, default=1e-4, help='Minimum covariance eigenvalue during Mahalanobis association')
     parser.add_argument('--motion_model', type=str, default='mamba', choices=['kalman', 'mamba', 'bimamba'], help='Motion prediction model; bimamba uses bidirectional history windows')
     parser.add_argument('--motion_history_len', type=int, default=10, help='Number of trajectory tokens used by learned motion models')
     parser.add_argument('--mamba_history_mode', type=str, default='window', choices=['window', 'stateful'], help='Use a fixed trajectory window or persistent per-track Mamba state')
@@ -287,7 +283,7 @@ if __name__ == '__main__':
     print('Occupancy loss: edl')
     print('Motion model: {}'.format(args.motion_model))
     print('Motion loss: {}'.format(args.motion_loss))
-    print('Motion association cost: {}'.format(args.motion_cost))
+    print('Motion association cost: euclidean')
     print('Mamba uncertainty input: {}'.format(args.mamba_uncertainty_mode))
     print('Mamba explicit gate: {}, detection weight: {}, motion weight: tanh, motion covariance: {}'.format(
         args.mamba_uncertainty_gate, args.mamba_uncertainty_weight,

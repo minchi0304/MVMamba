@@ -38,7 +38,8 @@ python main.py \
   --motion_model mamba \
   --motion_loss niw \
   --evidential_head separate \
-  --mamba_uncertainty_mode unified
+  --mamba_uncertainty_mode unified \
+  --track_match_thresh 50 --track_low_match_thresh 80
 ```
 
 Replace `wildtrack` with `multiviewx`, `citytrack`, `mvcrowdtrack`, or `gmvd_train` as needed.
@@ -81,7 +82,7 @@ the installed kernels; it is not the shared-projection Vim implementation.
 `--mamba_layers` counts bidirectional blocks, each containing two Mamba branches.
 
 GT training, BEV normalization, repeated-first-state padding, implicit uncertainty
-inputs, explicit B/delta gates, and covariance-based association remain available.
+inputs, explicit B/delta gates, and Euclidean association remain available.
 Reliability values are reversed with their tokens on the backward branch. Only
 the supplied history is used; the next-frame target is never part of the input.
 
@@ -106,7 +107,8 @@ Pass a trained checkpoint through `--resume` to run testing:
 python main.py \
   --dataset wildtrack \
   --data_root <DATA_ROOT> \
-  --resume <CHECKPOINT_PATH>
+  --resume <CHECKPOINT_PATH> \
+  --track_match_thresh 50 --track_low_match_thresh 80
 ```
 
 Test outputs are saved under `logs/`.
@@ -125,9 +127,17 @@ uncertainty is `2 / (alpha + beta)` and is retained for each decoded detection.
 
 ## Tracking options
 
+Both primary and unconfirmed-track association use Euclidean center distance. The
+Wildtrack commands above set the primary and unconfirmed-track thresholds to
+`50` and `80`, respectively; the generic CLI defaults remain `75` and `100`.
+NIW motion training, uncertainty history inputs, explicit uncertainty gates,
+and covariance logging remain available with Euclidean association.
+
 The main tracking controls are:
 
 - `--high_cls_thres`: confidence threshold for high-confidence detections
+- `--track_match_thresh`: Euclidean distance threshold for primary association (`50` for the Wildtrack configuration)
+- `--track_low_match_thresh`: Euclidean distance threshold for unconfirmed-track association (`80` for the Wildtrack configuration)
 - `--motion_model`: `mamba`, `bimamba`, or `kalman` (`mamba` is the default)
 - `--motion_history_len`: number of trajectory tokens (default: `10`)
 - `--mamba_history_mode`: `window` uses the fixed trajectory window; `stateful` keeps each track's unidirectional Mamba convolution and SSM state across frames. BiMamba supports `window` only.
@@ -135,10 +145,6 @@ The main tracking controls are:
 - `--mamba_uncertainty_gate`: explicit SSM gating, `none` (default), `b`, or `delta`
 - `--mamba_uncertainty_weight`: detection reliability mapping, `linear`, `rational`, or `cosine` (default); motion always uses `1 - tanh(trace)`
 - `--motion_uncertainty_type`: `aleatoric`, `epistemic`, or `total` (default) covariance trace for the explicit motion gate
-- `--motion_cost`: `euclidean` keeps center-distance association; `mahalanobis` uses the NIW covariance for the primary association stage
-- `--mahalanobis_gate`: squared Mahalanobis gate (default: `5.991`, the 95% threshold for two dimensions)
-- `--motion_cov_scale`: calibration multiplier applied to NIW covariance before association
-- `--motion_cov_floor`: minimum covariance eigenvalue used when computing the inverse
 - `--motion_loss`: `niw` predicts a correlated 2D offset distribution; `smooth_l1` keeps the deterministic baseline
 - `--evidential_head`: `separate` uses independent mean/evidence MLPs; `joint` uses one MLP with seven outputs
 
@@ -177,24 +183,6 @@ In `separate_full`, detection tokens use a `5 -> d_model` projection over
 `[x, y, dx, dy, u_det]`, while motion tokens use a separate `7 -> d_model`
 projection over `[x, y, dx, dy, cov_xx, cov_yy, cov_xy]`. The source masks
 select exactly one projection for each time step.
-
-For an association uncertainty ablation, disable implicit uncertainty inputs and
-select covariance-aware association:
-
-```bash
-python main.py \
-  --motion_model mamba \
-  --motion_loss niw \
-  --mamba_uncertainty_mode none \
-  --motion_cost mahalanobis \
-  --mahalanobis_gate 5.991
-```
-
-Mahalanobis association is applied to the primary tracked/lost track pool. The
-unconfirmed-track association remains Euclidean. Consecutive missed frames add
-the predicted displacement covariances, and a matched detection resets the
-accumulated position covariance. If a valid NIW covariance is unavailable, the
-primary association falls back to the Euclidean cost.
 
 For persistent recurrent inference, add `--mamba_history_mode stateful`. In this mode, `--motion_history_len` still controls the training sample length, while tracking inference carries the Mamba state forward without truncating it to that window.
 
@@ -261,9 +249,8 @@ from its output.
 A matched detection supplies its own occupancy uncertainty. An unmatched
 frame supplies the one-step covariance and kappa of the prediction used for
 that frame, not those of the next prediction. This conditional displacement
-covariance does not include propagated history uncertainty. The accumulated
-position covariance used by Mahalanobis association remains separate. Full
-covariance is retained for association and existing CSV output; the trace
+covariance does not include propagated history uncertainty. Full covariance is
+retained for uncertainty history inputs and existing CSV output; the trace
 reduction is used only for gating. Gate histories append kappa to the existing
 10-field token; kappa is not an additional projected input feature.
 
@@ -272,7 +259,7 @@ training or test command:
 
 ```bash
 --motion_model mamba --motion_loss niw \
---mamba_uncertainty_mode none --motion_cost euclidean \
+--mamba_uncertainty_mode none \
 --mamba_uncertainty_gate b \
 --mamba_uncertainty_weight cosine \
 --motion_uncertainty_type total

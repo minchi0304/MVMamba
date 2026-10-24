@@ -1,4 +1,5 @@
 import unittest
+from itertools import product
 
 import numpy as np
 import torch
@@ -291,9 +292,9 @@ class MambaMotionPredictorTest(unittest.TestCase):
         self.assertAlmostEqual(row["cov_xx"], 4.0)
         self.assertAlmostEqual(row["cov_xy"], 1.0)
         self.assertAlmostEqual(row["cov_yy"], 9.0)
-        self.assertIsNone(tracks[0].motion_position_covariance)
+        np.testing.assert_allclose(tracks[0].motion_covariance, [[4.0, 1.0], [1.0, 9.0]])
 
-    def test_motion_position_covariance_accumulates_across_missed_frames(self):
+    def test_motion_covariance_stays_one_step_across_missed_frames(self):
         predictor = ConstantDistributionPredictor(
             [5.0, -2.0],
             [[4.0, 1.0], [1.0, 9.0]],
@@ -310,51 +311,72 @@ class MambaMotionPredictorTest(unittest.TestCase):
         tracker.update([[10.0, 20.0]], scores=[0.9])
         tracker.update([], scores=[])
         np.testing.assert_allclose(
-            tracker.lost_stracks[0].motion_position_covariance,
+            tracker.lost_stracks[0].motion_covariance,
             [[4.0, 1.0], [1.0, 9.0]],
         )
 
         tracker.update([], scores=[])
         np.testing.assert_allclose(
-            tracker.lost_stracks[0].motion_position_covariance,
-            [[8.0, 2.0], [2.0, 18.0]],
+            tracker.lost_stracks[0].motion_covariance,
+            [[4.0, 1.0], [1.0, 9.0]],
         )
 
-    def test_mahalanobis_cost_uses_motion_covariance_direction(self):
-        predictor = ConstantDistributionPredictor(
-            [0.0, 0.0],
-            [[1.0, 0.0], [0.0, 1.0]],
-        )
-        tracker = Tracker(
-            high_cls_thres=0.4,
-            match_thresh=30.0,
-            motion_model="mamba",
-            bev_grid_shape=(100, 200),
-            motion_predictor=predictor,
-            motion_cost="mahalanobis",
-            mahalanobis_gate=5.991,
-        )
-        wide_x_track = STrack([0.0, 0.0], 0.9)
-        wide_x_track.motion_position_covariance = np.asarray(
-            [[100.0, 0.0], [0.0, 1.0]],
-            dtype=np.float32,
-        )
-        closer_track = STrack([6.0, 3.0], 0.9)
-        closer_track.motion_position_covariance = np.eye(2, dtype=np.float32)
-        detection = STrack([8.0, 0.0], 0.9)
+    def test_primary_association_selects_nearest_track_despite_covariance_direction(self):
+        class UnequalCovariancePredictor(ConstantDistributionPredictor):
+            def generate_distribution(self, histories, bev_grid_shape=None):
+                motion, covariance = super().generate_distribution(histories, bev_grid_shape)
+                covariance[0] = np.diag([100.0, 1.0])
+                return motion, covariance
 
-        euclidean_matches, _, _ = tracker._linear_association(
-            [wide_x_track, closer_track],
-            [detection],
-            30.0,
-        )
-        mahalanobis_matches, _, _ = tracker._primary_association(
-            [wide_x_track, closer_track],
-            [detection],
-        )
+        for motion_model in ("mamba", "bimamba"):
+            with self.subTest(motion_model=motion_model):
+                tracker = Tracker(
+                    match_thresh=30.0,
+                    motion_model=motion_model,
+                    bev_grid_shape=(100, 200),
+                    motion_predictor=UnequalCovariancePredictor([0.0, 0.0], np.eye(2)),
+                )
+                initial = tracker.update([[0.0, 0.0], [6.0, 3.0]], scores=[0.9, 0.9])
+                nearer_id = initial[1].track_id
+                matched = tracker.update([[8.0, 0.0]], scores=[0.9])
 
-        self.assertEqual(int(euclidean_matches[0, 0]), 1)
-        self.assertEqual(int(mahalanobis_matches[0, 0]), 0)
+                self.assertEqual([track.track_id for track in matched], [nearer_id])
+                self.assertEqual(tracker.lost_stracks[0].track_id, initial[0].track_id)
+
+    def test_primary_euclidean_gate_is_independent_of_motion_covariance(self):
+        for motion_model, variance, distance in product(
+            ("mamba", "bimamba"), (1e-6, 1e6), (50.0, 50.1),
+        ):
+            with self.subTest(motion_model=motion_model, variance=variance, distance=distance):
+                tracker = Tracker(
+                    match_thresh=50.0,
+                    unconfirmed_match_thresh=80.0,
+                    motion_model=motion_model,
+                    bev_grid_shape=(100, 200),
+                    motion_predictor=ConstantDistributionPredictor([0.0, 0.0], np.eye(2) * variance),
+                )
+                identity = tracker.update([[10.0, 20.0]], scores=[0.9])[0].track_id
+                tracks = tracker.update([[10.0 + distance, 20.0]], scores=[0.9])
+
+                self.assertEqual([track.track_id for track in tracks], [identity] if distance <= 50 else [])
+                self.assertEqual(tracker.last_motion_predictions[0]["matched"], int(distance <= 50))
+
+    def test_unconfirmed_tracks_use_their_own_euclidean_gate(self):
+        for motion_model, distance in product(("mamba", "bimamba"), (80.0, 80.1)):
+            with self.subTest(motion_model=motion_model, distance=distance):
+                tracker = Tracker(
+                    match_thresh=50.0,
+                    unconfirmed_match_thresh=80.0,
+                    motion_model=motion_model,
+                    bev_grid_shape=(100, 200),
+                    motion_predictor=ConstantDistributionPredictor([0.0, 0.0], np.eye(2)),
+                )
+                tracker.update([], scores=[])
+                self.assertEqual(tracker.update([[10.0, 20.0]], scores=[0.9]), [])
+                identity = tracker.tracked_stracks[0].track_id
+                tracks = tracker.update([[10.0 + distance, 20.0]], scores=[0.9])
+
+                self.assertEqual([track.track_id for track in tracks], [identity] if distance <= 80 else [])
 
     def test_implicit_tracker_uses_detection_uncertainty_and_motion_covariance(self):
         predictor = ConstantDistributionPredictor(

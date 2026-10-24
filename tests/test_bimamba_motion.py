@@ -113,7 +113,7 @@ class BiMambaWiringTests(unittest.TestCase):
         self.assertEqual(exit_error.exception.code, 2)
         self.assertIn('--mamba_history_mode window', error.getvalue())
 
-    def test_tracker_routes_bimamba_covariance_through_misses_and_mahalanobis(self):
+    def test_tracker_routes_bimamba_covariance_through_misses_and_reacquisition(self):
         class Predictor(nn.Module):
             def generate_distribution(self, histories, bev_grid_shape=None, return_kappa=False):
                 count = len(histories)
@@ -122,19 +122,17 @@ class BiMambaWiringTests(unittest.TestCase):
 
         args = SimpleNamespace(high_cls_thres=.4, track_match_thresh=30, track_low_match_thresh=50,
                                motion_model='bimamba', motion_history_len=3,
-                               mamba_uncertainty_gate='b', mamba_uncertainty_mode='separate_full',
-                               motion_cost='mahalanobis')
+                               mamba_uncertainty_gate='b', mamba_uncertainty_mode='separate_full')
         config = {'base': SimpleNamespace(base=SimpleNamespace(world_grid_shape=(100, 200)))}
         tracker = build_tracker(args, config, 'cpu', Predictor())
         track = tracker.update([[10., 20.]], [.9], uncertainties=[.2])[0]
         identity = track.track_id
-        with patch.object(tracker, '_mahalanobis_cost', wraps=tracker._mahalanobis_cost) as cost:
-            tracker.update(np.empty((0, 2)), np.empty(0))
-            np.testing.assert_allclose(track.xy, [11., 20.])
-            np.testing.assert_array_equal(track.conds[-1][8:10], [0., 1.])
-            self.assertEqual(track.motion_kappa, 3.)
-            reacquired = tracker.update([[12.2, 20.]], [.9], uncertainties=[.4])[0]
-            self.assertTrue(cost.called)
+        tracker.update(np.empty((0, 2)), np.empty(0))
+        np.testing.assert_allclose(track.xy, [11., 20.])
+        np.testing.assert_array_equal(track.conds[-1][8:10], [0., 1.])
+        np.testing.assert_allclose(track.conds[-1][5:8], [4., 9., 0.])
+        self.assertEqual(track.motion_kappa, 3.)
+        reacquired = tracker.update([[12.2, 20.]], [.9], uncertainties=[.4])[0]
         self.assertEqual(reacquired.track_id, identity)
         np.testing.assert_array_equal(reacquired.conds[-1][8:10], [1., 0.])
         np.testing.assert_allclose(reacquired.xy, [12.2, 20.])
