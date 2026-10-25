@@ -74,8 +74,17 @@ class MambaMotionPredictor(nn.Module):
         uncertainty_gate="none",
         motion_uncertainty_type="total",
         uncertainty_weight="cosine",
+        niw_regularizer="mahalanobis",
+        niw_reg_weight=1e-3,
     ):
         super().__init__()
+
+        if niw_regularizer not in ("mahalanobis", "euclidean"):
+            raise ValueError("niw_regularizer must be 'mahalanobis' or 'euclidean'")
+        self.niw_regularizer = niw_regularizer
+        self.niw_reg_weight = float(niw_reg_weight)
+        if not np.isfinite(self.niw_reg_weight) or self.niw_reg_weight < 0:
+            raise ValueError("niw_reg_weight must be finite and non-negative")
 
         self.history_len = int(history_len)
         self.history_mode = history_mode
@@ -478,7 +487,8 @@ class MambaMotionPredictor(nn.Module):
                 kappa,
                 nu,
                 scale_tril,
-                lambda_evi=1e-3,
+                lambda_evi=self.niw_reg_weight,
+                regularizer_type=self.niw_regularizer,
             )
             return loss
 

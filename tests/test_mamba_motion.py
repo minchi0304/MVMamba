@@ -253,6 +253,25 @@ class MambaMotionPredictorTest(unittest.TestCase):
     def test_joint_niw_head_returns_finite_loss_and_bev_covariance(self):
         self._check_niw_head("joint")
 
+    def test_euclidean_niw_regularizer_uses_normalized_displacement_and_selected_weight(self):
+        for head in ("separate", "joint"):
+            with self.subTest(head=head):
+                predictor = mamba_motion.MambaMotionPredictor(
+                    history_len=2, d_model=8, num_layers=1, loss_type="niw",
+                    evidential_head=head, niw_regularizer="euclidean", niw_reg_weight=.25,
+                )
+                history = torch.tensor([[[10., 20., 5., -2.], [15., 18., 5., -2.]]])
+                target = torch.tensor([[11., 6.]])
+                shape = (100, 200)
+                loss = predictor(history, target, bev_grid_shape=shape)
+                _, _, kappa, nu, _ = predictor.predict_normalized_distribution(history, shape)
+                # The initialized mean repeats (5, -2): residual (6, 8) becomes (.03, .08).
+                expected_reg = (.03 ** 2 + .08 ** 2) ** .5 * (kappa + nu).item()
+                self.assertAlmostEqual(predictor.last_loss_stats["reg"], expected_reg, places=5)
+                self.assertAlmostEqual(
+                    loss.item(), predictor.last_loss_stats["nll"] + .25 * expected_reg, places=5,
+                )
+
     def test_detection_update_replaces_the_predicted_track_state(self):
         track = STrack([10.0, 20.0], 0.9, motion_history_len=5)
         track.activate(None, frame_id=1, motion_model="mamba")

@@ -80,6 +80,7 @@ class BiMambaWiringTests(unittest.TestCase):
 
         command = ('main.py -d multiviewx --data_root /dataset --motion_model bimamba '
                    '--mamba_history_mode window --mamba_uncertainty_gate b '
+                   '--niw_regularizer euclidean --niw_reg_weight 0.25 '
                    '--motion_loss niw --aug -j 0 --mamba_d_model 8 --mamba_layers 2')
         with contextlib.redirect_stdout(io.StringIO()) as output, \
              patch.object(sys, 'argv', command.split()), patch('os.makedirs'), \
@@ -100,6 +101,8 @@ class BiMambaWiringTests(unittest.TestCase):
         self.assertEqual(predictor.call_args.kwargs['d_model'], 8)
         self.assertEqual(predictor.call_args.kwargs['num_layers'], 2)
         self.assertEqual(predictor.call_args.kwargs['uncertainty_gate'], 'b')
+        self.assertEqual(predictor.call_args.kwargs['niw_regularizer'], 'euclidean')
+        self.assertEqual(predictor.call_args.kwargs['niw_reg_weight'], .25)
 
     def test_stateful_bimamba_is_rejected_before_loading_data(self):
         with self.assertRaisesRegex(ValueError, 'window'):
