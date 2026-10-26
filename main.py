@@ -11,7 +11,7 @@ import tqdm
 import torch
 import torch.optim as optim
 import torchvision.transforms as T
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataloader.wildtrack import Wildtrack
 from dataloader.multiviewx import MultiviewX
 from dataloader.citytrack import CityTrack
@@ -21,6 +21,7 @@ from dataloader.concat_dataset import ConcatDataset
 from utils.logger import Logger
 from utils import utils
 from utils.loss import EvidentialOccupancyLoss
+from utils.detection_motion_training import build_detection_motion_batch, format_history_stats
 from detector.multiview_model import MultiView_Detection
 from detector.encoder import resnet18
 from tracker.mamba_motion_predictor import MambaMotionPredictor
@@ -67,9 +68,19 @@ def train(
     tic = time.time()
 
     losses = 0
+    history_totals = Counter()
+    detection_history = args.motion_model in ('mamba', 'bimamba') and args.motion_train_history == 'detection'
 
     for batch_idx, (item, target) in enumerate(data_loader):
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
+        motion_item = item
+        history_text = ''
+        if detection_history:
+            motion_item, history_stats = build_detection_motion_batch(
+                model, train_dataset, item, device, args,
+            )
+            history_totals.update(history_stats)
+            history_text = ', ' + format_history_stats(history_stats)
         data = item['img'].to(device)
                 
         bev_occupancy = model(train_dataset, item['root'], data, item.get('proj_mats'))
@@ -81,11 +92,11 @@ def train(
 
         occ_loss = criterion(bev_occupancy, gt_valid_bev.float(), gt_occ)
 
-        has_motion_sample = args.motion_model in ('mamba', 'bimamba') and item['motion_bev_grid_shape'].size(0) > 0
+        has_motion_sample = args.motion_model in ('mamba', 'bimamba') and motion_item['motion_bev_grid_shape'].size(0) > 0
         if has_motion_sample:
-            motion_condition = item['motion_condition'].to(bev_center.device)
-            motion_target = item['motion_target'].to(bev_center.device)
-            motion_bev_grid_shape = item['motion_bev_grid_shape'].to(bev_center.device)
+            motion_condition = motion_item['motion_condition'].to(bev_center.device)
+            motion_target = motion_item['motion_target'].to(bev_center.device)
+            motion_bev_grid_shape = motion_item['motion_bev_grid_shape'].to(bev_center.device)
             motion_loss = model.motion_predictor(
                 motion_condition,
                 motion_target,
@@ -122,10 +133,12 @@ def train(
 
         if (batch_idx + 1) % log_interval == 0:
             print('Train Epoch: {}, Batch:{}/{},\t occ_loss: {:.3f}, motion_loss: {:.6f}{}{}, \tTime: {:.3f} (min), maxima: {:.3f}'.format(
-                    epoch, (batch_idx + 1), len(data_loader), occ_loss.item(), motion_loss.item(), task_weight_text, motion_stats_text, (time.time()-tic)/60, bev_center.max()))
+                    epoch, (batch_idx + 1), len(data_loader), occ_loss.item(), motion_loss.item(), task_weight_text, motion_stats_text + history_text, (time.time()-tic)/60, bev_center.max()))
 
     print('Train Epoch: {}, Batch:{}/{},\t occ_loss: {:.3f}, motion_loss: {:.6f}{}{}, \tTime: {:.3f} (min), maxima: {:.3f}'.format(
-                    epoch, (batch_idx + 1), len(data_loader), occ_loss.item(), motion_loss.item(), task_weight_text, motion_stats_text, (time.time()-tic)/60, bev_center.max()))
+                    epoch, (batch_idx + 1), len(data_loader), occ_loss.item(), motion_loss.item(), task_weight_text, motion_stats_text + history_text, (time.time()-tic)/60, bev_center.max()))
+    if detection_history:
+        print('Train history epoch {}: {}'.format(epoch, format_history_stats(history_totals)))
 
     return losses / len(data_loader)
 
@@ -239,18 +252,21 @@ if __name__ == '__main__':
     parser.add_argument('--high_cls_thres', type=float, default=0.4, help='Confidence threshold for high-confidence detections')
     parser.add_argument('--track_match_thresh', type=float, default=75, help='MVTrackTrans-style center-distance association threshold')
     parser.add_argument('--track_low_match_thresh', type=float, default=100, help='MVTrackTrans-style center-distance gate for unconfirmed tracks')
+    parser.add_argument('--track_buffer', type=int, default=5, help='Maximum missed frames retained by tracking and motion-history replay')
     parser.add_argument('--motion_model', type=str, default='mamba', choices=['kalman', 'mamba', 'bimamba'], help='Motion prediction model; bimamba uses bidirectional history windows')
     parser.add_argument('--motion_history_len', type=int, default=10, help='Number of trajectory tokens used by learned motion models')
+    parser.add_argument('--motion_train_history', choices=['detection', 'gt'], default='detection', help='Fresh current-detector histories (default), or legacy GT histories for ablation')
+    parser.add_argument('--motion_train_match_thresh', type=float, default=20., help='Detection-to-GT identity assignment radius in original world-grid units, only for training')
     parser.add_argument('--mamba_history_mode', type=str, default='window', choices=['window', 'stateful'], help='Use a fixed trajectory window or persistent per-track Mamba state')
     parser.add_argument('--mamba_uncertainty_mode', type=str, default='unified', choices=['none', 'unified', 'separate', 'separate_full'], help='Implicit uncertainty input: disabled, unified, uncertainty-only branches, or fully source-specific projections')
     parser.add_argument('--mamba_uncertainty_gate', type=str, default='none', choices=['none', 'b', 'delta'], help='Explicit reliability gate on SSM B or positive delta')
     parser.add_argument('--mamba_uncertainty_weight', type=str, default='cosine', choices=['linear', 'rational', 'cosine'], help='Detection reliability mapping; motion always uses 1-tanh(trace)')
     parser.add_argument('--motion_uncertainty_type', type=str, default='total', choices=['aleatoric', 'epistemic', 'total'], help='NIW covariance component whose trace drives the explicit motion gate')
-    parser.add_argument('--mamba_d_model', type=int, default=64)
+    parser.add_argument('--mamba_d_model', type=int, default=128)
     parser.add_argument('--mamba_d_state', type=int, default=16)
     parser.add_argument('--mamba_d_conv', type=int, default=4)
     parser.add_argument('--mamba_expand', type=int, default=2)
-    parser.add_argument('--mamba_layers', type=int, default=6)
+    parser.add_argument('--mamba_layers', type=int, default=2)
     parser.add_argument('--mamba_dropout', type=float, default=0.0)
     parser.add_argument('--motion_loss', type=str, default='niw', choices=['smooth_l1', 'niw'], help='Motion prediction loss and output head')
     parser.add_argument('--niw_regularizer', type=str, default='mahalanobis', choices=['mahalanobis', 'euclidean'], help='NIW evidence penalty: Psi-whitened error or BEV-normalized L2 error; association always uses Euclidean distance')
@@ -262,7 +278,7 @@ if __name__ == '__main__':
     parser.add_argument('-d', '--dataset', type=str, default='wildtrack', choices=['wildtrack', 'multiviewx', 'citytrack', 'mvcrowdtrack', 'gmvd_test','gmvd_train'], help='Choose dataset wildtrack/multiviewx/citytrack/mvcrowdtrack/gmvd (default: wildtrack)')
     parser.add_argument('-pr', '--pretrained', default=False, action='store_true', help='Use pretrained weights (default: True)')
     parser.add_argument('-j', '--num_workers', type=int, default=4)
-    parser.add_argument('-b', '--batch_size', type=int, default=1, metavar='N', help='input batch size for training (default: 2)')
+    parser.add_argument('-b', '--batch_size', type=int, default=1, metavar='N', help='Number of target multiview frames per training step (default: 1)')
     parser.add_argument('--epochs', type=int, default=120, metavar='N', help='number of epochs to train')
     parser.add_argument('--lr', type=float, default=1e-4, metavar='LR', help='learning rate (default: 1e-3)')
     parser.add_argument('--min_lr', type=float, default=1e-6, metavar='min LR', help='minimum learning rate for cosine scheduler')
@@ -279,6 +295,10 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if not np.isfinite(args.niw_reg_weight) or args.niw_reg_weight < 0:
         parser.error('--niw_reg_weight must be finite and non-negative')
+    if args.motion_history_len < 1 or args.track_buffer < 0:
+        parser.error('--motion_history_len must be positive and --track_buffer must be nonnegative')
+    if not np.isfinite(args.motion_train_match_thresh) or args.motion_train_match_thresh <= 0:
+        parser.error('--motion_train_match_thresh must be finite and positive')
     if args.motion_model == 'bimamba' and args.mamba_history_mode != 'window':
         parser.error('--motion_model bimamba requires --mamba_history_mode window')
     if args.mamba_uncertainty_gate != 'none':
@@ -315,7 +335,13 @@ if __name__ == '__main__':
     sys.stdout = Logger(os.path.join(logdir, 'log.txt'), )
     print('Settings:')
     print(vars(args))
-    print('Motion training history: GT')
+    print('Motion training history: {}'.format(
+        args.motion_train_history if args.motion_model in ('mamba', 'bimamba') else 'disabled',
+    ))
+    if args.motion_model in ('mamba', 'bimamba') and args.motion_train_history == 'detection':
+        print('Past-only replay with current weights: up to {} detector inferences per target; '
+              'GT identity gate {}, max missed frames {}, no epoch cache'.format(
+                  args.motion_history_len, args.motion_train_match_thresh, args.track_buffer))
     
      # Dataset
     normalize = T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
@@ -350,7 +376,7 @@ if __name__ == '__main__':
             train_ratio = float(data_row[2])
             sample_require = int(data_row[3])
             sub_path = str(data_row[1]).lstrip('.')
-            path = os.path.expanduser("/dataset/Multiview_datasets"+sub_path)
+            path = os.path.expanduser("/dataset"+sub_path)
             if data_row[1].split('/')[-1]!='Wildtrack':
                 base = MultiviewX(path)
             else:
@@ -359,7 +385,7 @@ if __name__ == '__main__':
             if data_row[0]=='train':
                 # Train data
                 # dataset_obj = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=4, train_ratio=train_ratio, sample_require=sample_require)
-                dataset_obj = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=8, train_ratio=train_ratio, sample_require=sample_require, data_aug=args.aug, build_motion_samples=args.motion_model in ('mamba', 'bimamba'), motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
+                dataset_obj = GetDataset(base, train=True, transform=train_transform, grid_reduce=4, img_reduce=8, train_ratio=train_ratio, sample_require=sample_require, data_aug=args.aug, build_motion_samples=args.motion_model in ('mamba', 'bimamba') and args.motion_train_history == 'gt', motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
                 train_dataset_list.append(dataset_obj)
                 
             else:
@@ -386,7 +412,7 @@ if __name__ == '__main__':
     elif args.dataset in ['wildtrack', 'multiviewx', 'citytrack', 'mvcrowdtrack']:
         grid_reduce = int(getattr(base0, 'default_grid_reduce', 4))
         img_reduce = int(getattr(base0, 'default_img_reduce', 8))
-        train_dataset_ = GetDataset(base0, train=True, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=args.aug, build_motion_samples=args.motion_model in ('mamba', 'bimamba'), motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
+        train_dataset_ = GetDataset(base0, train=True, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=args.aug, build_motion_samples=args.motion_model in ('mamba', 'bimamba') and args.motion_train_history == 'gt', motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
         test_dataset_ = GetDataset(base0, train=False, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=False, bev_gaussian_sigma=args.bev_gaussian_sigma)
 
         print("Training datasets")
@@ -397,7 +423,7 @@ if __name__ == '__main__':
     # Train and Test Data Loader 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                                             num_workers=args.num_workers, pin_memory=True, worker_init_fn=init_fn,
-                                            collate_fn=motion_joint_collate if args.motion_model in ('mamba', 'bimamba') else None)
+                                            collate_fn=motion_joint_collate if args.motion_model in ('mamba', 'bimamba') and args.motion_train_history == 'gt' else None)
     
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False,
                                             num_workers=args.num_workers, pin_memory=True, worker_init_fn=init_fn)

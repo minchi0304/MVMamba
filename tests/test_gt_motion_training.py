@@ -71,7 +71,7 @@ class GTJointTrainingTests(unittest.TestCase):
             with self.subTest(motion_model=motion_model, weighting=weighting):
                 model = Model()
                 before = model.detector.weight.detach().clone()
-                args = SimpleNamespace(motion_model=motion_model, multi_task_loss=weighting)
+                args = SimpleNamespace(motion_model=motion_model, multi_task_loss=weighting, motion_train_history='gt')
                 optimizer = torch.optim.SGD(model.parameters(), lr=.001)
                 with patch.multiple(main, args=args, device=torch.device('cpu'), train_dataset=None,
                                     criterion=occupancy_loss, create=True), contextlib.redirect_stdout(io.StringIO()):
@@ -98,7 +98,7 @@ class GTJointTrainingTests(unittest.TestCase):
             def forward(self, dataset, roots, images, projection):
                 return self.occupancy
 
-        args = SimpleNamespace(motion_model='mamba', multi_task_loss='uncertainty')
+        args = SimpleNamespace(motion_model='mamba', multi_task_loss='uncertainty', motion_train_history='gt')
         model = Model()
         optimizer = torch.optim.Adam(model.parameters(), lr=.001, weight_decay=.01)
         criterion = lambda raw, valid, target: .5 * (raw - 1.).square().mean()
@@ -122,7 +122,7 @@ class GTJointTrainingTests(unittest.TestCase):
             pass
 
         command = ('main.py -d multiviewx -pr --data_root /dataset --motion_model mamba '
-                   '--multi_task_loss uncertainty --epochs 100 '
+                   '--multi_task_loss uncertainty --epochs 100 --motion_train_history gt '
                    '--track_match_thresh 50 --track_low_match_thresh 80 --bev_gaussian_sigma 1.5 '
                    '--motion_loss niw --evidential_head separate --mamba_history_mode window '
                    '--mamba_uncertainty_mode separate_full --mamba_uncertainty_gate none --aug')

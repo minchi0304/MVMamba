@@ -281,6 +281,7 @@ def build_tracker(args, dataset_config, tracker_device, motion_predictor=None):
         high_cls_thres=float(args.high_cls_thres),
         match_thresh=float(args.track_match_thresh),
         unconfirmed_match_thresh=float(args.track_low_match_thresh),
+        track_buffer=int(getattr(args, 'track_buffer', 5)),
         motion_model=args.motion_model,
         bev_grid_shape=tuple(base_dataset.world_grid_shape),
         device=tracker_device,

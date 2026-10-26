@@ -73,6 +73,9 @@ class GetDataset(VisionDataset):
         self.imgs_gt = {}
         self.pid_dict = {}
         self.download(frame_range)
+        self.frames = sorted(self.world_gt)
+        self.frame_indices = {frame: index for index, frame in enumerate(self.frames)}
+        self.frame_step = min(np.diff(self.frames), default=1)
         max_frame_objects = max((len(points) for points, _ in self.world_gt.values()), default=0)
         self.max_objects = int(max_frame_objects)
         self.motion_samples = (
@@ -174,9 +177,11 @@ class GetDataset(VisionDataset):
                     self.imgs_gt[frame][cam] = (np.array(img_bboxs[cam]), np.array(img_pids[cam]))
 
 
-    def sample_augmentation(self):
+    def sample_augmentation(self, augment=None):
         fH, fW = self.data_aug_conf['final_dim']
-        if self.train and self.data_aug:
+        if augment is None:
+            augment = self.train and self.data_aug
+        if augment:
             resize = np.random.uniform(*self.data_aug_conf['resize_lim'])
             resize_dims = (int(fW * resize), int(fH * resize))
             newW, newH = resize_dims
@@ -284,16 +289,33 @@ class GetDataset(VisionDataset):
             person_ids[:, ct_int[1], ct_int[0]] = pid
         return person_ids, valid_mask
 
-    def __getitem__(self, index):
-        frame = list(self.world_gt.keys())[index]
+    def history_frames(self, frame):
+        """Past frames in this split, stopping at missing-frame/sequence gaps."""
+        index = self.frame_indices[int(frame)]
+        start = index
+        while start > 0 and index - start < self.motion_history_len:
+            if self.frames[start] - self.frames[start - 1] != self.frame_step:
+                break
+            start -= 1
+        return self.frames[start:index]
+
+    def load_history_frame(self, frame):
+        """Load one unaugmented frame without allocating dense training targets."""
+        if int(frame) not in self.frame_indices:
+            raise KeyError("History frame is outside this dataset split")
+        imgs, proj_mats, _ = self._load_images(
+            int(frame), np.eye(3, dtype=np.float32), augment=False,
+        )
+        return {'img': imgs, 'proj_mats': proj_mats, 'root': self.root, 'frame': int(frame)}
+
+    def _load_images(self, frame, bev_aug_mat, augment=None):
         imgs = []
         img_aug_params = []
         proj_mats = []
-        bev_aug_mat = self.sample_bev_augmentation()
         for cam in range(self.num_cam):
-
-            img = Image.open(self.img_fpath[cam][frame]).convert('RGB')
-            resize_dims, crop = self.sample_augmentation()
+            with Image.open(self.img_fpath[cam][frame]) as source:
+                img = source.convert('RGB')
+            resize_dims, crop = self.sample_augmentation(augment=augment)
             image_size = img.size
             sx = resize_dims[0] / float(image_size[0])
             sy = resize_dims[1] / float(image_size[1])
@@ -305,6 +327,12 @@ class GetDataset(VisionDataset):
             proj_mats.append(torch.from_numpy(self.projection_matrix(cam, resize_dims, crop, image_size, bev_aug_mat)).float())
         imgs = torch.stack(imgs)
         proj_mats = torch.stack(proj_mats)
+        return imgs, proj_mats, img_aug_params
+
+    def __getitem__(self, index):
+        frame = self.frames[index]
+        bev_aug_mat = self.sample_bev_augmentation()
+        imgs, proj_mats, img_aug_params = self._load_images(frame, bev_aug_mat)
 
         # BEV GT
         worldgrid_pts, world_pids = self.world_gt[frame]
@@ -361,7 +389,7 @@ class GetDataset(VisionDataset):
                     np.stack([sample[1] for sample in motion_samples], axis=0)
                 ).float()
             else:
-                item['motion_condition'] = torch.empty((0, 5, 4), dtype=torch.float32)
+                item['motion_condition'] = torch.empty((0, self.motion_history_len, 4), dtype=torch.float32)
                 item['motion_target'] = torch.empty((0, 2), dtype=torch.float32)
             item['motion_bev_grid_shape'] = torch.tensor(
                 self.world_grid_shape,
@@ -416,7 +444,8 @@ def motion_joint_collate(batch):
         collated_item['motion_target'] = torch.cat(motion_targets, dim=0)
         collated_item['motion_bev_grid_shape'] = torch.cat(motion_grid_shapes, dim=0)
     else:
-        collated_item['motion_condition'] = torch.empty((0, 5, 4), dtype=torch.float32)
+        history_len = items[0]['motion_condition'].size(1) if 'motion_condition' in items[0] else 0
+        collated_item['motion_condition'] = torch.empty((0, history_len, 4), dtype=torch.float32)
         collated_item['motion_target'] = torch.empty((0, 2), dtype=torch.float32)
         collated_item['motion_bev_grid_shape'] = torch.empty((0, 2), dtype=torch.float32)
     return collated_item, collated_target

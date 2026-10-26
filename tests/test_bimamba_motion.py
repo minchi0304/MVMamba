@@ -79,6 +79,7 @@ class BiMambaWiringTests(unittest.TestCase):
                 return 2
 
         command = ('main.py -d multiviewx --data_root /dataset --motion_model bimamba '
+                   '--motion_train_history gt '
                    '--mamba_history_mode window --mamba_uncertainty_gate b '
                    '--niw_regularizer euclidean --niw_reg_weight 0.25 '
                    '--motion_loss niw --aug -j 0 --mamba_d_model 8 --mamba_layers 2')

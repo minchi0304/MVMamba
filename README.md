@@ -51,13 +51,44 @@ With `--multi_task_loss uncertainty`, each active task uses
 are occupancy detection and motion.
 `--multi_task_loss plain` sums their losses with coefficient `1` each.
 
-### GT-history joint training
+### Detector-history joint training
 
-The detector and Mamba train together. Motion training always uses GT histories
-of `[x, y, dx, dy]`; its target is `next_GT_xy - last_GT_xy`. Frames are shuffled,
-while each object's history remains in chronological order. A batch without a
-complete GT motion window trains detection only, without updating the motion
-task weight. No detector-history snapshot or cache is generated during training.
+The default `--motion_train_history detection` trains the detector and Mamba
+together. `--batch_size 1` still means one **target multiview frame** per optimizer
+step, and target frames are shuffled. For each target `t`, the **current** detector
+decodes up to `--motion_history_len` preceding frames in chronological order.
+These forwards run one frame at a time in evaluation mode without gradients;
+they do not update BatchNorm statistics or use a previous-epoch cache. No target
+or future detection enters the motion history. Histories stay inside each dataset
+root/train split and restart at gaps in the sampled frame sequence.
+
+Past detections are matched one-to-one to GT identities within
+`--motion_train_match_thresh` (default `20`, in original world-grid units, separate
+from tracking association thresholds). GT positions are never inserted as inputs.
+A history starts at a matched detection with confidence at least
+`--high_cls_thres`; later observations may use confidence above
+`max(0, high_cls_thres - 0.1)`, as in tracking. Missed observations use detached
+Mamba predictions autoregressively, including predicted covariance and NIW kappa
+when explicit gating is enabled. Histories expire after more than
+`--track_buffer` missed frames (default `5`, also used during tracking).
+This is supervised identity association, not training on tracker ID switches or
+unmatched false positives.
+
+The final motion forward has gradients and predicts
+`GT_xy(t) - history_xy(t-1)`. A short history uses repeated-first-state padding;
+an object with no detected history contributes no motion loss. The current target
+frame supplies the detection loss, and both losses share **one optimizer step**.
+There is no gradient through decoding, identity assignment, or autoregressive
+history generation; the motion model learns from the resulting input tokens.
+Without any valid motion samples, only detection is updated. Logs report sample
+counts, observed/predicted token counts before padding, mean input uncertainty,
+and mean predictive covariance trace in original world-grid units squared.
+
+This costs up to `motion_history_len` extra detector inferences per target.
+Early training can have few motion samples until the detector finds people;
+covariance inputs occur only when a detected history contains a subsequent miss.
+Use `--motion_train_history gt` for the previous GT-only baseline, whose motion
+target remains `next_GT_xy - last_GT_xy` and which requires a complete GT window.
 
 `-pr` initializes the ImageNet backbone. `--resume` loads a trained checkpoint
 for evaluation. Image augmentation remains available with `--aug`.

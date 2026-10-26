@@ -6,6 +6,7 @@ import torch
 
 from . import matching
 from .kalman_filter import KalmanFilter
+from .motion_history import detection_token, motion_token
 
 class TrackState:
     New = 0
@@ -55,48 +56,16 @@ class STrack:
         self.motion_prediction_pending = False
 
     def _detection_condition(self, observed_xy, delta):
-        kinematics = np.concatenate((observed_xy, delta)).astype(np.float32)
-        if self.mamba_uncertainty_mode == "none" and self.mamba_uncertainty_gate == "none":
-            return kinematics
-        condition = np.concatenate((
-            kinematics,
-            np.asarray([
-                self.detection_uncertainty,
-                0.0,
-                0.0,
-                0.0,
-                1.0,
-                0.0,
-            ], dtype=np.float32),
-        ))
-        if self.mamba_uncertainty_gate != "none":
-            condition = np.concatenate((condition, np.zeros(1, dtype=np.float32)))
-        return condition
+        return detection_token(
+            observed_xy, delta, self.detection_uncertainty,
+            self.mamba_uncertainty_mode, self.mamba_uncertainty_gate,
+        )
 
     def _motion_condition(self, predicted_xy, delta):
-        kinematics = np.concatenate((predicted_xy, delta)).astype(np.float32)
-        if self.mamba_uncertainty_mode == "none" and self.mamba_uncertainty_gate == "none":
-            return kinematics
-        covariance = self.motion_covariance
-        if covariance is None:
-            covariance_values = np.zeros(3, dtype=np.float32)
-        else:
-            covariance_values = np.asarray([
-                covariance[0, 0],
-                covariance[1, 1],
-                covariance[0, 1],
-            ], dtype=np.float32)
-        condition = np.concatenate((
-            kinematics,
-            np.asarray([0.0], dtype=np.float32),
-            covariance_values,
-            np.asarray([0.0, 1.0], dtype=np.float32),
-        ))
-        if self.mamba_uncertainty_gate != "none":
-            condition = np.concatenate((
-                condition, np.asarray([self.motion_kappa], dtype=np.float32),
-            ))
-        return condition
+        return motion_token(
+            predicted_xy, delta, self.motion_covariance, self.motion_kappa,
+            self.mamba_uncertainty_mode, self.mamba_uncertainty_gate,
+        )
 
     @classmethod
     def next_id(cls):
