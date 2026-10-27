@@ -177,7 +177,6 @@ The main tracking controls are:
 - `--mamba_uncertainty_weight`: detection reliability mapping, `linear`, `rational`, or `cosine` (default); motion always uses `1 - tanh(trace)`
 - `--motion_uncertainty_type`: `aleatoric`, `epistemic`, or `total` (default) covariance trace for the explicit motion gate
 - `--motion_loss`: `niw` predicts a correlated 2D offset distribution; `smooth_l1` keeps the deterministic baseline
-- `--niw_regularizer`: `mahalanobis` (default) uses Psi-whitened error for the NIW evidence penalty; `euclidean` uses BEV-normalized L2 error
 - `--niw_reg_weight`: NIW evidence regularization coefficient (default: `1e-3`; finite and non-negative)
 - `--evidential_head`: `separate` uses independent mean/evidence MLPs; `joint` uses one MLP with seven outputs
 
@@ -185,27 +184,25 @@ Motion coordinates, displacements, and covariance are always normalized by the
 BEV width/height. The Mamba predictor estimates the normalized forward displacement. During tracking it is converted back to world-grid units and applied as
 `predicted_xy = previous_xy + predicted_delta`. A matched detection then replaces the predicted state and becomes the newest trajectory observation.
 
-Both Mamba and BiMamba support the same NIW regularizer options. With error
-`e = target_delta_normalized - predicted_delta_normalized` and `Psi = L @ L.T`:
+Both Mamba and BiMamba use a fixed Euclidean NIW evidence penalty. With error
+`e = target_delta_normalized - predicted_delta_normalized`:
 
 ```text
-mahalanobis: R = sqrt(e.T @ inverse(Psi) @ e + eps) * (kappa + nu)
-euclidean:   R = norm(e, 2) * (kappa + nu)
+R = norm(e, 2) * (kappa + nu)
 loss = Student-t NLL + niw_reg_weight * R
 ```
 
-To train with the Euclidean evidence penalty, add:
+To set the evidence penalty weight, add:
 
 ```bash
---motion_loss niw --niw_regularizer euclidean --niw_reg_weight 1e-3
+--motion_loss niw --niw_reg_weight 1e-3
 ```
 
-The Student-t NLL and predictive covariance formula are the same for both
-regularizers. These options affect NIW training only; tracking association
-always uses Euclidean distance. The L2 penalty uses BEV-normalized displacement
-coordinates, not world-grid distances. Its scale differs from the Psi-whitened
-penalty, so compare regularization weights on validation data. The default
-`mahalanobis` and weight `1e-3` preserve the previous training objective.
+The `--niw_regularizer` selector has been removed; omit it from older commands.
+The Student-t NLL uses the full predictive scale matrix, and predictive
+covariance is still learned. The L2 penalty uses BEV-normalized displacement
+coordinates. Its scale differs from the former Psi-whitened penalty, so compare
+regularization weights on validation data. The default weight is `1e-3`.
 
 With `--motion_loss niw`, the predictive covariance is converted to world-grid
 units and recorded without changing association. Per-epoch values are written to

@@ -269,7 +269,6 @@ if __name__ == '__main__':
     parser.add_argument('--mamba_layers', type=int, default=2)
     parser.add_argument('--mamba_dropout', type=float, default=0.0)
     parser.add_argument('--motion_loss', type=str, default='niw', choices=['smooth_l1', 'niw'], help='Motion prediction loss and output head')
-    parser.add_argument('--niw_regularizer', type=str, default='mahalanobis', choices=['mahalanobis', 'euclidean'], help='NIW evidence penalty: Psi-whitened error or BEV-normalized L2 error; association always uses Euclidean distance')
     parser.add_argument('--niw_reg_weight', type=float, default=1e-3, help='Non-negative NIW evidence regularization coefficient')
     parser.add_argument('--evidential_head', type=str, default='separate', choices=['separate', 'joint'], help='Use separate mean/evidence MLPs or one joint NIW MLP')
     parser.add_argument('--bev_gaussian_sigma', type=float, default=2.0, help='Gaussian sigma used to generate BEV occupancy targets')
@@ -308,7 +307,7 @@ if __name__ == '__main__':
     print('Motion model: {}'.format(args.motion_model))
     print('Motion loss: {}'.format(args.motion_loss))
     if args.motion_model in ('mamba', 'bimamba') and args.motion_loss == 'niw':
-        print('NIW regularizer: {}, weight: {:g}'.format(args.niw_regularizer, args.niw_reg_weight))
+        print('NIW regularizer: euclidean, weight: {:g}'.format(args.niw_reg_weight))
     print('Motion association cost: euclidean')
     print('Mamba uncertainty input: {}'.format(args.mamba_uncertainty_mode))
     print('Mamba explicit gate: {}, detection weight: {}, motion weight: tanh, motion covariance: {}'.format(
@@ -453,7 +452,6 @@ if __name__ == '__main__':
             dropout=args.mamba_dropout,
             history_mode=args.mamba_history_mode,
             loss_type=args.motion_loss,
-            niw_regularizer=args.niw_regularizer,
             niw_reg_weight=args.niw_reg_weight,
             evidential_head=args.evidential_head,
             uncertainty_mode=args.mamba_uncertainty_mode,

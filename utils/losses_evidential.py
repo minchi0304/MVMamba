@@ -260,19 +260,16 @@ def evidential_niw_loss_2d(
     scale_tril: torch.Tensor,
     lambda_evi: float = 1e-3,
     eps: float = 1e-8,
-    regularizer_type: str = "mahalanobis",
 ):
     """NIW evidential loss for a batch of correlated 2D motion targets.
 
     ``mean`` is the predictive location, ``kappa`` and ``nu`` are the NIW
     evidence parameters, and ``scale_tril`` is the Cholesky factor of Psi.
     The induced predictive distribution is a bivariate Student-t.
-    The evidence penalty uses either the Psi-whitened error (``mahalanobis``)
-    or the L2 error in the supplied coordinates (``euclidean``). The Student-t
-    NLL is identical for both choices.
+    The evidence penalty is the Euclidean error in the supplied coordinates
+    times (kappa + nu). Motion predictors supply BEV-normalized displacements.
+    The Student-t NLL uses the full predictive scale matrix.
     """
-    if regularizer_type not in ("mahalanobis", "euclidean"):
-        raise ValueError("regularizer_type must be 'mahalanobis' or 'euclidean'")
     if not math.isfinite(lambda_evi) or lambda_evi < 0:
         raise ValueError("lambda_evi must be finite and non-negative")
 
@@ -306,10 +303,7 @@ def evidential_niw_loss_2d(
         * torch.log1p(mahalanobis / degrees_of_freedom)
     )
 
-    if regularizer_type == "euclidean":
-        error = torch.linalg.vector_norm(diff.squeeze(-1), dim=-1)
-    else:
-        error = torch.sqrt(delta_psi + eps)
+    error = torch.linalg.vector_norm(diff.squeeze(-1), dim=-1)
     regularizer = error * (kappa_flat + nu_flat)
     loss = nll + lambda_evi * regularizer
     stats = {

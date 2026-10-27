@@ -258,7 +258,7 @@ class MambaMotionPredictorTest(unittest.TestCase):
             with self.subTest(head=head):
                 predictor = mamba_motion.MambaMotionPredictor(
                     history_len=2, d_model=8, num_layers=1, loss_type="niw",
-                    evidential_head=head, niw_regularizer="euclidean", niw_reg_weight=.25,
+                    evidential_head=head, niw_reg_weight=.25,
                 )
                 history = torch.tensor([[[10., 20., 5., -2.], [15., 18., 5., -2.]]])
                 target = torch.tensor([[11., 6.]])
