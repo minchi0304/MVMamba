@@ -23,7 +23,7 @@ from utils.detection_motion_training import (
 
 def arguments(**overrides):
     values = dict(
-        motion_model='mamba', motion_train_history='detection', motion_history_len=3,
+        motion_model='mamba', motion_train_history='detection', motion_train_cache='epoch', motion_history_len=3,
         high_cls_thres=.4, motion_train_match_thresh=5., track_buffer=2,
         mamba_uncertainty_mode='unified', mamba_uncertainty_gate='none',
         dataset='multiviewx', multi_task_loss='plain',
@@ -134,12 +134,13 @@ class TinyFrames:
     world_grid_shape = (64, 64)
     grid_reduce = 2
 
-    def __init__(self):
-        self.world_gt = {frame: (np.array([[10. + 2 * frame, 20.]]), np.array([7])) for frame in range(5)}
+    def __init__(self, history_len=3, num_frames=5):
+        self.history_len = history_len
+        self.world_gt = {frame: (np.array([[10. + 2 * frame, 20.]]), np.array([7])) for frame in range(num_frames)}
         self.requested = []
 
     def history_frames(self, frame):
-        return list(range(max(0, frame - 3), frame))
+        return list(range(max(0, frame - self.history_len), frame))
 
     def load_history_frame(self, frame):
         self.requested.append(frame)
@@ -179,6 +180,96 @@ def target_batch(frame=3):
 
 
 class JointTrainingTests(unittest.TestCase):
+    def test_cache_reuses_cpu_observations_but_recomputes_motion_with_current_model(self):
+        frames, model, cache = TinyFrames(), TinyModel(), {}
+        dataset = SimpleNamespace(dicts={'train': {'base': frames}})
+        args = arguments(mamba_uncertainty_gate='b')
+        first, stats = build_detection_motion_batch(model, dataset, target_batch()[0], 'cpu', args, cache)
+        self.assertEqual((stats['history_inferences'], stats['history_cache_hits']), (3, 0))
+        for values in cache.values():
+            self.assertEqual(len(values), 3)
+            for array in values:
+                self.assertIsInstance(array, np.ndarray)
+                self.assertEqual(array.dtype, np.float32)
+                self.assertTrue(array.flags.owndata)
+        with torch.no_grad():
+            model.detector_weight.add_(1.)
+        original = model.motion_predictor.generate_distribution
+
+        def updated_motion(*args, **kwargs):
+            delta, covariance, kappa = original(*args, **kwargs)
+            return delta * 2, covariance * 3, kappa * 2
+
+        with patch.object(model.motion_predictor, 'generate_distribution', side_effect=updated_motion) as rollout:
+            second, stats = build_detection_motion_batch(model, dataset, target_batch()[0], 'cpu', args, cache)
+        self.assertEqual((stats['history_inferences'], stats['history_cache_hits']), (0, 3))
+        self.assertEqual(frames.requested, [0, 1, 2])
+        self.assertEqual(len(model.calls), 3)
+        self.assertEqual(rollout.call_count, 2)
+        torch.testing.assert_close(first['motion_condition'][0, 0], second['motion_condition'][0, 0])
+        torch.testing.assert_close(second['motion_condition'][0, -1, :2], torch.tensor([20., 20.]))
+        torch.testing.assert_close(second['motion_condition'][0, -1, 5:8], torch.tensor([12., 27., 1.5]))
+        self.assertEqual(second['motion_condition'][0, -1, 10].item(), 4.)
+
+    def test_shuffled_overlapping_windows_match_fresh_outputs_and_decode_each_frame_once(self):
+        fresh_frames, cached_frames = (TinyFrames(history_len=10, num_frames=25) for _ in range(2))
+        fresh_model, cached_model = TinyModel(), TinyModel()
+        fresh_dataset = SimpleNamespace(dicts={'train': {'base': fresh_frames}})
+        cached_dataset = SimpleNamespace(dicts={'train': {'base': cached_frames}})
+        cache, inference_count, cache_hits = {}, 0, 0
+        args = arguments(motion_history_len=10)
+        # Reverse order also checks that cached later frames never leak into a target's history.
+        for frame in reversed(range(25)):
+            item, _ = target_batch(frame)
+            expected, _ = build_detection_motion_batch(fresh_model, fresh_dataset, item, 'cpu', args)
+            actual, stats = build_detection_motion_batch(cached_model, cached_dataset, item, 'cpu', args, cache)
+            for name in expected:
+                torch.testing.assert_close(actual[name], expected[name])
+            inference_count += stats['history_inferences']
+            cache_hits += stats['history_cache_hits']
+        self.assertEqual(len(fresh_model.calls), 195)
+        self.assertEqual(len(cached_model.calls), 24)
+        self.assertEqual((inference_count, cache_hits), (24, 171))
+        self.assertEqual(sorted(cached_frames.requested), list(range(24)))
+        self.assertEqual(len(cache), 24)
+
+    def test_cache_separates_roots_with_same_frame_ids_and_keeps_world_coordinates(self):
+        model, cache = TinyModel(), {}
+        frames, other = TinyFrames(), TinyFrames()
+        other.grid_reduce = 3
+        other.world_gt = {frame: (xy * 1.5, ids) for frame, (xy, ids) in other.world_gt.items()}
+        dataset = SimpleNamespace(dicts={'train': {'base': frames}, 'other': {'base': other}})
+        item, _ = target_batch()
+        build_detection_motion_batch(model, dataset, item, 'cpu', arguments(), cache)
+        item['root'] = ['other']
+        result, stats = build_detection_motion_batch(model, dataset, item, 'cpu', arguments(), cache)
+        self.assertEqual((len(cache), stats['history_inferences']), (6, 3))
+        self.assertEqual(other.requested, [0, 1, 2])
+        torch.testing.assert_close(result['motion_condition'][0, 0, :2], torch.tensor([18., 30.]))
+
+    def test_train_resets_cache_each_epoch_and_keeps_one_joint_update_per_batch(self):
+        for mode, inference_frames in (('epoch', [0, 1, 2]), ('none', [0, 1, 2, 0, 1])):
+            with self.subTest(cache=mode):
+                model, frames = TinyModel(), TinyFrames()
+                dataset = SimpleNamespace(dicts={'train': {'base': frames}})
+                optimizer = torch.optim.SGD(model.parameters(), lr=.0001)
+                args = arguments(motion_train_cache=mode)
+                with patch.multiple(main, args=args, device=torch.device('cpu'), train_dataset=dataset,
+                                    criterion=lambda raw, valid, target: raw.square().mean(), create=True), \
+                     patch.object(optimizer, 'step', wraps=optimizer.step) as step, \
+                     contextlib.redirect_stdout(io.StringIO()) as output:
+                    for epoch in (1, 2):
+                        before = [parameter.detach().clone() for parameter in
+                                  (model.detector_weight, model.motion_predictor.projection.weight)]
+                        main.train(model, epoch, [target_batch(3), target_batch(2)], optimizer, 1)
+                        self.assertFalse(torch.equal(model.detector_weight, before[0]))
+                        self.assertFalse(torch.equal(model.motion_predictor.projection.weight, before[1]))
+                self.assertEqual(step.call_count, 4)
+                self.assertEqual(model.bn.num_batches_tracked.item(), 4)
+                self.assertEqual(frames.requested, inference_frames * 2)
+                self.assertEqual([frame for frame, training, grad in model.calls if training and grad], [3, 2, 3, 2])
+                self.assertIn('cache_hits', output.getvalue())
+
     def test_fresh_past_only_replay_restores_modes_and_does_not_update_bn_or_gradients(self):
         frames, model = TinyFrames(), TinyModel()
         dataset = SimpleNamespace(dicts={'train': {'base': frames}})

@@ -55,11 +55,22 @@ are occupancy detection and motion.
 
 The default `--motion_train_history detection` trains the detector and Mamba
 together. `--batch_size 1` still means one **target multiview frame** per optimizer
-step, and target frames are shuffled. For each target `t`, the **current** detector
-decodes up to `--motion_history_len` preceding frames in chronological order.
-These forwards run one frame at a time in evaluation mode without gradients;
-they do not update BatchNorm statistics or use a previous-epoch cache. No target
-or future detection enters the motion history. Histories stay inside each dataset
+step, and target frames are shuffled. For each target `t`, up to
+`--motion_history_len` preceding frames form the history in chronological order.
+The default `--motion_train_cache epoch` stores each frame's detections on its
+first use and reuses them for the rest of that epoch. Cache misses run the
+**current** detector one frame at a time in evaluation mode without gradients
+or BatchNorm updates. Cache hits skip both image loading and detector inference.
+The cache is recreated at the start of every training epoch and contains only
+CPU arrays of world-grid xy, score, and uncertainty, keyed by dataset root/frame;
+it retains no images, GPU features, computation graphs, or motion predictions.
+
+Cached detections can come from earlier detector weights within the same epoch,
+so this changes the motion training inputs compared with fresh decoding each step.
+Use `--motion_train_cache none` for the original fresh-inference baseline.
+Both modes continue to train the current-frame detector and motion model each
+batch. No target or future detection enters the motion history, even when a
+later frame has already been cached. Histories stay inside each dataset
 root/train split and restart at gaps in the sampled frame sequence.
 
 Past detections are matched one-to-one to GT identities within
@@ -71,6 +82,8 @@ A history starts at a matched detection with confidence at least
 Mamba predictions autoregressively, including predicted covariance and NIW kappa
 when explicit gating is enabled. Histories expire after more than
 `--track_buffer` missed frames (default `5`, also used during tracking).
+GT identity matching and all Mamba predictions are recomputed from each window
+with the current motion model, including on detector-cache hits.
 This is supervised identity association, not training on tracker ID switches or
 unmatched false positives.
 
@@ -83,8 +96,13 @@ history generation; the motion model learns from the resulting input tokens.
 Without any valid motion samples, only detection is updated. Logs report sample
 counts, observed/predicted token counts before padding, mean input uncertainty,
 and mean predictive covariance trace in original world-grid units squared.
+`history_frames` counts frame visits, `history_inferences` counts actual history
+detector forwards, and `cache_hits` reports reused visits and their fraction.
 
-This costs up to `motion_history_len` extra detector inferences per target.
+With epoch caching, each past frame requires at most one history detector
+inference per epoch. A first-use window can still need `motion_history_len`
+inferences; speed improves as cached frames are reused. With caching disabled,
+each target can require `motion_history_len` extra detector inferences.
 Early training can have few motion samples until the detector finds people;
 covariance inputs occur only when a detected history contains a subsequent miss.
 Use `--motion_train_history gt` for the previous GT-only baseline, whose motion

@@ -1,4 +1,4 @@
-"""Fresh, detached detector histories for shuffled joint-training targets."""
+"""Detached detector histories, optionally cached, for joint-training targets."""
 
 from collections import Counter, deque
 from contextlib import contextmanager
@@ -28,7 +28,7 @@ class DetectionHistory:
 
     This is teacher association, not a full tracker simulation: unmatched false
     positives cannot get a supervised identity. Each instance belongs to one
-    target window, so neither state nor detections survive an optimizer update.
+    target window. Motion state is rebuilt even when detector outputs are cached.
     """
 
     def __init__(self, history_len, high_threshold, match_threshold, max_gap,
@@ -127,8 +127,13 @@ class DetectionHistory:
         return conditions, targets, stats
 
 
-def build_detection_motion_batch(model, dataset, item, device, args):
-    """Decode past frames one at a time, before the current training forward."""
+def build_detection_motion_batch(model, dataset, item, device, args, frame_cache=None):
+    """Replay past frames, decoding only cache misses before the training forward.
+
+    The caller owns the cache lifetime; train() creates a new dict each epoch.
+    Entries contain only detached CPU arrays (world-grid xy, score, uncertainty),
+    never images, feature maps, GT assignments, or motion predictions.
+    """
     from utils.utils import decode_frame
 
     conditions, targets, grid_shapes = [], [], []
@@ -146,20 +151,34 @@ def build_detection_motion_batch(model, dataset, item, device, args):
                 # Explicit past-only check also protects future dataset adapters.
                 if frame >= target_frame:
                     raise ValueError("Motion history must be strictly before the target frame")
-                past = sub_dataset.load_history_frame(frame)
-                past['img'] = past['img'].unsqueeze(0)
-                past['proj_mats'] = past['proj_mats'].unsqueeze(0)
-                past['root'] = [root]
-                decoded = decode_frame(model, dataset, past, 0, device, args)
+                cache_key = (root, int(frame))
+                detections = None if frame_cache is None else frame_cache.get(cache_key)
+                if detections is None:
+                    past = sub_dataset.load_history_frame(frame)
+                    past['img'] = past['img'].unsqueeze(0)
+                    past['proj_mats'] = past['proj_mats'].unsqueeze(0)
+                    past['root'] = [root]
+                    decoded = decode_frame(model, dataset, past, 0, device, args)
+                    # Compact owned arrays avoid retaining tensor storage or GPU data.
+                    xy = decoded['xy_all'].detach().cpu().numpy().astype(np.float32, copy=True)
+                    xy *= sub_dataset.grid_reduce
+                    detections = (
+                        xy,
+                        decoded['scores_all'].detach().cpu().numpy().astype(np.float32, copy=True),
+                        decoded['uncertainty_all'].detach().cpu().numpy().astype(np.float32, copy=True),
+                    )
+                    if frame_cache is not None:
+                        frame_cache[cache_key] = detections
+                    stats['history_inferences'] += 1
+                    del decoded, past
+                else:
+                    stats['history_cache_hits'] += 1
                 gt_xy, gt_ids = sub_dataset.world_gt[frame]
                 replay.advance(
-                    decoded['xy_all'].detach().cpu().numpy() * sub_dataset.grid_reduce,
-                    decoded['scores_all'].detach().cpu().numpy(),
-                    decoded['uncertainty_all'].detach().cpu().numpy(),
+                    *detections,
                     gt_xy, gt_ids, model.motion_predictor, sub_dataset.world_grid_shape,
                 )
                 stats['history_frames'] += 1
-                del decoded, past
             gt_xy, gt_ids = sub_dataset.world_gt[target_frame]
             sample_conditions, sample_targets, sample_stats = replay.samples(gt_xy, gt_ids)
             conditions.extend(sample_conditions)
@@ -187,9 +206,15 @@ def build_detection_motion_batch(model, dataset, item, device, args):
 def format_history_stats(stats):
     return (
         'motion_samples {motion_samples}, det_tokens {det_tokens}, motion_tokens {motion_tokens}, '
-        'history_frames {history_frames}, det_u {det_u:.4f}, motion_cov_trace {trace:.4f}'
+        'history_frames {history_frames}, history_inferences {history_inferences}, '
+        'cache_hits {history_cache_hits} ({hit_rate:.1%}), '
+        'det_u {det_u:.4f}, motion_cov_trace {trace:.4f}'
     ).format(
-        **{key: stats[key] for key in ('motion_samples', 'det_tokens', 'motion_tokens', 'history_frames')},
+        **{key: stats[key] for key in (
+            'motion_samples', 'det_tokens', 'motion_tokens', 'history_frames',
+            'history_inferences', 'history_cache_hits',
+        )},
+        hit_rate=stats['history_cache_hits'] / max(stats['history_frames'], 1),
         det_u=stats['det_u_sum'] / max(stats['det_tokens'], 1),
         trace=stats['motion_trace_sum'] / max(stats['motion_tokens'], 1),
     )
