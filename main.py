@@ -21,7 +21,9 @@ from dataloader.concat_dataset import ConcatDataset
 from utils.logger import Logger
 from utils import utils
 from utils.loss import EvidentialOccupancyLoss
-from utils.detection_motion_training import build_detection_motion_batch, format_history_stats
+from utils.detection_motion_training import (
+    build_detection_motion_batch, format_history_stats, precompute_detection_cache,
+)
 from detector.multiview_model import MultiView_Detection
 from detector.encoder import resnet18
 from tracker.mamba_motion_predictor import MambaMotionPredictor
@@ -71,7 +73,22 @@ def train(
     history_totals = Counter()
     detection_history = args.motion_model in ('mamba', 'bimamba') and args.motion_train_history == 'detection'
     # Local to this train() call: never reuse observations from a previous epoch.
-    frame_cache = {} if detection_history and args.motion_train_cache == 'epoch' else None
+    frame_cache = None
+    precompute_inferences = 0
+    if detection_history:
+        if args.motion_train_cache == 'precompute':
+            optimizer.zero_grad(set_to_none=True)
+            cache_tic = time.time()
+            print('Preparing detector cache for epoch {} before joint training...'.format(epoch))
+            frame_cache = precompute_detection_cache(
+                model, train_dataset, device, args, epoch=epoch, progress=True,
+            )
+            precompute_inferences = len(frame_cache)
+            print('Detector cache epoch {}: {} frames, {:.3f} min'.format(
+                epoch, precompute_inferences, (time.time() - cache_tic) / 60,
+            ))
+        elif args.motion_train_cache == 'epoch':
+            frame_cache = {}
 
     for batch_idx, (item, target) in enumerate(data_loader):
         optimizer.zero_grad(set_to_none=True)
@@ -141,6 +158,10 @@ def train(
                     epoch, (batch_idx + 1), len(data_loader), occ_loss.item(), motion_loss.item(), task_weight_text, motion_stats_text + history_text, (time.time()-tic)/60, bev_center.max()))
     if detection_history:
         print('Train history epoch {}: {}'.format(epoch, format_history_stats(history_totals)))
+        print('History detector forwards: precompute {}, during training {}, total {}'.format(
+            precompute_inferences, history_totals['history_inferences'],
+            precompute_inferences + history_totals['history_inferences'],
+        ))
 
     return losses / len(data_loader)
 
@@ -258,7 +279,7 @@ if __name__ == '__main__':
     parser.add_argument('--motion_model', type=str, default='mamba', choices=['kalman', 'mamba', 'bimamba'], help='Motion prediction model; bimamba uses bidirectional history windows')
     parser.add_argument('--motion_history_len', type=int, default=10, help='Number of trajectory tokens used by learned motion models')
     parser.add_argument('--motion_train_history', choices=['detection', 'gt'], default='detection', help='Detector-output histories (default), or legacy GT histories for ablation')
-    parser.add_argument('--motion_train_cache', choices=['epoch', 'none'], default='epoch', help='Reuse past detections within each epoch (default), or decode with current weights every step')
+    parser.add_argument('--motion_train_cache', choices=['precompute', 'epoch', 'none'], default='precompute', help='Precompute all detections before each epoch (default), cache on first use within an epoch, or decode every step')
     parser.add_argument('--motion_train_match_thresh', type=float, default=20., help='Detection-to-GT identity assignment radius in original world-grid units, only for training')
     parser.add_argument('--mamba_history_mode', type=str, default='window', choices=['window', 'stateful'], help='Use a fixed trajectory window or persistent per-track Mamba state')
     parser.add_argument('--mamba_uncertainty_mode', type=str, default='unified', choices=['none', 'unified', 'separate', 'separate_full'], help='Implicit uncertainty input: disabled, unified, uncertainty-only branches, or fully source-specific projections')

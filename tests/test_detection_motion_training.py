@@ -17,7 +17,7 @@ from tracker.mamba_motion_predictor import MambaMotionPredictor
 from tracker.bimamba_motion_predictor import BiMambaMotionPredictor
 from tracker.multitracker import STrack
 from utils.detection_motion_training import (
-    DetectionHistory, build_detection_motion_batch, history_inference,
+    DetectionHistory, build_detection_motion_batch, history_inference, precompute_detection_cache,
 )
 
 
@@ -180,6 +180,56 @@ def target_batch(frame=3):
 
 
 class JointTrainingTests(unittest.TestCase):
+    def test_precompute_uses_fixed_detector_only_and_refreshes_next_epoch(self):
+        frames, model = TinyFrames(), TinyModel()
+        dataset = SimpleNamespace(dicts={'train': {'base': frames}})
+        args = arguments(motion_train_cache='precompute')
+        model.train()
+        model.motion_predictor.eval()
+        before = {key: value.clone() for key, value in model.state_dict().items()}
+        with patch.object(model.motion_predictor, 'generate_distribution',
+                          side_effect=AssertionError('Motion must not run during detector precomputation')):
+            cache = precompute_detection_cache(model, dataset, 'cpu', args, epoch=1)
+        self.assertEqual(frames.requested, list(range(5)))
+        self.assertEqual(model.calls, [(frame, False, False) for frame in range(5)])
+        self.assertTrue(model.training)
+        self.assertFalse(model.motion_predictor.training)
+        for key, value in model.state_dict().items():
+            torch.testing.assert_close(value, before[key])
+        self.assertTrue(all(parameter.grad is None for parameter in model.parameters()))
+        self.assertEqual(set(cache), {('train', frame) for frame in range(5)})
+        for values in cache.values():
+            for array in values:
+                self.assertIsInstance(array, np.ndarray)
+                self.assertTrue(array.flags.owndata)
+
+        old_uncertainty = cache[('train', 0)][2].copy()
+        with torch.no_grad():
+            model.detector_weight.add_(1.)
+        result, stats = build_detection_motion_batch(model, dataset, target_batch()[0], 'cpu', args, cache)
+        # Current and future frames are cached too, but only t-3..t-1 enter the input.
+        self.assertEqual(len(model.calls), 5)
+        self.assertEqual((stats['history_inferences'], stats['history_cache_hits']), (0, 3))
+        torch.testing.assert_close(result['motion_condition'][0, -1, :2], torch.tensor([16., 20.]))
+        torch.testing.assert_close(result['motion_target'], torch.zeros(1, 2))
+        self.assertEqual(len(model.motion_predictor.rollouts), 2)
+        refreshed = precompute_detection_cache(model, dataset, 'cpu', args, epoch=2)
+        self.assertIsNot(refreshed, cache)
+        self.assertFalse(np.array_equal(old_uncertainty, refreshed[('train', 0)][2]))
+        np.testing.assert_array_equal(old_uncertainty, cache[('train', 0)][2])
+        self.assertEqual(frames.requested, list(range(5)) * 2)
+
+    def test_missing_precomputed_frame_fails_without_mixing_in_new_detector_weights(self):
+        frames, model = TinyFrames(), TinyModel()
+        dataset = SimpleNamespace(dicts={'train': {'base': frames}})
+        args = arguments(motion_train_cache='precompute')
+        cache = precompute_detection_cache(model, dataset, 'cpu', args)
+        del cache[('train', 1)]
+        with patch.object(frames, 'load_history_frame', side_effect=AssertionError('Unexpected inference')), \
+             self.assertRaisesRegex(KeyError, 'Missing precomputed detection'):
+            build_detection_motion_batch(model, dataset, target_batch()[0], 'cpu', args, cache)
+        self.assertTrue(model.training)
+
     def test_cache_reuses_cpu_observations_but_recomputes_motion_with_current_model(self):
         frames, model, cache = TinyFrames(), TinyModel(), {}
         dataset = SimpleNamespace(dicts={'train': {'base': frames}})
@@ -248,7 +298,9 @@ class JointTrainingTests(unittest.TestCase):
         torch.testing.assert_close(result['motion_condition'][0, 0, :2], torch.tensor([18., 30.]))
 
     def test_train_resets_cache_each_epoch_and_keeps_one_joint_update_per_batch(self):
-        for mode, inference_frames in (('epoch', [0, 1, 2]), ('none', [0, 1, 2, 0, 1])):
+        for mode, inference_frames in (
+            ('precompute', [0, 1, 2, 3, 4]), ('epoch', [0, 1, 2]), ('none', [0, 1, 2, 0, 1]),
+        ):
             with self.subTest(cache=mode):
                 model, frames = TinyModel(), TinyFrames()
                 dataset = SimpleNamespace(dicts={'train': {'base': frames}})
@@ -269,6 +321,10 @@ class JointTrainingTests(unittest.TestCase):
                 self.assertEqual(frames.requested, inference_frames * 2)
                 self.assertEqual([frame for frame, training, grad in model.calls if training and grad], [3, 2, 3, 2])
                 self.assertIn('cache_hits', output.getvalue())
+                if mode == 'precompute':
+                    expected_epoch = [(frame, False, False) for frame in range(5)] + [(3, True, True), (2, True, True)]
+                    self.assertEqual(model.calls, expected_epoch * 2)
+                    self.assertIn('precompute 5, during training 0, total 5', output.getvalue())
 
     def test_fresh_past_only_replay_restores_modes_and_does_not_update_bn_or_gradients(self):
         frames, model = TinyFrames(), TinyModel()
@@ -373,6 +429,7 @@ class JointTrainingTests(unittest.TestCase):
         self.assertFalse(dataset.call_args.kwargs['build_motion_samples'])
         self.assertTrue(dataset.call_args.kwargs['data_aug'])
         self.assertEqual(dataset.call_args.kwargs['motion_history_len'], 10)
+        self.assertIn('Detector history cache: precompute', output.getvalue())
 
 
 if __name__ == '__main__':

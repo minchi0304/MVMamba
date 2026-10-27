@@ -5,6 +5,7 @@ from contextlib import contextmanager
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from tracker import matching
 from tracker.motion_history import detection_token, motion_token
@@ -127,6 +128,47 @@ class DetectionHistory:
         return conditions, targets, stats
 
 
+def _decode_history_frame(model, dataset, root, frame, device, args):
+    """Return owned CPU detection arrays; caller supplies eval/no_grad context."""
+    from utils.utils import decode_frame
+
+    sub_dataset = dataset.dicts[root]['base']
+    past = sub_dataset.load_history_frame(frame)
+    past['img'] = past['img'].unsqueeze(0)
+    past['proj_mats'] = past['proj_mats'].unsqueeze(0)
+    past['root'] = [root]
+    decoded = decode_frame(model, dataset, past, 0, device, args)
+    xy = decoded['xy_all'].detach().cpu().numpy().astype(np.float32, copy=True)
+    xy *= sub_dataset.grid_reduce
+    return (
+        xy,
+        decoded['scores_all'].detach().cpu().numpy().astype(np.float32, copy=True),
+        decoded['uncertainty_all'].detach().cpu().numpy().astype(np.float32, copy=True),
+    )
+
+
+def precompute_detection_cache(model, dataset, device, args, epoch=0, progress=False):
+    """Decode this training dataset once with fixed epoch-start detector weights.
+
+    All frames are loaded one at a time without augmentation. No optimizer or
+    motion predictor runs here; cached arrays contain no graphs or GPU storage.
+    Returning a new dict keeps the cache local to the current epoch.
+    """
+    frame_cache = {}
+    total = sum(len(config['base'].world_gt) for config in dataset.dicts.values())
+    with history_inference(model), tqdm(
+        total=total, desc='Detector cache epoch {}'.format(epoch),
+        unit='frame', leave=False, disable=not progress,
+    ) as bar:
+        for root, config in dataset.dicts.items():
+            for frame in sorted(config['base'].world_gt):
+                frame_cache[(root, int(frame))] = _decode_history_frame(
+                    model, dataset, root, frame, device, args,
+                )
+                bar.update(1)
+    return frame_cache
+
+
 def build_detection_motion_batch(model, dataset, item, device, args, frame_cache=None):
     """Replay past frames, decoding only cache misses before the training forward.
 
@@ -134,8 +176,6 @@ def build_detection_motion_batch(model, dataset, item, device, args, frame_cache
     Entries contain only detached CPU arrays (world-grid xy, score, uncertainty),
     never images, feature maps, GT assignments, or motion predictions.
     """
-    from utils.utils import decode_frame
-
     conditions, targets, grid_shapes = [], [], []
     stats = Counter()
     with history_inference(model):
@@ -154,23 +194,14 @@ def build_detection_motion_batch(model, dataset, item, device, args, frame_cache
                 cache_key = (root, int(frame))
                 detections = None if frame_cache is None else frame_cache.get(cache_key)
                 if detections is None:
-                    past = sub_dataset.load_history_frame(frame)
-                    past['img'] = past['img'].unsqueeze(0)
-                    past['proj_mats'] = past['proj_mats'].unsqueeze(0)
-                    past['root'] = [root]
-                    decoded = decode_frame(model, dataset, past, 0, device, args)
-                    # Compact owned arrays avoid retaining tensor storage or GPU data.
-                    xy = decoded['xy_all'].detach().cpu().numpy().astype(np.float32, copy=True)
-                    xy *= sub_dataset.grid_reduce
-                    detections = (
-                        xy,
-                        decoded['scores_all'].detach().cpu().numpy().astype(np.float32, copy=True),
-                        decoded['uncertainty_all'].detach().cpu().numpy().astype(np.float32, copy=True),
+                    if getattr(args, 'motion_train_cache', 'none') == 'precompute':
+                        raise KeyError('Missing precomputed detection for root {!r}, frame {}'.format(root, frame))
+                    detections = _decode_history_frame(
+                        model, dataset, root, frame, device, args,
                     )
                     if frame_cache is not None:
                         frame_cache[cache_key] = detections
                     stats['history_inferences'] += 1
-                    del decoded, past
                 else:
                     stats['history_cache_hits'] += 1
                 gt_xy, gt_ids = sub_dataset.world_gt[frame]

@@ -57,18 +57,24 @@ The default `--motion_train_history detection` trains the detector and Mamba
 together. `--batch_size 1` still means one **target multiview frame** per optimizer
 step, and target frames are shuffled. For each target `t`, up to
 `--motion_history_len` preceding frames form the history in chronological order.
-The default `--motion_train_cache epoch` stores each frame's detections on its
-first use and reuses them for the rest of that epoch. Cache misses run the
-**current** detector one frame at a time in evaluation mode without gradients
-or BatchNorm updates. Cache hits skip both image loading and detector inference.
+The default `--motion_train_cache precompute` first decodes every frame in the
+training dataset using the **epoch-start detector weights**, before the first
+training batch. This is a sequential inference pass, one frame at a time in
+evaluation mode without gradients, BatchNorm updates, or optimizer steps.
+All histories in that epoch therefore use detections from the same detector
+snapshot. During training, cache hits skip image loading and detector inference
+for past frames; the current target still has its normal training forward.
 The cache is recreated at the start of every training epoch and contains only
 CPU arrays of world-grid xy, score, and uncertainty, keyed by dataset root/frame;
 it retains no images, GPU features, computation graphs, or motion predictions.
 
-Cached detections can come from earlier detector weights within the same epoch,
-so this changes the motion training inputs compared with fresh decoding each step.
-Use `--motion_train_cache none` for the original fresh-inference baseline.
-Both modes continue to train the current-frame detector and motion model each
+Use `--motion_train_cache epoch` for the previous on-demand cache: each frame is
+decoded on first use with that step's detector, then reused within the epoch.
+Use `--motion_train_cache none` to decode with current weights every step.
+With precomputation, detector improvements during an epoch reach motion histories
+at the next epoch's refresh. This changes training inputs compared with fresh
+decoding; the three modes can have different final tracking accuracy.
+All modes continue to train the current-frame detector and motion model each
 batch. No target or future detection enters the motion history, even when a
 later frame has already been cached. Histories stay inside each dataset
 root/train split and restart at gaps in the sampled frame sequence.
@@ -96,13 +102,18 @@ history generation; the motion model learns from the resulting input tokens.
 Without any valid motion samples, only detection is updated. Logs report sample
 counts, observed/predicted token counts before padding, mean input uncertainty,
 and mean predictive covariance trace in original world-grid units squared.
-`history_frames` counts frame visits, `history_inferences` counts actual history
-detector forwards, and `cache_hits` reports reused visits and their fraction.
+`history_frames` counts frame visits, `history_inferences` counts history detector
+forwards during training, and `cache_hits` reports reused visits and their fraction.
+Precomputation has a progress bar and logs its frame count and elapsed time.
+The epoch summary reports precompute forwards, in-training history forwards,
+and their total separately; a fully precomputed epoch has zero in-training
+history forwards. Total epoch time includes precomputation.
 
-With epoch caching, each past frame requires at most one history detector
-inference per epoch. A first-use window can still need `motion_history_len`
-inferences; speed improves as cached frames are reused. With caching disabled,
-each target can require `motion_history_len` extra detector inferences.
+Precomputation adds one detector inference per training frame per epoch. Its
+total detector work is similar to on-demand epoch caching; the distinction is
+when results are generated and which weights produce them. On-demand caching
+can need `motion_history_len` inferences for a first-use window. With caching
+disabled, each target can require that many extra detector inferences.
 Early training can have few motion samples until the detector finds people;
 covariance inputs occur only when a detected history contains a subsequent miss.
 Use `--motion_train_history gt` for the previous GT-only baseline, whose motion
