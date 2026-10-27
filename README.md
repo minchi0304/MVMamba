@@ -12,6 +12,93 @@ To install the remaining dependencies:
 pip install -r requirements.txt --no-build-isolation
 ```
 
+### RTX 5090 Docker environment
+
+Use `Dockerfile.rtx5090` for an RTX 5090. It provides Python 3.10, CUDA 12.8.1,
+PyTorch 2.7.1, torchvision 0.22.1, Mamba-SSM 2.3.0, and causal-conv1d 1.6.0.
+The original `Dockerfile` and `requirements.txt` describe the older environment;
+the new image uses `requirements.rtx5090.txt` instead.
+
+The RTX 5090 has compute capability `12.0` (`sm_120`), and PyTorch's Blackwell
+support starts with the CUDA 12.8 builds in PyTorch 2.7.
+See [NVIDIA's GPU list](https://developer.nvidia.com/cuda/gpus) and the
+[PyTorch 2.7 release notes](https://pytorch.org/blog/pytorch-2-7/).
+Both CUDA extensions are built from source against the installed PyTorch.
+The selected [Mamba build](https://github.com/state-spaces/mamba/blob/v2.3.0/setup.py)
+and [causal-conv1d build](https://github.com/Dao-AILab/causal-conv1d/blob/v1.6.0/setup.py)
+explicitly include `sm_120`; setting `TORCH_CUDA_ARCH_LIST` alone is insufficient
+for older releases that hard-code their compiler targets. The application still
+uses the Mamba-1 `Mamba` class, including its existing uncertainty gates.
+
+On the host, install an up-to-date NVIDIA driver that supports the RTX 5090 and
+CUDA 12.8.1. NVIDIA lists Linux 570.124.06 / Windows 572.61 as the corresponding
+toolkit driver versions; use those or newer drivers
+([CUDA release notes](https://docs.nvidia.com/cuda/archive/12.8.1/cuda-toolkit-release-notes/index.html)).
+Linux hosts also need the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+On Windows, use Docker Desktop's WSL 2 backend with Linux containers
+([Docker GPU setup](https://docs.docker.com/desktop/features/gpu/)).
+The CUDA toolkit itself is included in the image.
+
+Build from the repository root (the same command works in Bash and PowerShell):
+
+```bash
+docker build -f Dockerfile.rtx5090 -t mvmamba:rtx5090 .
+```
+
+The first build compiles both CUDA extensions and can take a while. It does not
+need GPU access. Compilation defaults to two concurrent jobs; if the compiler
+is killed for lack of host RAM, build with `--build-arg MAX_JOBS=1`.
+The build checks package dependencies, native extension imports, and
+`python main.py --help`.
+
+On the RTX 5090 host, verify GPU access and run an actual Mamba forward/backward
+pass before training (these commands also work in Bash and PowerShell):
+
+```bash
+docker run --rm --gpus all mvmamba:rtx5090 nvidia-smi
+docker run --rm --gpus all mvmamba:rtx5090 python -c "import torch; from mamba_ssm import Mamba; assert torch.cuda.is_available(), 'CUDA is unavailable'; print(torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0), torch.__version__, torch.version.cuda); x = torch.randn(2, 16, 32, device='cuda', requires_grad=True); m = Mamba(d_model=32, d_state=16, d_conv=4, expand=2).cuda(); y = m(x); y.square().mean().backward(); torch.cuda.synchronize(); assert torch.isfinite(y).all() and torch.isfinite(x.grad).all(); print('Mamba CUDA forward/backward OK')"
+docker run --rm --gpus all mvmamba:rtx5090 python -m unittest discover -s tests -p '*mamba*.py' -v
+```
+
+The existing Mamba tests also exercise BiMamba, explicit uncertainty gates, and
+stateful inference. Their GPU cases skip when CUDA is unavailable, so run the
+forward/backward check first. A successful image build alone does not validate
+GPU execution.
+
+For training on Linux / WSL, replace `/absolute/path/to/datasets` with the host
+directory containing `Wildtrack/`, `MultiviewX/`, etc.:
+
+```bash
+docker run --rm -it --gpus all --shm-size=8g \
+  -v "$PWD:/workspace" \
+  -v "/absolute/path/to/datasets:/dataset" \
+  mvmamba:rtx5090 \
+  python main.py --dataset wildtrack --data_root /dataset --pretrained \
+  --motion_model mamba --motion_loss niw --evidential_head separate \
+  --mamba_uncertainty_mode unified \
+  --track_match_thresh 50 --track_low_match_thresh 80
+```
+
+PowerShell equivalent, with an example dataset root of `E:\datasets`:
+
+```powershell
+docker run --rm -it --gpus all --shm-size=8g `
+  -v "${PWD}:/workspace" `
+  -v "E:\datasets:/dataset" `
+  mvmamba:rtx5090 `
+  python main.py --dataset wildtrack --data_root /dataset --pretrained `
+  --motion_model mamba --motion_loss niw --evidential_head separate `
+  --mamba_uncertainty_mode unified `
+  --track_match_thresh 50 --track_low_match_thresh 80
+```
+
+The repository mount keeps checkpoints and logs in the host's `logs/` directory
+and exposes local GMVD CSV files. Dataset mounts are writable because loaders
+can generate GT files. The detector downloads ImageNet weights on first use,
+so allow network access for the first training run. To open a shell, omit
+`python main.py` and its arguments from the run command.
+
 ## Dataset preparation
 
 Place the datasets under a common root directory:
