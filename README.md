@@ -49,8 +49,15 @@ docker build -f Dockerfile.rtx5090 -t mvmamba:rtx5090 .
 The first build compiles both CUDA extensions and can take a while. It does not
 need GPU access. Compilation defaults to two concurrent jobs; if the compiler
 is killed for lack of host RAM, build with `--build-arg MAX_JOBS=1`.
-The build checks package dependencies, native extension imports, and
-`python main.py --help`.
+The build checks package dependencies, direct native extension imports, and
+Python source syntax without running the application.
+
+With this Mamba/Triton combination, importing `mamba_ssm` initializes Triton's
+autotuner and requires an active GPU driver. Ordinary Docker builds have no GPU
+access, so the build reads Mamba's version from package metadata. Both
+`python main.py --help` and Mamba execution are checked after building, using
+`docker run --gpus all`. See the
+[Triton autotuner initialization](https://github.com/triton-lang/triton/blob/v3.3.1/python/triton/runtime/autotuner.py).
 
 Ninja is pinned to `1.11.1.4`: `1.11.1.1` has malformed wheel metadata that
 causes `pip check` to report "is not supported on this platform" with pip 24.2+.
@@ -62,14 +69,15 @@ pass before training (these commands also work in Bash and PowerShell):
 
 ```bash
 docker run --rm --gpus all mvmamba:rtx5090 nvidia-smi
-docker run --rm --gpus all mvmamba:rtx5090 python -c "import torch; from mamba_ssm import Mamba; assert torch.cuda.is_available(), 'CUDA is unavailable'; print(torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0), torch.__version__, torch.version.cuda); x = torch.randn(2, 16, 32, device='cuda', requires_grad=True); m = Mamba(d_model=32, d_state=16, d_conv=4, expand=2).cuda(); y = m(x); y.square().mean().backward(); torch.cuda.synchronize(); assert torch.isfinite(y).all() and torch.isfinite(x.grad).all(); print('Mamba CUDA forward/backward OK')"
+docker run --rm --gpus all mvmamba:rtx5090 python -c "import torch; assert torch.cuda.is_available(), 'CUDA is unavailable'; from mamba_ssm import Mamba; print(torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0), torch.__version__, torch.version.cuda); x = torch.randn(2, 16, 32, device='cuda', requires_grad=True); m = Mamba(d_model=32, d_state=16, d_conv=4, expand=2).cuda(); y = m(x); y.square().mean().backward(); torch.cuda.synchronize(); assert torch.isfinite(y).all() and torch.isfinite(x.grad).all(); print('Mamba CUDA forward/backward OK')"
+docker run --rm --gpus all mvmamba:rtx5090 python main.py --help
 docker run --rm --gpus all mvmamba:rtx5090 python -m unittest discover -s tests -p '*mamba*.py' -v
 ```
 
 The existing Mamba tests also exercise BiMamba, explicit uncertainty gates, and
-stateful inference. Their GPU cases skip when CUDA is unavailable, so run the
-forward/backward check first. A successful image build alone does not validate
-GPU execution.
+stateful inference. Run the forward/backward check first: even importing these
+tests requires GPU access with this environment. A successful image build alone
+does not validate GPU execution.
 
 For training on Linux / WSL, replace `/absolute/path/to/datasets` with the host
 directory containing `Wildtrack/`, `MultiviewX/`, etc.:

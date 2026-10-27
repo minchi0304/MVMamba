@@ -45,12 +45,15 @@ RUN MAMBA_FORCE_BUILD=TRUE CAUSAL_CONV1D_FORCE_BUILD=TRUE \
     python -m pip install --no-build-isolation \
     --no-binary=mamba-ssm,causal-conv1d -r requirements.rtx5090.txt
 
-# Docker builds do not need GPU access. Check dependencies and native imports;
-# run the GPU forward/backward check in README.md on the target machine.
+# Ordinary Docker builds have no GPU driver. Import native extensions directly
+# to check their linkage, but read Mamba's version from package metadata:
+# importing mamba_ssm initializes Triton's autotuner and requires an active GPU.
+# Run the application import and GPU checks from README.md with --gpus all.
 RUN python -m pip check \
-    && python -c "import cv2, einops, kornia, mamba_ssm, matplotlib, motmetrics, networkx, numpy, PIL, scipy, torch, torchvision, causal_conv1d_cuda, selective_scan_cuda; assert torch.version.cuda == '12.8'; print('PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda, 'Mamba:', mamba_ssm.__version__)"
+    && python -c "from importlib.metadata import version; import cv2, einops, kornia, matplotlib, motmetrics, networkx, numpy, PIL, scipy, torch, torchvision, causal_conv1d_cuda, selective_scan_cuda; assert torch.version.cuda == '12.8'; print('PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda, 'Mamba:', version('mamba-ssm'))"
 
 COPY . .
-RUN python main.py --help > /dev/null
+# Compile source without executing imports; main.py --help also imports Mamba.
+RUN python -m compileall -q main.py dataloader detector evaluation tracker utils
 
 CMD ["/bin/bash"]
