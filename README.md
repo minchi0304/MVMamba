@@ -52,6 +52,11 @@ is killed for lack of host RAM, build with `--build-arg MAX_JOBS=1`.
 The build checks package dependencies, native extension imports, and
 `python main.py --help`.
 
+Ninja is pinned to `1.11.1.4`: `1.11.1.1` has malformed wheel metadata that
+causes `pip check` to report "is not supported on this platform" with pip 24.2+.
+See the [upstream Ninja issue](https://github.com/scikit-build/ninja-python-distributions/issues/256).
+Build tools are checked before compiling the CUDA extensions.
+
 On the RTX 5090 host, verify GPU access and run an actual Mamba forward/backward
 pass before training (these commands also work in Bash and PowerShell):
 
