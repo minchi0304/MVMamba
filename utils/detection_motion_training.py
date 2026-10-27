@@ -169,8 +169,8 @@ def precompute_detection_cache(model, dataset, device, args, epoch=0, progress=F
     return frame_cache
 
 
-def build_detection_motion_batch(model, dataset, item, device, args, frame_cache=None):
-    """Replay past frames, decoding only cache misses before the training forward.
+def build_detection_motion_batch(model, dataset, item, device, args, frame_cache):
+    """Replay past frames using detections precomputed at the start of this epoch.
 
     The caller owns the cache lifetime; train() creates a new dict each epoch.
     Entries contain only detached CPU arrays (world-grid xy, score, uncertainty),
@@ -192,18 +192,10 @@ def build_detection_motion_batch(model, dataset, item, device, args, frame_cache
                 if frame >= target_frame:
                     raise ValueError("Motion history must be strictly before the target frame")
                 cache_key = (root, int(frame))
-                detections = None if frame_cache is None else frame_cache.get(cache_key)
+                detections = frame_cache.get(cache_key)
                 if detections is None:
-                    if getattr(args, 'motion_train_cache', 'none') == 'precompute':
-                        raise KeyError('Missing precomputed detection for root {!r}, frame {}'.format(root, frame))
-                    detections = _decode_history_frame(
-                        model, dataset, root, frame, device, args,
-                    )
-                    if frame_cache is not None:
-                        frame_cache[cache_key] = detections
-                    stats['history_inferences'] += 1
-                else:
-                    stats['history_cache_hits'] += 1
+                    raise KeyError('Missing precomputed detection for root {!r}, frame {}'.format(root, frame))
+                stats['history_cache_hits'] += 1
                 gt_xy, gt_ids = sub_dataset.world_gt[frame]
                 replay.advance(
                     *detections,

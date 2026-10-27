@@ -23,7 +23,7 @@ from utils.detection_motion_training import (
 
 def arguments(**overrides):
     values = dict(
-        motion_model='mamba', motion_train_history='detection', motion_train_cache='epoch', motion_history_len=3,
+        motion_model='mamba', motion_train_history='detection', motion_history_len=3,
         high_cls_thres=.4, motion_train_match_thresh=5., track_buffer=2,
         mamba_uncertainty_mode='unified', mamba_uncertainty_gate='none',
         dataset='multiviewx', multi_task_loss='plain',
@@ -183,7 +183,7 @@ class JointTrainingTests(unittest.TestCase):
     def test_precompute_uses_fixed_detector_only_and_refreshes_next_epoch(self):
         frames, model = TinyFrames(), TinyModel()
         dataset = SimpleNamespace(dicts={'train': {'base': frames}})
-        args = arguments(motion_train_cache='precompute')
+        args = arguments()
         model.train()
         model.motion_predictor.eval()
         before = {key: value.clone() for key, value in model.state_dict().items()}
@@ -222,7 +222,7 @@ class JointTrainingTests(unittest.TestCase):
     def test_missing_precomputed_frame_fails_without_mixing_in_new_detector_weights(self):
         frames, model = TinyFrames(), TinyModel()
         dataset = SimpleNamespace(dicts={'train': {'base': frames}})
-        args = arguments(motion_train_cache='precompute')
+        args = arguments()
         cache = precompute_detection_cache(model, dataset, 'cpu', args)
         del cache[('train', 1)]
         with patch.object(frames, 'load_history_frame', side_effect=AssertionError('Unexpected inference')), \
@@ -231,11 +231,12 @@ class JointTrainingTests(unittest.TestCase):
         self.assertTrue(model.training)
 
     def test_cache_reuses_cpu_observations_but_recomputes_motion_with_current_model(self):
-        frames, model, cache = TinyFrames(), TinyModel(), {}
+        frames, model = TinyFrames(), TinyModel()
         dataset = SimpleNamespace(dicts={'train': {'base': frames}})
         args = arguments(mamba_uncertainty_gate='b')
+        cache = precompute_detection_cache(model, dataset, 'cpu', args)
         first, stats = build_detection_motion_batch(model, dataset, target_batch()[0], 'cpu', args, cache)
-        self.assertEqual((stats['history_inferences'], stats['history_cache_hits']), (3, 0))
+        self.assertEqual((stats['history_inferences'], stats['history_cache_hits']), (0, 3))
         for values in cache.values():
             self.assertEqual(len(values), 3)
             for array in values:
@@ -253,87 +254,84 @@ class JointTrainingTests(unittest.TestCase):
         with patch.object(model.motion_predictor, 'generate_distribution', side_effect=updated_motion) as rollout:
             second, stats = build_detection_motion_batch(model, dataset, target_batch()[0], 'cpu', args, cache)
         self.assertEqual((stats['history_inferences'], stats['history_cache_hits']), (0, 3))
-        self.assertEqual(frames.requested, [0, 1, 2])
-        self.assertEqual(len(model.calls), 3)
+        self.assertEqual(frames.requested, list(range(5)))
+        self.assertEqual(len(model.calls), 5)
         self.assertEqual(rollout.call_count, 2)
         torch.testing.assert_close(first['motion_condition'][0, 0], second['motion_condition'][0, 0])
         torch.testing.assert_close(second['motion_condition'][0, -1, :2], torch.tensor([20., 20.]))
         torch.testing.assert_close(second['motion_condition'][0, -1, 5:8], torch.tensor([12., 27., 1.5]))
         self.assertEqual(second['motion_condition'][0, -1, 10].item(), 4.)
 
-    def test_shuffled_overlapping_windows_match_fresh_outputs_and_decode_each_frame_once(self):
-        fresh_frames, cached_frames = (TinyFrames(history_len=10, num_frames=25) for _ in range(2))
-        fresh_model, cached_model = TinyModel(), TinyModel()
-        fresh_dataset = SimpleNamespace(dicts={'train': {'base': fresh_frames}})
-        cached_dataset = SimpleNamespace(dicts={'train': {'base': cached_frames}})
-        cache, inference_count, cache_hits = {}, 0, 0
+    def test_shuffled_overlapping_windows_use_only_past_precomputed_frames(self):
+        frames, model = TinyFrames(history_len=10, num_frames=25), TinyModel()
+        dataset = SimpleNamespace(dicts={'train': {'base': frames}})
         args = arguments(motion_history_len=10)
+        cache = precompute_detection_cache(model, dataset, 'cpu', args)
+        inference_count, cache_hits = 0, 0
         # Reverse order also checks that cached later frames never leak into a target's history.
         for frame in reversed(range(25)):
             item, _ = target_batch(frame)
-            expected, _ = build_detection_motion_batch(fresh_model, fresh_dataset, item, 'cpu', args)
-            actual, stats = build_detection_motion_batch(cached_model, cached_dataset, item, 'cpu', args, cache)
-            for name in expected:
-                torch.testing.assert_close(actual[name], expected[name])
+            actual, stats = build_detection_motion_batch(model, dataset, item, 'cpu', args, cache)
+            # Only frame 0 has a detection, retained for at most two missed frames.
+            sample_count = int(1 <= frame <= 3)
+            self.assertEqual(actual['motion_condition'].shape, (sample_count, 10, 10))
+            if sample_count:
+                torch.testing.assert_close(actual['motion_condition'][0, -1, :2],
+                                           torch.tensor([10. + 2 * frame, 20.]))
+                torch.testing.assert_close(actual['motion_target'], torch.zeros(1, 2))
             inference_count += stats['history_inferences']
             cache_hits += stats['history_cache_hits']
-        self.assertEqual(len(fresh_model.calls), 195)
-        self.assertEqual(len(cached_model.calls), 24)
-        self.assertEqual((inference_count, cache_hits), (24, 171))
-        self.assertEqual(sorted(cached_frames.requested), list(range(24)))
-        self.assertEqual(len(cache), 24)
+        self.assertEqual(len(model.calls), 25)
+        self.assertEqual((inference_count, cache_hits), (0, 195))
+        self.assertEqual(frames.requested, list(range(25)))
+        self.assertEqual(len(cache), 25)
 
     def test_cache_separates_roots_with_same_frame_ids_and_keeps_world_coordinates(self):
-        model, cache = TinyModel(), {}
+        model = TinyModel()
         frames, other = TinyFrames(), TinyFrames()
         other.grid_reduce = 3
         other.world_gt = {frame: (xy * 1.5, ids) for frame, (xy, ids) in other.world_gt.items()}
         dataset = SimpleNamespace(dicts={'train': {'base': frames}, 'other': {'base': other}})
+        cache = precompute_detection_cache(model, dataset, 'cpu', arguments())
         item, _ = target_batch()
         build_detection_motion_batch(model, dataset, item, 'cpu', arguments(), cache)
         item['root'] = ['other']
         result, stats = build_detection_motion_batch(model, dataset, item, 'cpu', arguments(), cache)
-        self.assertEqual((len(cache), stats['history_inferences']), (6, 3))
-        self.assertEqual(other.requested, [0, 1, 2])
+        self.assertEqual((len(cache), stats['history_inferences']), (10, 0))
+        self.assertEqual(other.requested, list(range(5)))
         torch.testing.assert_close(result['motion_condition'][0, 0, :2], torch.tensor([18., 30.]))
 
     def test_train_resets_cache_each_epoch_and_keeps_one_joint_update_per_batch(self):
-        for mode, inference_frames in (
-            ('precompute', [0, 1, 2, 3, 4]), ('epoch', [0, 1, 2]), ('none', [0, 1, 2, 0, 1]),
-        ):
-            with self.subTest(cache=mode):
-                model, frames = TinyModel(), TinyFrames()
-                dataset = SimpleNamespace(dicts={'train': {'base': frames}})
-                optimizer = torch.optim.SGD(model.parameters(), lr=.0001)
-                args = arguments(motion_train_cache=mode)
-                with patch.multiple(main, args=args, device=torch.device('cpu'), train_dataset=dataset,
-                                    criterion=lambda raw, valid, target: raw.square().mean(), create=True), \
-                     patch.object(optimizer, 'step', wraps=optimizer.step) as step, \
-                     contextlib.redirect_stdout(io.StringIO()) as output:
-                    for epoch in (1, 2):
-                        before = [parameter.detach().clone() for parameter in
-                                  (model.detector_weight, model.motion_predictor.projection.weight)]
-                        main.train(model, epoch, [target_batch(3), target_batch(2)], optimizer, 1)
-                        self.assertFalse(torch.equal(model.detector_weight, before[0]))
-                        self.assertFalse(torch.equal(model.motion_predictor.projection.weight, before[1]))
-                self.assertEqual(step.call_count, 4)
-                self.assertEqual(model.bn.num_batches_tracked.item(), 4)
-                self.assertEqual(frames.requested, inference_frames * 2)
-                self.assertEqual([frame for frame, training, grad in model.calls if training and grad], [3, 2, 3, 2])
-                self.assertIn('cache_hits', output.getvalue())
-                if mode == 'precompute':
-                    expected_epoch = [(frame, False, False) for frame in range(5)] + [(3, True, True), (2, True, True)]
-                    self.assertEqual(model.calls, expected_epoch * 2)
-                    self.assertIn('precompute 5, during training 0, total 5', output.getvalue())
+        model, frames = TinyModel(), TinyFrames()
+        dataset = SimpleNamespace(dicts={'train': {'base': frames}})
+        optimizer = torch.optim.SGD(model.parameters(), lr=.0001)
+        with patch.multiple(main, args=arguments(), device=torch.device('cpu'), train_dataset=dataset,
+                            criterion=lambda raw, valid, target: raw.square().mean(), create=True), \
+             patch.object(optimizer, 'step', wraps=optimizer.step) as step, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            for epoch in (1, 2):
+                before = [parameter.detach().clone() for parameter in
+                          (model.detector_weight, model.motion_predictor.projection.weight)]
+                main.train(model, epoch, [target_batch(3), target_batch(2)], optimizer, 1)
+                self.assertFalse(torch.equal(model.detector_weight, before[0]))
+                self.assertFalse(torch.equal(model.motion_predictor.projection.weight, before[1]))
+        self.assertEqual(step.call_count, 4)
+        self.assertEqual(model.bn.num_batches_tracked.item(), 4)
+        self.assertEqual(frames.requested, list(range(5)) * 2)
+        expected_epoch = [(frame, False, False) for frame in range(5)] + [(3, True, True), (2, True, True)]
+        self.assertEqual(model.calls, expected_epoch * 2)
+        self.assertIn('cache_hits', output.getvalue())
+        self.assertIn('precompute 5, during training 0, total 5', output.getvalue())
 
-    def test_fresh_past_only_replay_restores_modes_and_does_not_update_bn_or_gradients(self):
+    def test_precomputed_replay_restores_modes_and_does_not_update_bn_or_gradients(self):
         frames, model = TinyFrames(), TinyModel()
         dataset = SimpleNamespace(dicts={'train': {'base': frames}})
         model.train()
         model.motion_predictor.eval()  # mixed modes must be restored exactly
         item, _ = target_batch()
-        batch, stats = build_detection_motion_batch(model, dataset, item, 'cpu', arguments())
-        self.assertEqual(model.calls, [(0, False, False), (1, False, False), (2, False, False)])
+        cache = precompute_detection_cache(model, dataset, 'cpu', arguments())
+        batch, stats = build_detection_motion_batch(model, dataset, item, 'cpu', arguments(), cache)
+        self.assertEqual(model.calls, [(frame, False, False) for frame in range(5)])
         self.assertEqual(model.bn.num_batches_tracked.item(), 0)
         self.assertTrue(model.training)
         self.assertFalse(model.motion_predictor.training)
@@ -345,9 +343,9 @@ class JointTrainingTests(unittest.TestCase):
         before = batch['motion_condition'][0, 0, 4].item()
         with torch.no_grad():
             model.detector_weight.add_(1.)
-        batch, _ = build_detection_motion_batch(model, dataset, item, 'cpu', arguments())
-        self.assertNotEqual(before, batch['motion_condition'][0, 0, 4].item())
-        self.assertEqual(frames.requested, [0, 1, 2, 0, 1, 2])
+        batch, _ = build_detection_motion_batch(model, dataset, item, 'cpu', arguments(), cache)
+        self.assertEqual(before, batch['motion_condition'][0, 0, 4].item())
+        self.assertEqual(frames.requested, list(range(5)))
 
     def test_each_step_updates_both_tasks_once_and_empty_history_updates_only_detection(self):
         for model_name in ('mamba', 'bimamba'):
@@ -386,10 +384,11 @@ class JointTrainingTests(unittest.TestCase):
                     dataset = SimpleNamespace(dicts={'train': {'base': frames}})
                     args = arguments(mamba_uncertainty_mode=mode)
                     optimizer = torch.optim.SGD(predictor.parameters(), lr=.01)
+                    cache = precompute_detection_cache(model, dataset, 'cpu', args)
                     # Output heads start at zero, so the first update learns the
                     # heads; the second must reach the covariance input columns.
                     for _ in range(2):
-                        batch, _ = build_detection_motion_batch(model, dataset, target_batch()[0], 'cpu', args)
+                        batch, _ = build_detection_motion_batch(model, dataset, target_batch()[0], 'cpu', args, cache)
                         self.assertGreater(batch['motion_condition'][0, -1, 5:7].sum().item(), 0.)
                         optimizer.zero_grad(set_to_none=True)
                         loss = predictor(batch['motion_condition'], batch['motion_target'], batch['motion_bev_grid_shape'])
@@ -411,7 +410,7 @@ class JointTrainingTests(unittest.TestCase):
         dataset = SimpleNamespace(dicts={'train': {'base': frames}})
         with patch.object(frames, 'history_frames', return_value=[3]), \
              self.assertRaisesRegex(ValueError, 'strictly before'):
-            build_detection_motion_batch(model, dataset, target_batch()[0], 'cpu', arguments())
+            build_detection_motion_batch(model, dataset, target_batch()[0], 'cpu', arguments(), {})
         self.assertFalse(frames.requested)
 
     def test_cli_defaults_to_detection_history_and_retains_target_augmentation(self):

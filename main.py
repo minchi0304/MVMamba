@@ -76,19 +76,16 @@ def train(
     frame_cache = None
     precompute_inferences = 0
     if detection_history:
-        if args.motion_train_cache == 'precompute':
-            optimizer.zero_grad(set_to_none=True)
-            cache_tic = time.time()
-            print('Preparing detector cache for epoch {} before joint training...'.format(epoch))
-            frame_cache = precompute_detection_cache(
-                model, train_dataset, device, args, epoch=epoch, progress=True,
-            )
-            precompute_inferences = len(frame_cache)
-            print('Detector cache epoch {}: {} frames, {:.3f} min'.format(
-                epoch, precompute_inferences, (time.time() - cache_tic) / 60,
-            ))
-        elif args.motion_train_cache == 'epoch':
-            frame_cache = {}
+        optimizer.zero_grad(set_to_none=True)
+        cache_tic = time.time()
+        print('Preparing detector cache for epoch {} before joint training...'.format(epoch))
+        frame_cache = precompute_detection_cache(
+            model, train_dataset, device, args, epoch=epoch, progress=True,
+        )
+        precompute_inferences = len(frame_cache)
+        print('Detector cache epoch {}: {} frames, {:.3f} min'.format(
+            epoch, precompute_inferences, (time.time() - cache_tic) / 60,
+        ))
 
     for batch_idx, (item, target) in enumerate(data_loader):
         optimizer.zero_grad(set_to_none=True)
@@ -278,8 +275,7 @@ if __name__ == '__main__':
     parser.add_argument('--track_buffer', type=int, default=5, help='Maximum missed frames retained by tracking and motion-history replay')
     parser.add_argument('--motion_model', type=str, default='mamba', choices=['kalman', 'mamba', 'bimamba'], help='Motion prediction model; bimamba uses bidirectional history windows')
     parser.add_argument('--motion_history_len', type=int, default=10, help='Number of trajectory tokens used by learned motion models')
-    parser.add_argument('--motion_train_history', choices=['detection', 'gt'], default='detection', help='Detector-output histories (default), or legacy GT histories for ablation')
-    parser.add_argument('--motion_train_cache', choices=['precompute', 'epoch', 'none'], default='precompute', help='Precompute all detections before each epoch (default), cache on first use within an epoch, or decode every step')
+    parser.add_argument('--motion_train_history', choices=['detection', 'gt'], default='detection', help='Detector-output histories precomputed before each epoch (default), or legacy GT histories for ablation')
     parser.add_argument('--motion_train_match_thresh', type=float, default=20., help='Detection-to-GT identity assignment radius in original world-grid units, only for training')
     parser.add_argument('--mamba_history_mode', type=str, default='window', choices=['window', 'stateful'], help='Use a fixed trajectory window or persistent per-track Mamba state')
     parser.add_argument('--mamba_uncertainty_mode', type=str, default='unified', choices=['none', 'unified', 'separate', 'separate_full'], help='Implicit uncertainty input: disabled, unified, uncertainty-only branches, or fully source-specific projections')
@@ -365,7 +361,7 @@ if __name__ == '__main__':
         print('Past-only replay: up to {} past frames per target; '
               'GT identity gate {}, max missed frames {}'.format(
                   args.motion_history_len, args.motion_train_match_thresh, args.track_buffer))
-        print('Detector history cache: {} (motion predictions are recomputed each step)'.format(args.motion_train_cache))
+        print('Detector history cache: precompute before every epoch (motion predictions are recomputed each step)')
     
      # Dataset
     normalize = T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))

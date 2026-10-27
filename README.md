@@ -57,8 +57,8 @@ The default `--motion_train_history detection` trains the detector and Mamba
 together. `--batch_size 1` still means one **target multiview frame** per optimizer
 step, and target frames are shuffled. For each target `t`, up to
 `--motion_history_len` preceding frames form the history in chronological order.
-The default `--motion_train_cache precompute` first decodes every frame in the
-training dataset using the **epoch-start detector weights**, before the first
+With `--motion_train_history detection`, every frame in the training dataset is
+always decoded using the **epoch-start detector weights**, before the first
 training batch. This is a sequential inference pass, one frame at a time in
 evaluation mode without gradients, BatchNorm updates, or optimizer steps.
 All histories in that epoch therefore use detections from the same detector
@@ -68,15 +68,11 @@ The cache is recreated at the start of every training epoch and contains only
 CPU arrays of world-grid xy, score, and uncertainty, keyed by dataset root/frame;
 it retains no images, GPU features, computation graphs, or motion predictions.
 
-Use `--motion_train_cache epoch` for the previous on-demand cache: each frame is
-decoded on first use with that step's detector, then reused within the epoch.
-Use `--motion_train_cache none` to decode with current weights every step.
-With precomputation, detector improvements during an epoch reach motion histories
-at the next epoch's refresh. This changes training inputs compared with fresh
-decoding; the three modes can have different final tracking accuracy.
-All modes continue to train the current-frame detector and motion model each
-batch. No target or future detection enters the motion history, even when a
-later frame has already been cached. Histories stay inside each dataset
+There is no separate cache-mode option; remove `--motion_train_cache` from older
+commands. Detector improvements during an epoch reach motion histories at the
+next epoch's refresh. The current-frame detector and motion model continue to
+train each batch. No target or future detection enters the motion history, even
+when a later frame has already been cached. Histories stay inside each dataset
 root/train split and restart at gaps in the sampled frame sequence.
 
 Past detections are matched one-to-one to GT identities within
@@ -106,14 +102,11 @@ and mean predictive covariance trace in original world-grid units squared.
 forwards during training, and `cache_hits` reports reused visits and their fraction.
 Precomputation has a progress bar and logs its frame count and elapsed time.
 The epoch summary reports precompute forwards, in-training history forwards,
-and their total separately; a fully precomputed epoch has zero in-training
+and their total separately; detection-history training has zero in-training
 history forwards. Total epoch time includes precomputation.
 
-Precomputation adds one detector inference per training frame per epoch. Its
-total detector work is similar to on-demand epoch caching; the distinction is
-when results are generated and which weights produce them. On-demand caching
-can need `motion_history_len` inferences for a first-use window. With caching
-disabled, each target can require that many extra detector inferences.
+Precomputation adds one detector inference per training frame per epoch, in
+addition to the current-frame detector forwards used for joint training.
 Early training can have few motion samples until the detector finds people;
 covariance inputs occur only when a detected history contains a subsequent miss.
 Use `--motion_train_history gt` for the previous GT-only baseline, whose motion
