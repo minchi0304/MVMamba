@@ -290,6 +290,7 @@ def build_tracker(args, dataset_config, tracker_device, motion_predictor=None):
         mamba_history_mode=getattr(args, 'mamba_history_mode', 'window'),
         mamba_uncertainty_mode=getattr(args, 'mamba_uncertainty_mode', 'none'),
         mamba_uncertainty_gate=getattr(args, 'mamba_uncertainty_gate', 'none'),
+        implicit_motion_uncertainty_type=getattr(args, 'implicit_motion_uncertainty_type', 'total'),
     )
 
 

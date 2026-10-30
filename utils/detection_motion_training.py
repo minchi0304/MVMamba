@@ -8,7 +8,7 @@ import torch
 from tqdm import tqdm
 
 from tracker import matching
-from tracker.motion_history import detection_token, motion_token
+from tracker.motion_history import detection_token, history_token_width, motion_token
 
 
 @contextmanager
@@ -33,7 +33,7 @@ class DetectionHistory:
     """
 
     def __init__(self, history_len, high_threshold, match_threshold, max_gap,
-                 uncertainty_mode, uncertainty_gate):
+                 uncertainty_mode, uncertainty_gate, implicit_motion_uncertainty_type="total"):
         self.history_len = int(history_len)
         self.high_threshold = float(high_threshold)
         self.low_threshold = max(0., self.high_threshold - .1)
@@ -41,7 +41,8 @@ class DetectionHistory:
         self.max_gap = int(max_gap)
         self.mode = uncertainty_mode
         self.gate = uncertainty_gate
-        self.width = 11 if self.gate != 'none' else (4 if self.mode == 'none' else 10)
+        self.implicit_motion_uncertainty_type = implicit_motion_uncertainty_type
+        self.width = history_token_width(self.mode, self.gate, implicit_motion_uncertainty_type)
         self.histories = {}
         self.sources = {}
         self.missed = {}
@@ -71,6 +72,7 @@ class DetectionHistory:
             delta = xy[det_index] - history[-1][:2] if history else np.zeros(2, dtype=np.float32)
             history.append(detection_token(
                 xy[det_index], delta, uncertainty[det_index], self.mode, self.gate,
+                self.implicit_motion_uncertainty_type,
             ))
             self.sources.setdefault(pid, deque(maxlen=self.history_len)).append(True)
             self.missed[pid] = 0
@@ -98,6 +100,7 @@ class DetectionHistory:
                     None if covariances is None else covariances[index],
                     None if kappas is None else float(np.asarray(kappas[index]).reshape(-1)[0]),
                     self.mode, self.gate,
+                    self.implicit_motion_uncertainty_type,
                 )
                 if not np.isfinite(token).all():
                     raise FloatingPointError("Non-finite autoregressive motion history")
@@ -185,6 +188,7 @@ def build_detection_motion_batch(model, dataset, item, device, args, frame_cache
                 args.motion_history_len, args.high_cls_thres,
                 args.motion_train_match_thresh, args.track_buffer,
                 args.mamba_uncertainty_mode, args.mamba_uncertainty_gate,
+                getattr(args, 'implicit_motion_uncertainty_type', 'total'),
             )
             target_frame = int(target_frame)
             for frame in sub_dataset.history_frames(target_frame):
@@ -209,8 +213,9 @@ def build_detection_motion_batch(model, dataset, item, device, args, frame_cache
             grid_shapes.extend([sub_dataset.world_grid_shape] * len(sample_conditions))
             stats.update(sample_stats)
 
-    width = 11 if args.mamba_uncertainty_gate != 'none' else (
-        4 if args.mamba_uncertainty_mode == 'none' else 10
+    width = history_token_width(
+        args.mamba_uncertainty_mode, args.mamba_uncertainty_gate,
+        getattr(args, 'implicit_motion_uncertainty_type', 'total'),
     )
     return {
         'motion_condition': torch.as_tensor(

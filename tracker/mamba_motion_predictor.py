@@ -6,6 +6,7 @@ import triton.language as triton_language
 from mamba_ssm import Mamba
 from mamba_ssm.modules import mamba_simple
 from tracker.uncertainty_gated_mamba import UncertaintyGatedMamba
+from tracker.motion_history import history_token_width
 from utils.losses_evidential import (
     evidential_niw_loss_2d,
     niw_predictive_covariance_2d,
@@ -48,7 +49,7 @@ class MambaMotionPredictor(nn.Module):
 
     The baseline history token is ``[x, y, dx, dy]``. Implicit uncertainty
     modes use ``[x, y, dx, dy, u_det, cov_xx, cov_yy, cov_xy, is_det,
-    is_motion]``. Explicit gating appends NIW kappa as an eleventh field;
+    is_motion]``. Component selection or explicit gating appends NIW kappa as an eleventh field;
     kappa is used only to split total covariance, never projected as a feature.
     Coordinates, displacements, and covariance are normalized by
     the BEV size inside this module. The prediction returned by :meth:`generate`
@@ -75,6 +76,7 @@ class MambaMotionPredictor(nn.Module):
         motion_uncertainty_type="total",
         uncertainty_weight="cosine",
         niw_reg_weight=1e-3,
+        implicit_motion_uncertainty_type="total",
     ):
         super().__init__()
 
@@ -88,6 +90,11 @@ class MambaMotionPredictor(nn.Module):
         self.evidential_head_type = evidential_head
         self.uncertainty_mode = uncertainty_mode
         self.uncertainty_gate = uncertainty_gate
+        if implicit_motion_uncertainty_type not in ("aleatoric", "epistemic", "total"):
+            raise ValueError("implicit_motion_uncertainty_type must be aleatoric, epistemic, or total")
+        if uncertainty_mode != "none" and implicit_motion_uncertainty_type != "total" and loss_type != "niw":
+            raise ValueError("Implicit covariance component selection requires loss_type='niw'")
+        self.implicit_motion_uncertainty_type = implicit_motion_uncertainty_type
         self.motion_uncertainty_type = motion_uncertainty_type
         self.uncertainty_weight = uncertainty_weight
         self.last_loss_stats = {}
@@ -218,11 +225,13 @@ class MambaMotionPredictor(nn.Module):
     def _canonicalize_history(self, history):
         if self.uncertainty_mode == "none" and self.uncertainty_gate == "none":
             return history[..., :4]
-        width = 10 if self.uncertainty_gate == "none" else 11
+        width = history_token_width(
+            self.uncertainty_mode, self.uncertainty_gate, self.implicit_motion_uncertainty_type,
+        )
         if history.size(-1) >= width:
             return history[..., :width]
         if history.size(-1) != 4:
-            raise ValueError("explicit uncertainty histories require NIW kappa as field 11")
+            raise ValueError("Uncertainty component selection or explicit gating requires NIW kappa as field 11")
 
         # GT histories have no uncertainty: treat them as reliable observations.
         zeros = history.new_zeros((*history.shape[:-1], width - 4))
@@ -234,11 +243,21 @@ class MambaMotionPredictor(nn.Module):
         projected = self.input_projection(kinematics)
         if self.uncertainty_mode == "none":
             return projected
+        # History and the explicit gate retain total covariance. Only the
+        # implicit projection sees the selected component, including cov_xy.
+        covariance = history[..., 5:8]
+        if self.implicit_motion_uncertainty_type != "total":
+            kappa = history[..., 10:11]
+            if self.implicit_motion_uncertainty_type == "aleatoric":
+                covariance = covariance * kappa / (kappa + 1.0)
+            else:
+                covariance = covariance / (kappa + 1.0)
         if self.uncertainty_mode == "unified":
-            return projected + self.uncertainty_input_projection(history[..., 4:10])
+            uncertainty = torch.cat((history[..., 4:5], covariance, history[..., 8:10]), dim=-1)
+            return projected + self.uncertainty_input_projection(uncertainty)
         if self.uncertainty_mode == "separate_full":
             detection_input = torch.cat((kinematics, history[..., 4:5]), dim=-1)
-            motion_input = torch.cat((kinematics, history[..., 5:8]), dim=-1)
+            motion_input = torch.cat((kinematics, covariance), dim=-1)
             detection_features = self.detection_input_projection(detection_input)
             motion_features = self.motion_input_projection(motion_input)
             return (
@@ -247,7 +266,7 @@ class MambaMotionPredictor(nn.Module):
             )
 
         detection_features = self.detection_input_projection(history[..., 4:5])
-        motion_features = self.motion_input_projection(history[..., 5:8])
+        motion_features = self.motion_input_projection(covariance)
         return (
             projected
             + history[..., 8:9] * detection_features

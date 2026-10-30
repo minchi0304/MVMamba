@@ -279,6 +279,7 @@ if __name__ == '__main__':
     parser.add_argument('--motion_train_match_thresh', type=float, default=20., help='Detection-to-GT identity assignment radius in original world-grid units, only for training')
     parser.add_argument('--mamba_history_mode', type=str, default='window', choices=['window', 'stateful'], help='Use a fixed trajectory window or persistent per-track Mamba state')
     parser.add_argument('--mamba_uncertainty_mode', type=str, default='unified', choices=['none', 'unified', 'separate', 'separate_full'], help='Implicit uncertainty input: disabled, unified, uncertainty-only branches, or fully source-specific projections')
+    parser.add_argument('--implicit_motion_uncertainty_type', type=str, default='total', choices=['aleatoric', 'epistemic', 'total'], help='NIW covariance component used by implicit uncertainty projections; independent of the explicit gate')
     parser.add_argument('--mamba_uncertainty_gate', type=str, default='none', choices=['none', 'b', 'delta'], help='Explicit reliability gate on SSM B or positive delta')
     parser.add_argument('--mamba_uncertainty_weight', type=str, default='cosine', choices=['linear', 'rational', 'cosine'], help='Detection reliability mapping; motion always uses 1-tanh(trace)')
     parser.add_argument('--motion_uncertainty_type', type=str, default='total', choices=['aleatoric', 'epistemic', 'total'], help='NIW covariance component whose trace drives the explicit motion gate')
@@ -323,13 +324,18 @@ if __name__ == '__main__':
     if args.mamba_uncertainty_gate != 'none':
         if args.motion_model not in ('mamba', 'bimamba') or args.motion_loss != 'niw':
             parser.error('explicit uncertainty gating requires --motion_model mamba or bimamba with --motion_loss niw')
+    if args.mamba_uncertainty_mode != 'none' and args.implicit_motion_uncertainty_type != 'total':
+        if args.motion_model not in ('mamba', 'bimamba') or args.motion_loss != 'niw':
+            parser.error('implicit covariance component selection requires --motion_model mamba or bimamba with --motion_loss niw')
     print('Occupancy loss: edl')
     print('Motion model: {}'.format(args.motion_model))
     print('Motion loss: {}'.format(args.motion_loss))
     if args.motion_model in ('mamba', 'bimamba') and args.motion_loss == 'niw':
         print('NIW regularizer: euclidean, weight: {:g}'.format(args.niw_reg_weight))
     print('Motion association cost: euclidean')
-    print('Mamba uncertainty input: {}'.format(args.mamba_uncertainty_mode))
+    print('Mamba uncertainty input: {}, motion covariance: {}'.format(
+        args.mamba_uncertainty_mode, args.implicit_motion_uncertainty_type,
+    ))
     print('Mamba explicit gate: {}, detection weight: {}, motion weight: tanh, motion covariance: {}'.format(
         args.mamba_uncertainty_gate, args.mamba_uncertainty_weight,
         args.motion_uncertainty_type,
@@ -476,6 +482,7 @@ if __name__ == '__main__':
             niw_reg_weight=args.niw_reg_weight,
             evidential_head=args.evidential_head,
             uncertainty_mode=args.mamba_uncertainty_mode,
+            implicit_motion_uncertainty_type=args.implicit_motion_uncertainty_type,
             uncertainty_gate=args.mamba_uncertainty_gate,
             motion_uncertainty_type=args.motion_uncertainty_type,
             uncertainty_weight=args.mamba_uncertainty_weight,

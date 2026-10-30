@@ -82,6 +82,7 @@ class BiMambaWiringTests(unittest.TestCase):
                    '--motion_train_history gt '
                    '--mamba_history_mode window --mamba_uncertainty_gate b '
                    '--niw_reg_weight 0.25 '
+                   '--implicit_motion_uncertainty_type epistemic '
                    '--motion_loss niw --aug -j 0 --mamba_d_model 8 --mamba_layers 2')
         with contextlib.redirect_stdout(io.StringIO()) as output, \
              patch.object(sys, 'argv', command.split()), patch('os.makedirs'), \
@@ -103,6 +104,7 @@ class BiMambaWiringTests(unittest.TestCase):
         self.assertEqual(predictor.call_args.kwargs['num_layers'], 2)
         self.assertEqual(predictor.call_args.kwargs['uncertainty_gate'], 'b')
         self.assertEqual(predictor.call_args.kwargs['niw_reg_weight'], .25)
+        self.assertEqual(predictor.call_args.kwargs['implicit_motion_uncertainty_type'], 'epistemic')
 
     def test_stateful_bimamba_is_rejected_before_loading_data(self):
         with self.assertRaisesRegex(ValueError, 'window'):
@@ -125,10 +127,12 @@ class BiMambaWiringTests(unittest.TestCase):
 
         args = SimpleNamespace(high_cls_thres=.4, track_match_thresh=30, track_low_match_thresh=50,
                                motion_model='bimamba', motion_history_len=3,
-                               mamba_uncertainty_gate='b', mamba_uncertainty_mode='separate_full')
+                               mamba_uncertainty_gate='b', mamba_uncertainty_mode='separate_full',
+                               implicit_motion_uncertainty_type='aleatoric')
         config = {'base': SimpleNamespace(base=SimpleNamespace(world_grid_shape=(100, 200)))}
         tracker = build_tracker(args, config, 'cpu', Predictor())
         track = tracker.update([[10., 20.]], [.9], uncertainties=[.2])[0]
+        self.assertEqual(track.implicit_motion_uncertainty_type, 'aleatoric')
         identity = track.track_id
         tracker.update(np.empty((0, 2)), np.empty(0))
         np.testing.assert_allclose(track.xy, [11., 20.])

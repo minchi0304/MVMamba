@@ -6,7 +6,7 @@ import torch
 
 from . import matching
 from .kalman_filter import KalmanFilter
-from .motion_history import detection_token, motion_token
+from .motion_history import detection_token, history_token_width, motion_token
 
 class TrackState:
     New = 0
@@ -28,12 +28,17 @@ class STrack:
         detection_uncertainty=0.0,
         mamba_uncertainty_mode="none",
         mamba_uncertainty_gate="none",
+        implicit_motion_uncertainty_type="total",
     ):
         self._xy = np.asarray(xy, dtype=np.float32).reshape(2)
         self.score = float(score)
         self.detection_uncertainty = float(detection_uncertainty)
         self.mamba_uncertainty_mode = mamba_uncertainty_mode
         self.mamba_uncertainty_gate = mamba_uncertainty_gate
+        self.implicit_motion_uncertainty_type = implicit_motion_uncertainty_type
+        self.requires_motion_kappa = history_token_width(
+            mamba_uncertainty_mode, mamba_uncertainty_gate, implicit_motion_uncertainty_type,
+        ) == 11
         self.buffer_size = buffer_size
         self.tracklet_len = 0
         self.track_id = 0
@@ -59,12 +64,14 @@ class STrack:
         return detection_token(
             observed_xy, delta, self.detection_uncertainty,
             self.mamba_uncertainty_mode, self.mamba_uncertainty_gate,
+            self.implicit_motion_uncertainty_type,
         )
 
     def _motion_condition(self, predicted_xy, delta):
         return motion_token(
             predicted_xy, delta, self.motion_covariance, self.motion_kappa,
             self.mamba_uncertainty_mode, self.mamba_uncertainty_gate,
+            self.implicit_motion_uncertainty_type,
         )
 
     @classmethod
@@ -189,7 +196,7 @@ class STrack:
         conditions = [track.conds for track in stracks]
         kappa = None
         with torch.no_grad():
-            if stracks[0].mamba_uncertainty_gate != "none":
+            if stracks[0].requires_motion_kappa:
                 motion, covariance, kappa = model.generate_distribution(
                     conditions, bev_grid_shape=bev_grid_shape, return_kappa=True,
                 )
@@ -232,7 +239,7 @@ class STrack:
         states = [track.mamba_state for track in stracks]
         kappa = None
         with torch.no_grad():
-            if stracks[0].mamba_uncertainty_gate != "none":
+            if stracks[0].requires_motion_kappa:
                 motion, covariance, next_states, kappa = model.stateful_step_distribution(
                     tokens, states=states, bev_grid_shape=bev_grid_shape,
                     return_kappa=True,
@@ -315,6 +322,7 @@ class Tracker:
         mamba_history_mode="window",
         mamba_uncertainty_mode="none",
         mamba_uncertainty_gate="none",
+        implicit_motion_uncertainty_type="total",
     ):
         self.tracked_stracks: List[STrack] = []
         self.lost_stracks: List[STrack] = []
@@ -341,6 +349,7 @@ class Tracker:
         self.mamba_history_mode = mamba_history_mode
         self.mamba_uncertainty_mode = mamba_uncertainty_mode
         self.mamba_uncertainty_gate = mamba_uncertainty_gate
+        self.implicit_motion_uncertainty_type = implicit_motion_uncertainty_type
 
         self.kalman_filter = KalmanFilter() if motion_model == "kalman" else None
         self.motion_predictor = None
@@ -364,6 +373,7 @@ class Tracker:
                 detection_uncertainty=uncertainty,
                 mamba_uncertainty_mode=self.mamba_uncertainty_mode,
                 mamba_uncertainty_gate=self.mamba_uncertainty_gate,
+                implicit_motion_uncertainty_type=self.implicit_motion_uncertainty_type,
             )
             for xy, score, uncertainty in zip(dets, scores, uncertainties)
         ]

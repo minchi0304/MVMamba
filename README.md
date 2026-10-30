@@ -295,6 +295,7 @@ The main tracking controls are:
 - `--motion_history_len`: number of trajectory tokens (default: `10`)
 - `--mamba_history_mode`: `window` uses the fixed trajectory window; `stateful` keeps each track's unidirectional Mamba convolution and SSM state across frames. BiMamba supports `window` only.
 - `--mamba_uncertainty_mode`: `none` uses `[x, y, dx, dy]`; `unified` projects kinematics, source masks, detection uncertainty, and motion covariance together; `separate` adds source-specific uncertainty projections to a shared kinematic projection; `separate_full` independently projects the full detection and motion tokens
+- `--implicit_motion_uncertainty_type`: `aleatoric`, `epistemic`, or `total` (default) covariance for the implicit motion projection; applies to `unified`, `separate`, and `separate_full`
 - `--mamba_uncertainty_gate`: explicit SSM gating, `none` (default), `b`, or `delta`
 - `--mamba_uncertainty_weight`: detection reliability mapping, `linear`, `rational`, or `cosine` (default); motion always uses `1 - tanh(trace)`
 - `--motion_uncertainty_type`: `aleatoric`, `epistemic`, or `total` (default) covariance trace for the explicit motion gate
@@ -345,11 +346,41 @@ squared BEV axis scales before entering Mamba. Short histories retain the
 existing padding rule: the first state and source fields are repeated at the
 front, while only the repeated `dx, dy` values are set to zero.
 
+Choose the implicit covariance component with
+`--implicit_motion_uncertainty_type aleatoric|epistemic|total`. For example,
+add these options to the training command for an aleatoric-only implicit ablation:
+
+```bash
+--motion_loss niw --motion_train_history detection \
+--mamba_uncertainty_mode separate_full --mamba_uncertainty_gate none \
+--implicit_motion_uncertainty_type aleatoric
+```
+
+Histories retain total covariance. For `aleatoric` or `epistemic`, an eleventh
+field stores NIW `kappa`, including when the explicit gate is disabled. Immediately
+before projection, the covariance entries `(xx, yy, xy)` are multiplied by
+`kappa / (kappa + 1)` for aleatoric or `1 / (kappa + 1)` for epistemic.
+Kappa itself is not projected. Detection uncertainty is unchanged.
+The option applies to training replay, window inference, and stateful inference;
+BiMamba uses the same selection in window mode. NIW loss and returned/logged
+covariances still use the full predictive distribution. The explicit gate
+independently follows `--motion_uncertainty_type`.
+
+For a training ablation, train each component separately and pass the same
+component option when evaluating its checkpoint (`--resume`). Checkpoints store
+weights, not this selection; the training log records it in `Settings`.
+Changing the option only at inference instead measures sensitivity of that
+checkpoint to different inputs. Omitting the option preserves total-covariance
+behavior and projection dimensions.
+
 GT motion samples contain only kinematics. They are converted to
 detection-source tokens with zero uncertainty during training. The uncertainty
 projections start from zero so that a checkpoint is not perturbed by untrained
 uncertainty weights. GT-only training does not supply nonzero detection or motion
 uncertainty; these values enter the history during tracking.
+Consequently, switching covariance components does not change GT-only training
+inputs. Use detection histories containing motion rollouts to train with the
+selected nonzero covariance component.
 
 In `separate_full`, detection tokens use a `5 -> d_model` projection over
 `[x, y, dx, dy, u_det]`, while motion tokens use a separate `7 -> d_model`
