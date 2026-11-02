@@ -379,14 +379,17 @@ if __name__ == '__main__':
     sys.stdout = Logger(os.path.join(logdir, 'log.txt'), )
     print('Settings:')
     print(vars(args))
-    print('Motion training history: {}'.format(
-        args.motion_train_history if args.motion_model in ('mamba', 'bimamba') else 'disabled',
-    ))
-    if args.motion_model in ('mamba', 'bimamba') and args.motion_train_history == 'detection':
-        print('Past-only replay: up to {} past frames per target; '
-              'GT identity gate {}, max missed frames {}'.format(
-                  args.motion_history_len, args.motion_train_match_thresh, args.track_buffer))
-        print('Detector history cache: precompute before every epoch (motion predictions are recomputed each step)')
+    if args.resume is None:
+        print('Motion training history: {}'.format(
+            args.motion_train_history if args.motion_model in ('mamba', 'bimamba') else 'disabled',
+        ))
+        if args.motion_model in ('mamba', 'bimamba') and args.motion_train_history == 'detection':
+            print('Past-only replay: up to {} past frames per target; '
+                  'GT identity gate {}, max missed frames {}'.format(
+                      args.motion_history_len, args.motion_train_match_thresh, args.track_buffer))
+            print('Detector history cache: precompute before every epoch (motion predictions are recomputed each step)')
+    else:
+        print('Resume evaluation: loading evaluation datasets only')
     
      # Dataset
     normalize = T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
@@ -417,6 +420,10 @@ if __name__ == '__main__':
         data_path = csv.reader(f)
 
         for i,data_row in enumerate(data_path):
+            # Resume never needs training images, annotations, or calibration.
+            # Skip these entries before constructing the base dataset.
+            if args.resume is not None and data_row[0] == 'train':
+                continue
 
             train_ratio = float(data_row[2])
             sample_require = int(data_row[3])
@@ -443,7 +450,7 @@ if __name__ == '__main__':
                 dataset_obj = GetDataset(base, train=False, transform=train_transform, grid_reduce=4, img_reduce=8, train_ratio=train_ratio, sample_require=sample_require, data_aug=False, bev_gaussian_sigma=args.bev_gaussian_sigma)
                 test_dataset_list.append(dataset_obj)
         
-        if 'gmvd_test' == args.dataset:
+        if 'gmvd_test' == args.dataset and args.resume is None:
             train_dataset_list = test_dataset_list
 
     else:
@@ -451,34 +458,40 @@ if __name__ == '__main__':
         
 
     # Train and Test set
+    train_dataset = None
     if args.dataset == 'gmvd_train' or args.dataset == 'gmvd_test':
-        print("Training datasets")
-        train_dataset = ConcatDataset(*train_dataset_list)
+        if args.resume is None:
+            print("Training datasets")
+            train_dataset = ConcatDataset(*train_dataset_list)
         print("Testing datasets")
         test_dataset = ConcatDataset(*test_dataset_list)
 
     elif args.dataset in ['wildtrack', 'multiviewx', 'citytrack', 'mvcrowdtrack']:
         grid_reduce = int(getattr(base0, 'default_grid_reduce', 4))
         img_reduce = int(getattr(base0, 'default_img_reduce', 8))
-        train_dataset_ = GetDataset(base0, train=True, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=args.aug, build_motion_samples=args.motion_model in ('mamba', 'bimamba') and args.motion_train_history == 'gt', motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
+        if args.resume is None:
+            train_dataset_ = GetDataset(base0, train=True, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=args.aug, build_motion_samples=args.motion_model in ('mamba', 'bimamba') and args.motion_train_history == 'gt', motion_history_len=args.motion_history_len, bev_gaussian_sigma=args.bev_gaussian_sigma)
+            print("Training datasets")
+            train_dataset = ConcatDataset(train_dataset_)
         test_dataset_ = GetDataset(base0, train=False, transform=train_transform, grid_reduce=grid_reduce, img_reduce=img_reduce, data_aug=False, bev_gaussian_sigma=args.bev_gaussian_sigma)
 
-        print("Training datasets")
-        train_dataset = ConcatDataset(train_dataset_)
         print("Testing datasets")
         test_dataset = ConcatDataset(test_dataset_)
     
     # Train and Test Data Loader 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+    train_loader = None
+    if train_dataset is not None:
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                                             num_workers=args.num_workers, pin_memory=True, worker_init_fn=init_fn,
                                             collate_fn=motion_joint_collate if args.motion_model in ('mamba', 'bimamba') and args.motion_train_history == 'gt' else None)
     
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False,
                                             num_workers=args.num_workers, pin_memory=True, worker_init_fn=init_fn)
 
-    print_bev_gaussian_settings("Train", train_dataset)
+    if train_dataset is not None:
+        print_bev_gaussian_settings("Train", train_dataset)
+        print(f'Train Data : {len(train_dataset)} frames')
     print_bev_gaussian_settings("Test", test_dataset)
-    print(f'Train Data : {len(train_dataset)} frames')
     print(f'Test Data : {len(test_loader)}')
     
     # Model

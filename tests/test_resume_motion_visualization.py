@@ -86,7 +86,7 @@ class ResumePlotSelectionTests(unittest.TestCase):
                       and ast.unparse(node.test) == "'wildtrack' in args.dataset")
         code = compile(ast.Module(body=[branch], type_ignores=[]), str(source), "exec")
         for enabled in (False, True):
-            args = SimpleNamespace(dataset="gmvd_train", gmvd_eval_all_frames=enabled, aug=False,
+            args = SimpleNamespace(dataset="gmvd_train", resume=None, gmvd_eval_all_frames=enabled, aug=False,
                                    motion_model="mamba", motion_train_history="detection",
                                    motion_history_len=15, bev_gaussian_sigma=3.)
             constructor = Mock(side_effect=lambda base, **kwargs: kwargs)

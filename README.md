@@ -495,6 +495,13 @@ pass is performed. Keep the architecture and history options in your existing
 resume command consistent with the checkpoint; this path still uses the
 `main.py` model settings supplied on the command line.
 
+Resume creates only the evaluation datasets and loader. Training images and
+training splits are not required. For GMVD, `-d gmvd_train --resume ...` reads
+only the evaluation rows of `train_datapath.csv`, skipping training rows before
+opening their dataset directories. `-d gmvd_test --resume ...` uses evaluation
+rows from `test_datapath.csv`. The selected CSV is still required, and sequence
+IDs follow its evaluation-row order.
+
 Append these options to the existing resume command to plot three objects in
 sequence 0 at frames 100 and 110:
 
