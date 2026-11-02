@@ -28,8 +28,10 @@ and covariance consistently, relative to the BEV grid origin.
 Existing motion CSVs contain TOTAL covariance, regardless of the implicit
 input option. --component aleatoric/epistemic requires an extra 'kappa' column.
 This script cannot recover missing kappa from total covariance alone.
-Ellipse semiaxes are ellipse_scale * sqrt(eigenvalue); no probability coverage
-is claimed (in particular, 2 is not automatically a 95% NIW region).
+Ellipses use fixed semiaxes sqrt(eigenvalue), oriented by the covariance
+eigenvectors. There is no adjustable display multiplier. This unit covariance
+ellipse describes one standard deviation along each principal axis; no
+particular probability coverage is claimed for the NIW predictive distribution.
 
 all_res contains saved high-confidence detections, not all tracker candidates.
 It is overwritten each evaluation: do not pair an old/best motion CSV with a
@@ -162,26 +164,27 @@ def selected_covariance(record, component="total", coordinate_scale=1.0):
     return covariance * coordinate_scale ** 2
 
 
-def ellipse_geometry(covariance, ellipse_scale=2.0):
-    """Return full width, full height, angle in degrees; tolerate roundoff only."""
+def ellipse_geometry(covariance):
+    """Return unit covariance ellipse diameters and angle; tolerate roundoff only."""
     eigenvalues, eigenvectors = np.linalg.eigh(covariance)
     tolerance = 1e-10 * max(float(np.abs(covariance).max()), 1e-12)
     if eigenvalues[0] < -tolerance:
         raise ValueError(f"Covariance is not positive semidefinite: {covariance.tolist()}")
-    diameters = 2. * ellipse_scale * np.sqrt(np.maximum(eigenvalues, 0.))
+    # Matplotlib expects diameters; each semiaxis is sqrt(eigenvalue).
+    diameters = 2. * np.sqrt(np.maximum(eigenvalues, 0.))
     major = eigenvectors[:, 1]
     return float(diameters[1]), float(diameters[0]), math.degrees(math.atan2(major[1], major[0]))
 
 
 def prepare_points(motion, gt, detections, component, coordinate_scale, detection_order,
-                   frames=None, track_ids=None, gt_ids=None, min_score=0.0, ellipse_scale=2.0):
+                   frames=None, track_ids=None, gt_ids=None, min_score=0.0):
     points = []
     for row in motion:
         if (frames is not None and row["frame"] not in frames) or (track_ids is not None and row["track_id"] not in track_ids):
             continue
         covariance = selected_covariance(row, component, coordinate_scale)
         try:
-            geometry = ellipse_geometry(covariance, ellipse_scale)
+            geometry = ellipse_geometry(covariance)
         except ValueError as exc:
             raise ValueError(f"Frame {row['frame']}, track {row['track_id']}: {exc}") from exc
         points.append(dict(frame=row["frame"], source="motion", id=row["track_id"],
@@ -254,7 +257,7 @@ def plot_limits(points):
     return (lower[0] - padding[0], upper[0] + padding[0]), (lower[1] - padding[1], upper[1] + padding[1])
 
 
-def draw_frame(points, frame, sequence, component, ellipse_scale, xlim, ylim,
+def draw_frame(points, frame, sequence, component, xlim, ylim,
                unit="grid cells", show_ids=False, invert_y=False, nearby_context=False):
     fig, ax = plt.subplots(figsize=(9, 7))
     colors = {"gt": "#238443", "detection": "#2166ac", "motion": "#d73027"}
@@ -280,7 +283,7 @@ def draw_frame(points, frame, sequence, component, ellipse_scale, xlim, ylim,
         ax.scatter(xy[:, 0], xy[:, 1], marker=marker, s=size, label=label, zorder=3, **kwargs)
     handles, labels = ax.get_legend_handles_labels()
     handles.append(Patch(facecolor=colors["motion"], edgecolor=colors["motion"], alpha=.25))
-    labels.append(f"{component.capitalize()} covariance (scale {ellipse_scale:g})")
+    labels.append(f"{component.capitalize()} covariance")
     ax.legend(handles, labels, loc="upper center", bbox_to_anchor=(.5, -.1), ncol=2, frameon=False)
     ax.set(xlim=xlim, ylim=ylim, xlabel=f"BEV x ({unit})", ylabel=f"BEV y ({unit})",
            title=f"{_basename(sequence)} | frame {frame} | {component}")
@@ -325,7 +328,6 @@ def build_parser():
     parser.add_argument("--max-objects", type=int, help="Limit to N stable motion track IDs, plus at most one nearby GT/detection each")
     parser.add_argument("--context-radius", type=float, default=50., help="Nearby point selection radius in original grid cells (default: 50); only with --max-objects")
     parser.add_argument("--component", choices=("total", "aleatoric", "epistemic"), default="total")
-    parser.add_argument("--ellipse-scale", type=float, default=2., help="Ellipse semiaxis multiplier, not a coverage probability")
     parser.add_argument("--detection-order", choices=("auto", "xy", "yx"), default="auto")
     parser.add_argument("--min-score", type=float, default=0., help="Further filter the saved detections")
     parser.add_argument("--meters-per-cell", type=float, help="Convert grid positions/covariance to relative BEV meters")
@@ -341,8 +343,8 @@ def build_parser():
 
 def run(args):
     scale = 1. if args.meters_per_cell is None else args.meters_per_cell
-    if not math.isfinite(scale) or scale <= 0 or not math.isfinite(args.ellipse_scale) or args.ellipse_scale <= 0:
-        raise ValueError("--meters-per-cell and --ellipse-scale must be finite and positive")
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError("--meters-per-cell must be finite and positive")
     if args.dpi <= 0 or not math.isfinite(args.min_score) or not 0 <= args.min_score <= 1:
         raise ValueError("--dpi must be positive and --min-score must be in [0, 1]")
     if args.max_objects is not None and args.max_objects <= 0:
@@ -371,7 +373,7 @@ def run(args):
     if not frames or set(frames) - available_frames:
         raise ValueError(f"No data for requested frame(s): {sorted(set(frames) - available_frames)}")
     points = prepare_points(motion, gt, detections, args.component, scale, order,
-                            set(frames), args.track_ids, args.gt_ids, args.min_score, args.ellipse_scale)
+                            set(frames), args.track_ids, args.gt_ids, args.min_score)
     selected_track_ids = None
     if args.max_objects is not None:
         points, selected_track_ids = limit_objects(points, args.max_objects, args.context_radius * scale)
@@ -388,7 +390,7 @@ def run(args):
         by_frame[point["frame"]].append(point)
     files = []
     for frame in frames:
-        fig = draw_frame(by_frame[frame], frame, sequence, args.component, args.ellipse_scale,
+        fig = draw_frame(by_frame[frame], frame, sequence, args.component,
                          xlim, ylim, "m" if args.meters_per_cell is not None else "grid cells",
                          args.show_ids, args.invert_y, nearby_context=args.max_objects is not None)
         try:
@@ -402,6 +404,7 @@ def run(args):
     settings = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     settings.update(sequence=sequence, sequence_id=sequence_id, detection_order=order,
                     frames=frames, xlim=list(xlim), ylim=list(ylim), selected_track_ids=selected_track_ids,
+                    ellipse_definition="semiaxes=sqrt(eigenvalues)",
                     context_selection="greedy_nearest_one_to_one" if args.max_objects is not None else None)
     (output / f"plot_settings_{args.component}.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
     print(f"Saved {len(files)} figure(s) and point coordinates to {output}")

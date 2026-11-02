@@ -34,14 +34,19 @@ class MotionUncertaintyVisualizationTests(unittest.TestCase):
         angle = np.deg2rad(30.)
         rotation = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
         covariance = rotation @ np.diag([9., 1.]) @ rotation.T
-        width, height, degrees = viz.ellipse_geometry(covariance, 2.)
-        self.assertAlmostEqual(width, 12.)
-        self.assertAlmostEqual(height, 4.)
+        width, height, degrees = viz.ellipse_geometry(covariance)
+        self.assertAlmostEqual(width, 6.)
+        self.assertAlmostEqual(height, 2.)
         self.assertAlmostEqual(degrees % 180., 30.)
+        # The displayed semiaxes reconstruct the original covariance, without
+        # a user-selected multiplier or a probability-contour conversion.
+        radians = np.deg2rad(degrees)
+        axes = np.array([[np.cos(radians), -np.sin(radians)], [np.sin(radians), np.cos(radians)]])
+        np.testing.assert_allclose(axes @ np.diag([(width / 2.) ** 2, (height / 2.) ** 2]) @ axes.T, covariance)
         point = dict(source="motion", xy=np.array([10., 20.]), ellipse=(width, height, degrees))
         xlim, ylim = viz.plot_limits([point])
-        self.assertLess(xlim[0], 10. - 2. * np.sqrt(covariance[0, 0]))
-        self.assertGreater(ylim[1], 20. + 2. * np.sqrt(covariance[1, 1]))
+        self.assertLess(xlim[0], 10. - np.sqrt(covariance[0, 0]))
+        self.assertGreater(ylim[1], 20. + np.sqrt(covariance[1, 1]))
 
     def test_component_decomposition_and_metric_scaling_preserve_total(self):
         total = viz.selected_covariance(self.record)
@@ -117,7 +122,7 @@ class MotionUncertaintyVisualizationTests(unittest.TestCase):
         points = viz.prepare_points([self.record], gt, detections, "total", 1., "xy",
                                     {2}, [42], [7], min_score=.8)
         self.assertEqual(len(points), 3)
-        fig = viz.draw_frame(points, 2, "scene", "total", 2., (0, 50), (0, 50), show_ids=True)
+        fig = viz.draw_frame(points, 2, "scene", "total", (0, 50), (0, 50), show_ids=True)
         try:
             ax = fig.axes[0]
             self.assertEqual(len(ax.lines), 0)
