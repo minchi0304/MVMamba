@@ -1,14 +1,30 @@
 r"""Plot per-frame GT/detection/motion points and motion covariance ellipses.
 
-Standalone: only NumPy and Matplotlib are required; no model/GPU imports.
-Run from the repository root, using files from the SAME evaluation:
+Run a trained checkpoint and plot its fresh inference results:
+
+    python visualize_motion_uncertainty.py \
+        --checkpoint logs/RUN/Best_Multiview_Tracking_IDF1_gmvd_train.pth \
+        --data_root /dataset --sequence-id 0 --frames 100 110 --max-objects 3
+
+Checkpoint mode needs the project's CUDA/Mamba environment. Model settings are
+read from log.txt beside the checkpoint, or --model-config LOG_OR_JSON, with
+explicit CLI options taking precedence. Loading is strict. Only the selected
+evaluation sequence is loaded, and every evaluation frame from its start through
+the last requested frame is processed to preserve tracking history. GMVD IDs
+are mapped automatically from the split CSV; --sequence OR --sequence-id is
+sufficient. --list-sequences lists the actual ID/path mapping without inference.
+Fresh CSVs (including NIW kappa) and inference settings are saved below
+OUTPUT_DIR/inference/RUN_ID, then used directly to generate the figures.
+
+Alternatively, CSV-only plotting needs only NumPy and Matplotlib (no model/GPU
+imports). Use files from the SAME evaluation:
 
     python visualize_motion_uncertainty.py \
         --motion-csv logs/RUN/motion_uncertainty_epoch_100.csv \
         --gt logs/RUN/mota_gt.txt --detections logs/RUN/all_res.txt \
         --frames 100 105 --max-objects 3 --output-dir outputs/motion_plots --show-ids
 
-For GMVD/multiple sequences, also specify --sequence NAME --sequence-id N.
+For GMVD/multiple sequences in CSV mode, specify --sequence NAME --sequence-id N.
 NAME is the CSV sequence path (or its unique basename). N is its zero-based
 index in the evaluation dataset_list, also stored in mota_gt/all_res. Use
 --list-sequences to inspect names and numeric IDs; their order is NOT a mapping.
@@ -60,6 +76,8 @@ import json
 import math
 from pathlib import Path
 import re
+
+from motion_uncertainty_inference import add_inference_arguments, run_checkpoint
 
 import matplotlib
 matplotlib.use("Agg")
@@ -316,11 +334,13 @@ def write_points(path, points, sequence, sequence_id, component):
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--motion-csv", type=Path, required=True)
-    parser.add_argument("--gt", type=Path, required=True, help="mota_gt.txt from the same evaluation")
-    parser.add_argument("--detections", type=Path, required=True, help="all_res.txt from the same evaluation")
-    parser.add_argument("--sequence", help="CSV sequence name/path or unique basename")
-    parser.add_argument("--sequence-id", type=int, help="Numeric evaluation dataset_list index for the selected sequence")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--checkpoint", "--resume", type=Path, help="Run trained detector + motion weights and plot fresh results")
+    source.add_argument("--motion-csv", type=Path, help="Plot an existing motion prediction CSV instead of running inference")
+    parser.add_argument("--gt", type=Path, help="mota_gt.txt from the same evaluation; required with --motion-csv")
+    parser.add_argument("--detections", type=Path, help="all_res.txt from the same evaluation; required with --motion-csv")
+    parser.add_argument("--sequence", help="Sequence path or unique name; checkpoint mode also accepts scene/config/seq")
+    parser.add_argument("--sequence-id", type=int, help="Evaluation sequence index; checkpoint mode resolves the matching path automatically")
     parser.add_argument("--list-sequences", action="store_true", help="Print available names/IDs and exit")
     parser.add_argument("--frames", type=int, nargs="+", help="Frames to draw; default: all frames in the selected sequence")
     parser.add_argument("--track-ids", type=int, nargs="+", help="Filter motion predictions only")
@@ -338,6 +358,7 @@ def build_parser():
     parser.add_argument("--formats", choices=("png", "pdf", "svg"), nargs="+", default=["png"])
     parser.add_argument("--dpi", type=int, default=180)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/motion_uncertainty"))
+    add_inference_arguments(parser)
     return parser
 
 
@@ -354,6 +375,13 @@ def run(args):
     for limits in (args.xlim, args.ylim):
         if limits is not None and (not np.isfinite(limits).all() or limits[0] >= limits[1]):
             raise ValueError("Axis limits must be finite, with MIN < MAX")
+    if args.checkpoint is not None:
+        if args.gt is not None or args.detections is not None:
+            raise ValueError("--checkpoint generates fresh GT/detections; omit --gt and --detections")
+        if not run_checkpoint(args):
+            return []
+    elif args.gt is None or args.detections is None:
+        raise ValueError("--motion-csv requires both --gt and --detections from the same evaluation")
     motion = load_motion(args.motion_csv)
     gt = load_numeric(args.gt, 11, delimiter=",")
     detections = load_numeric(args.detections, 5)
@@ -416,7 +444,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         run(args)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, ImportError) as exc:
         parser.error(str(exc))
 
 

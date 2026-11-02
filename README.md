@@ -485,6 +485,73 @@ with all gate choices using `--resume <checkpoint>`.
 
 Use `python main.py --help` for the complete list of options.
 
+## Motion covariance visualization from a checkpoint
+
+Run the trained detector and motion model directly from the standalone plotting
+script. No pre-existing prediction/GT/detection result files are needed:
+
+```bash
+python visualize_motion_uncertainty.py \
+  --checkpoint logs/RUN/Best_Multiview_Tracking_IDF1_gmvd_train.pth \
+  --data_root /dataset --sequence-id 0 --frames 100 110 \
+  --max-objects 3 --component total --formats png pdf \
+  --output-dir outputs/motion_from_checkpoint
+```
+
+This mode uses the project's CUDA/Mamba environment, including the RTX 5090
+Docker environment. It automatically reads the training `Settings` dictionary
+from `log.txt` beside the checkpoint. For relocated weights, use
+`--model-config /path/to/training/log.txt` or a JSON object containing the same
+settings. Explicit options such as `--mamba_d_model 1024`,
+`--mamba_uncertainty_mode separate_full`, `--evidential_head joint`, and
+`--motion_history_len 13` override saved settings. If no settings file is found,
+specify `--dataset` and the model/tracker options used for that checkpoint.
+Weights must match the complete detector and motion model: missing, unexpected,
+or differently sized parameters cause an error. Backbone pretraining is not
+downloaded when loading a checkpoint.
+
+For GMVD, `--sequence-id N` refers to the zero-based evaluation-row order in
+`train_datapath.csv` (`gmvd_train`) or `test_datapath.csv` (`gmvd_test`). Use
+`--gmvd-csv PATH` to select another split file. Relative sequence paths are
+resolved under `--data_root`. Alternatively, select a sequence with
+`--sequence scene5/config1/seq1`; its numeric ID is determined automatically.
+Add `--list-sequences` to list the actual ID/path mapping without loading images
+or model weights. Only the selected sequence is loaded for inference.
+
+`--frames` selects figures, not independent inference samples. The script runs
+every sampled evaluation frame from the beginning of that sequence through the
+last requested frame, in order, so earlier detections and motion rollouts build
+the history. Requested frame numbers must exist in the evaluation split and
+its sampling. Omit `--frames` to process and plot the complete selected sequence.
+
+The fresh `motion_uncertainty.csv`, `mota_gt.txt`, `all_res.txt`, and resolved
+`inference_settings.json` are saved in a new `OUTPUT_DIR/inference/RUN_ID/`
+directory. The script then plots those exact results under
+`OUTPUT_DIR/seq_N_NAME/`. Motion CSVs include total covariance and NIW `kappa`,
+so `--component total`, `aleatoric`, and `epistemic` are all available. The
+component controls only the plotted ellipse; the model's implicit covariance
+input remains controlled by `--implicit_motion_uncertainty_type`.
+
+Figures show GT, high-confidence detections, the pure motion prediction before
+detection replacement, and a covariance ellipse with semiaxes
+`sqrt(eigenvalues)`. They use equal axis units, no background grid, and no
+extra covariance multiplier. `--max-objects N` keeps N stable motion IDs and
+at most one nearby GT/detection per ID; this proximity selection is not an
+identity annotation or the tracker's actual assignment. Use `--xlim MIN MAX`
+and `--ylim MIN MAX` for a closer view without changing covariance values.
+
+CSV-only plotting is still supported with just NumPy and Matplotlib. For
+example, replot the inference output with another covariance component without
+running the checkpoint again:
+
+```bash
+python visualize_motion_uncertainty.py \
+  --motion-csv outputs/motion_from_checkpoint/inference/RUN_ID/motion_uncertainty.csv \
+  --gt outputs/motion_from_checkpoint/inference/RUN_ID/mota_gt.txt \
+  --detections outputs/motion_from_checkpoint/inference/RUN_ID/all_res.txt \
+  --frames 100 110 --max-objects 3 --component aleatoric
+```
+
 ## Notes
 
 - Pretrained checkpoints and datasets are not included.
