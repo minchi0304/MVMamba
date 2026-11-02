@@ -6,7 +6,7 @@ Run from the repository root, using files from the SAME evaluation:
     python visualize_motion_uncertainty.py \
         --motion-csv logs/RUN/motion_uncertainty_epoch_100.csv \
         --gt logs/RUN/mota_gt.txt --detections logs/RUN/all_res.txt \
-        --frames 100 105 --output-dir outputs/motion_plots --show-ids
+        --frames 100 105 --max-objects 3 --output-dir outputs/motion_plots --show-ids
 
 For GMVD/multiple sequences, also specify --sequence NAME --sequence-id N.
 NAME is the CSV sequence path (or its unique basename). N is its zero-based
@@ -37,6 +37,19 @@ different epoch's all_res. GT IDs and tracker IDs are separate namespaces;
 the plot shows contemporaneous points without inventing identity matches.
 No trajectory lines are drawn. Exported plotted_points_COMPONENT.csv retains
 frames/IDs so lines can be drawn separately later.
+
+--max-objects N selects the first N available motion track IDs in ascending
+order, keeping those same IDs across the requested frames (no replacements
+when a track is absent). --track-ids can restrict the candidate IDs first.
+Each frame then shows at most one nearby GT and one nearby detection per
+selected motion point, hence at most 3*N points and N ellipses. Context points
+are chosen by greedy shortest-distance, one-to-one selection among the frame's
+available motion points, within --context-radius (default 50 original grid
+cells). A context point is never reused. This is visualization-only spatial
+context, NOT the actual tracker assignment or a verified GT identity mapping.
+Absent context is left absent; GT IDs can change between frames. CSV columns
+context_track_id/context_distance record this display selection, in plotted
+coordinate units. Without --max-objects, existing independent filters apply.
 """
 
 import argparse
@@ -186,6 +199,44 @@ def prepare_points(motion, gt, detections, component, coordinate_scale, detectio
     return points
 
 
+def limit_objects(points, max_objects, context_radius):
+    """Keep stable motion IDs and unique nearby context, never infer true IDs."""
+    track_ids = sorted({p["id"] for p in points if p["source"] == "motion"})[:max_objects]
+    if not track_ids:
+        raise ValueError("--max-objects requires motion predictions after frame/ID filtering")
+    chosen = set(track_ids)
+    by_frame = {}
+    for point in points:
+        by_frame.setdefault(point["frame"], []).append(point)
+    selected = []
+    for frame_points in by_frame.values():
+        motion = sorted((p for p in frame_points if p["source"] == "motion"), key=lambda p: p["id"])
+        selected.extend(dict(p, context_track_id=p["id"], context_distance=0.)
+                        for p in motion if p["id"] in chosen)
+        for source in ("gt", "detection"):
+            candidates = [p for p in frame_points if p["source"] == source]
+            if not motion or not candidates:
+                continue
+            # Unselected motion points also compete for nearby context.
+            distances = np.linalg.norm(
+                np.array([p["xy"] for p in motion])[:, None, :]
+                - np.array([p["xy"] for p in candidates])[None, :, :], axis=-1,
+            )
+            pairs = sorted((float(distances[i, j]), int(i), int(j))
+                           for i, j in np.argwhere(distances <= context_radius))
+            used_motion, used_context = set(), set()
+            for distance, motion_index, context_index in pairs:
+                if motion_index in used_motion or context_index in used_context:
+                    continue
+                used_motion.add(motion_index)
+                used_context.add(context_index)
+                track_id = motion[motion_index]["id"]
+                if track_id in chosen:
+                    selected.append(dict(candidates[context_index], context_track_id=track_id,
+                                         context_distance=distance))
+    return selected, track_ids
+
+
 def plot_limits(points):
     bounds = []
     for point in points:
@@ -204,7 +255,7 @@ def plot_limits(points):
 
 
 def draw_frame(points, frame, sequence, component, ellipse_scale, xlim, ylim,
-               unit="grid cells", show_ids=False, invert_y=False):
+               unit="grid cells", show_ids=False, invert_y=False, nearby_context=False):
     fig, ax = plt.subplots(figsize=(9, 7))
     colors = {"gt": "#238443", "detection": "#2166ac", "motion": "#d73027"}
     styles = {"gt": ("x", "GT", 65), "detection": ("s", "Detection", 48),
@@ -218,9 +269,12 @@ def draw_frame(points, frame, sequence, component, ellipse_scale, xlim, ylim,
                                  facecolor="none", edgecolor=colors["motion"], linewidth=1.3, zorder=2))
         if show_ids and point["id"] is not None:
             prefix = "M" if point["source"] == "motion" else "G"
-            ax.annotate(f"{prefix}{point['id']}", point["xy"], xytext=(5, 5),
+            label_offset = (5, -13) if point["source"] == "motion" else (5, 7)
+            ax.annotate(f"{prefix}{point['id']}", point["xy"], xytext=label_offset,
                         textcoords="offset points", fontsize=8, color=colors[point["source"]])
     for source, (marker, label, size) in styles.items():
+        if nearby_context and source != "motion":
+            label += " (nearby)"
         xy = np.array([p["xy"] for p in points if p["source"] == source]).reshape(-1, 2)
         kwargs = dict(facecolors="none", edgecolors=colors[source]) if source == "detection" else dict(color=colors[source])
         ax.scatter(xy[:, 0], xy[:, 1], marker=marker, s=size, label=label, zorder=3, **kwargs)
@@ -241,14 +295,15 @@ def draw_frame(points, frame, sequence, component, ellipse_scale, xlim, ylim,
 
 def write_points(path, points, sequence, sequence_id, component):
     fields = ["sequence", "sequence_id", "frame", "source", "id", "x", "y", "score", "matched",
-              "component", "cov_xx", "cov_xy", "cov_yy"]
+              "component", "cov_xx", "cov_xy", "cov_yy", "context_track_id", "context_distance"]
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         for point in sorted(points, key=lambda p: (p["frame"], p["source"], p["id"] or 0)):
             row = dict(sequence=sequence, sequence_id=sequence_id, frame=point["frame"],
                        source=point["source"], id=point["id"], x=point["xy"][0], y=point["xy"][1],
-                       score=point.get("score"), matched=point.get("matched"))
+                       score=point.get("score"), matched=point.get("matched"),
+                       context_track_id=point.get("context_track_id"), context_distance=point.get("context_distance"))
             if point["source"] == "motion":
                 covariance = point["covariance"]
                 row.update(component=component, cov_xx=covariance[0, 0],
@@ -267,6 +322,8 @@ def build_parser():
     parser.add_argument("--frames", type=int, nargs="+", help="Frames to draw; default: all frames in the selected sequence")
     parser.add_argument("--track-ids", type=int, nargs="+", help="Filter motion predictions only")
     parser.add_argument("--gt-ids", type=int, nargs="+", help="Filter GT only; GT IDs are not tracker IDs")
+    parser.add_argument("--max-objects", type=int, help="Limit to N stable motion track IDs, plus at most one nearby GT/detection each")
+    parser.add_argument("--context-radius", type=float, default=50., help="Nearby point selection radius in original grid cells (default: 50); only with --max-objects")
     parser.add_argument("--component", choices=("total", "aleatoric", "epistemic"), default="total")
     parser.add_argument("--ellipse-scale", type=float, default=2., help="Ellipse semiaxis multiplier, not a coverage probability")
     parser.add_argument("--detection-order", choices=("auto", "xy", "yx"), default="auto")
@@ -288,6 +345,10 @@ def run(args):
         raise ValueError("--meters-per-cell and --ellipse-scale must be finite and positive")
     if args.dpi <= 0 or not math.isfinite(args.min_score) or not 0 <= args.min_score <= 1:
         raise ValueError("--dpi must be positive and --min-score must be in [0, 1]")
+    if args.max_objects is not None and args.max_objects <= 0:
+        raise ValueError("--max-objects must be positive")
+    if not math.isfinite(args.context_radius) or args.context_radius <= 0:
+        raise ValueError("--context-radius must be finite and positive")
     for limits in (args.xlim, args.ylim):
         if limits is not None and (not np.isfinite(limits).all() or limits[0] >= limits[1]):
             raise ValueError("Axis limits must be finite, with MIN < MAX")
@@ -311,6 +372,10 @@ def run(args):
         raise ValueError(f"No data for requested frame(s): {sorted(set(frames) - available_frames)}")
     points = prepare_points(motion, gt, detections, args.component, scale, order,
                             set(frames), args.track_ids, args.gt_ids, args.min_score, args.ellipse_scale)
+    selected_track_ids = None
+    if args.max_objects is not None:
+        points, selected_track_ids = limit_objects(points, args.max_objects, args.context_radius * scale)
+        print(f"Selected motion track IDs: {selected_track_ids}; GT/detection context uses proximity, not tracker assignment")
     if not points:
         raise ValueError("No points remain after applying filters")
     xlim, ylim = plot_limits(points)
@@ -325,7 +390,7 @@ def run(args):
     for frame in frames:
         fig = draw_frame(by_frame[frame], frame, sequence, args.component, args.ellipse_scale,
                          xlim, ylim, "m" if args.meters_per_cell is not None else "grid cells",
-                         args.show_ids, args.invert_y)
+                         args.show_ids, args.invert_y, nearby_context=args.max_objects is not None)
         try:
             for extension in dict.fromkeys(args.formats):
                 destination = output / f"frame_{frame:06d}_{args.component}.{extension}"
@@ -336,7 +401,8 @@ def run(args):
     write_points(output / f"plotted_points_{args.component}.csv", points, sequence, sequence_id, args.component)
     settings = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     settings.update(sequence=sequence, sequence_id=sequence_id, detection_order=order,
-                    frames=frames, xlim=list(xlim), ylim=list(ylim))
+                    frames=frames, xlim=list(xlim), ylim=list(ylim), selected_track_ids=selected_track_ids,
+                    context_selection="greedy_nearest_one_to_one" if args.max_objects is not None else None)
     (output / f"plot_settings_{args.component}.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
     print(f"Saved {len(files)} figure(s) and point coordinates to {output}")
     return files

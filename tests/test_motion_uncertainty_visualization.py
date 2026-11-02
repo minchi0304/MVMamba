@@ -128,6 +128,66 @@ class MotionUncertaintyVisualizationTests(unittest.TestCase):
         finally:
             plt.close(fig)
 
+    def test_object_limit_keeps_same_ids_across_frames_and_limits_all_sources(self):
+        points = []
+        for frame, ids in ((1, (30, 10, 20)), (2, (30, 20))):
+            for identity in ids:
+                for source, offset in (("motion", 0.), ("gt", .2), ("detection", .4)):
+                    points.append(dict(frame=frame, source=source,
+                                       id=None if source == "detection" else identity + (100 if source == "gt" else 0),
+                                       xy=np.array([identity + offset, 0.])))
+        selected, ids = viz.limit_objects(points, 2, 1.)
+        self.assertEqual(ids, [10, 20])
+        self.assertEqual(len([p for p in selected if p["frame"] == 1]), 6)
+        self.assertEqual(len([p for p in selected if p["frame"] == 2]), 3)
+        self.assertEqual({p["id"] for p in selected if p["frame"] == 2 and p["source"] == "motion"}, {20})
+        self.assertEqual({p["id"] for p in selected if p["source"] == "gt"}, {110, 120})
+        self.assertEqual({p["context_track_id"] for p in selected}, {10, 20})
+        self.assertTrue(all("context_track_id" not in p for p in points))
+
+    def test_context_is_unique_radius_gated_and_competes_with_unselected_tracks(self):
+        points = [dict(frame=1, source="motion", id=1, xy=np.array([0., 0.])),
+                  dict(frame=1, source="motion", id=2, xy=np.array([1., 0.])),
+                  dict(frame=1, source="gt", id=100, xy=np.array([.1, 0.])),
+                  dict(frame=1, source="gt", id=101, xy=np.array([100., 0.])),
+                  dict(frame=1, source="detection", id=None, xy=np.array([1., 0.]))]
+        selected, _ = viz.limit_objects(points, 1, 2.)
+        self.assertEqual([p["source"] for p in selected], ["motion", "gt"])
+        self.assertEqual(selected[-1]["id"], 100)
+        selected, _ = viz.limit_objects(points, 2, 2.)
+        self.assertEqual(len([p for p in selected if p["source"] == "gt"]), 1)
+        self.assertEqual(len([p for p in selected if p["source"] == "detection"]), 1)
+        self.assertEqual(next(p for p in selected if p["source"] == "detection")["context_track_id"], 2)
+
+    def test_limited_cli_exports_only_selected_context_with_metric_radius_conversion(self):
+        arguments = self.write_inputs(
+            records=[self.record, dict(self.record, track_id=99, predicted_x=100.)],
+            gt=[[0, 2, 7, -1, -1, -1, -1, 1, 11, 20, -1],
+                [0, 2, 8, -1, -1, -1, -1, 1, 101, 20, -1]],
+            detections=[[2, 12, 20, .9, 0], [2, 102, 20, .9, 0]],
+        )
+        args = viz.build_parser().parse_args(arguments + ["--max-objects", "1", "--context-radius", "3",
+                                                         "--meters-per-cell", ".1"])
+        files = viz.run(args)
+        with (files[0].parent / "plotted_points_total.csv").open() as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual(len(rows), 3)
+        self.assertEqual({r["context_track_id"] for r in rows}, {"42"})
+        detection = next(r for r in rows if r["source"] == "detection")
+        self.assertAlmostEqual(float(detection["context_distance"]), .2)
+        settings = json.loads((files[0].parent / "plot_settings_total.json").read_text())
+        self.assertEqual(settings["selected_track_ids"], [42])
+        self.assertEqual(settings["context_selection"], "greedy_nearest_one_to_one")
+        self.assertFalse(plt.get_fignums())
+
+    def test_object_limit_rejects_invalid_counts_and_missing_motion(self):
+        arguments = self.write_inputs(records=[])
+        for count in ("0", "-1"):
+            with self.subTest(count=count), self.assertRaisesRegex(ValueError, "positive"):
+                viz.run(viz.build_parser().parse_args(arguments + ["--max-objects", count]))
+        with self.assertRaisesRegex(ValueError, "requires motion"):
+            viz.run(viz.build_parser().parse_args(arguments + ["--max-objects", "3"]))
+
 
 if __name__ == "__main__":
     unittest.main()
