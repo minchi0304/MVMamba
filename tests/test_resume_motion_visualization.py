@@ -1,8 +1,11 @@
 """Resume plots consume the same evaluation pass, without rerunning inference."""
 
 import argparse
+import ast
 import csv
+import io
 import json
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -45,6 +48,56 @@ class ResumePlotSelectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             self.assertEqual(viz.plot_resume_results(plot_settings(), None, 1, folder, {0: [10]}), [])
 
+    def test_automatic_selection_uses_real_consecutive_ids_after_initial_observation(self):
+        dataset = SimpleNamespace(dataset_list=["seq"], datasets=[SimpleNamespace(frames=list(range(200, 210)))])
+        args = plot_settings("--motion_plot_consecutive", "5")
+        self.assertEqual(viz.resume_plot_plan(args, dataset), {0: [201, 202, 203, 204, 205]})
+        args.motion_plot_start_frame = 204
+        self.assertEqual(viz.resume_plot_plan(args, dataset), {0: [204, 205, 206, 207, 208]})
+        dataset.datasets[0].frames = [10, 11, 13, 20, 21, 22, 23, 24]
+        args.motion_plot_start_frame = None
+        self.assertEqual(viz.resume_plot_plan(args, dataset), {0: [20, 21, 22, 23, 24]})
+
+    def test_sampling_is_not_silently_treated_as_original_frame_continuity(self):
+        dataset = SimpleNamespace(dataset_list=["seq"], datasets=[SimpleNamespace(frames=[0, 10, 20, 30, 40, 50])])
+        args = plot_settings("--motion_plot_consecutive", "5")
+        args.dataset = "gmvd_train"
+        with self.assertRaisesRegex(ValueError, "no run of 5.*steps=\\[10\\].*gmvd_eval_all_frames"):
+            viz.resume_plot_plan(args, dataset)
+        for options in (("--motion_plot_consecutive", "0"), ("--motion_plot_start_frame", "0")):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                viz.resume_plot_plan(plot_settings(*options), dataset)
+        dataset.datasets[0].frames = [0]
+        with self.assertRaisesRegex(ValueError, "no run of 5"):
+            viz.resume_plot_plan(args, dataset)
+
+    def test_invalid_explicit_ids_report_actual_range_and_examples(self):
+        dataset = SimpleNamespace(dataset_list=["seq"], datasets=[SimpleNamespace(frames=list(range(100)))])
+        with self.assertRaisesRegex(ValueError, "count=100, range=0..99.*IDs=.*motion_plot_consecutive"):
+            viz.resume_plot_plan(plot_settings("--motion_plot_frames", "100", "101", "102", "103", "104"), dataset)
+
+    def test_all_frames_override_applies_only_to_gmvd_evaluation_rows(self):
+        # Execute the actual CLI dataset construction branch with lightweight
+        # constructors; avoid opening images or importing GPU libraries.
+        source = Path(__file__).resolve().parents[1] / "main.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        entry = next(node for node in tree.body if isinstance(node, ast.If) and "__name__" in ast.unparse(node.test))
+        branch = next(node for node in entry.body if isinstance(node, ast.If)
+                      and ast.unparse(node.test) == "'wildtrack' in args.dataset")
+        code = compile(ast.Module(body=[branch], type_ignores=[]), str(source), "exec")
+        for enabled in (False, True):
+            args = SimpleNamespace(dataset="gmvd_train", gmvd_eval_all_frames=enabled, aug=False,
+                                   motion_model="mamba", motion_train_history="detection",
+                                   motion_history_len=15, bev_gaussian_sigma=3.)
+            constructor = Mock(side_effect=lambda base, **kwargs: kwargs)
+            namespace = dict(args=args, os=os, csv=csv, GetDataset=constructor,
+                             MultiviewX=lambda path: SimpleNamespace(root=path), train_transform=None)
+            with patch("builtins.open", return_value=io.StringIO(
+                    "train,./scene/train,1,100\ntest,./scene/test,0,100\n")):
+                exec(code, namespace)
+            self.assertEqual(namespace["train_dataset_list"][0]["sample_require"], 100)
+            self.assertEqual(namespace["test_dataset_list"][0]["sample_require"], 0 if enabled else 100)
+
 
 @unittest.skipIf(torch is None, "PyTorch unavailable in standalone plotting environment")
 class ResumeEvaluationIntegrationTests(unittest.TestCase):
@@ -65,14 +118,14 @@ class ResumeEvaluationIntegrationTests(unittest.TestCase):
 
             def __init__(self):
                 base = SimpleNamespace(indexing="xy", world_grid_shape=(100, 200), metric_grid_cell=.1, grid_cell=10.)
-                self.datasets = [SimpleNamespace(frames=[10, 20, 30], base=base, grid_reduce=2) for _ in range(2)]
+                self.datasets = [SimpleNamespace(frames=[10, 11, 12], base=base, grid_reduce=2) for _ in range(2)]
                 self.dicts = {name: {"base": sub} for name, sub in zip(self.dataset_list, self.datasets)}
 
             def __len__(self):
                 return 6
 
             def __getitem__(self, index):
-                return dict(root=self.dataset_list[index // 3], frame=[10, 20, 30][index % 3],
+                return dict(root=self.dataset_list[index // 3], frame=[10, 11, 12][index % 3],
                             grid_gt=np.array([[14., 25., 99.]], dtype=np.float32), grid_gt_count=1), {}
 
         def decode(model, dataset, item, index, device, args):
@@ -88,7 +141,7 @@ class ResumeEvaluationIntegrationTests(unittest.TestCase):
             utils.write_motion_uncertainty_file(folder, epoch, loader, uncertainty)
             return 50.
 
-        settings = plot_settings("--motion_plot_seq_ids", "1", "--motion_plot_frames", "30",
+        settings = plot_settings("--motion_plot_seq_ids", "1", "--motion_plot_consecutive", "2",
                                  "--motion_plot_component", "epistemic", "--motion_plot_formats", "png")
         for key, (default, _, _) in OPTIONS.items():
             setattr(settings, key, default)
@@ -121,13 +174,13 @@ class ResumeEvaluationIntegrationTests(unittest.TestCase):
             self.assertEqual({row["kappa"] for row in plotted if row["sequence"] == dataset.dataset_list[1]}, {"3.0"})
             self.assertEqual({row["kappa"] for row in plotted if row["sequence"] == dataset.dataset_list[0]}, {""})
             output = root / "True" / "motion_uncertainty_plots" / "seq_1_seq1"
-            self.assertEqual(len(list(output.glob("*.png"))), 1)
+            self.assertEqual(len(list(output.glob("*.png"))), 2)
             self.assertFalse((output.parent / "seq_0_seq1").exists())
             with (output / "plotted_points_epistemic.csv").open() as stream:
                 points = list(csv.DictReader(stream))
             motion = next(row for row in points if row["source"] == "motion")
             self.assertEqual(float(motion["cov_xx"]), 1.)
-            self.assertEqual({row["frame"] for row in points}, {"30"})
+            self.assertEqual({row["frame"] for row in points}, {"11", "12"})
             metadata = json.loads((output / "plot_settings_epistemic.json").read_text())
             self.assertEqual(metadata["evaluation_checkpoint"], "weights.pth")
             self.assertEqual(metadata["evaluation_epoch"], 1)

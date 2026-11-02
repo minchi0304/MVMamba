@@ -445,7 +445,12 @@ def add_resume_plot_arguments(parser):
     group.add_argument("--plot_motion_uncertainty", action=argparse.BooleanOptionalAction, default=True,
                        help="Save covariance plots during resume with Mamba/BiMamba NIW (default: enabled)")
     group.add_argument("--motion_plot_seq_ids", type=int, nargs="+", help="Evaluation sequence IDs to plot; default: all")
-    group.add_argument("--motion_plot_frames", type=int, nargs="+", help="Frame IDs to plot; evaluation still processes every frame")
+    frames = group.add_mutually_exclusive_group()
+    frames.add_argument("--motion_plot_frames", type=int, nargs="+", help="Exact frame IDs to plot; evaluation still processes every frame")
+    frames.add_argument("--motion_plot_consecutive", type=int, metavar="N",
+                        help="Automatically choose N existing frame IDs spaced by exactly 1 (after the first evaluation frame)")
+    group.add_argument("--motion_plot_start_frame", type=int,
+                       help="Minimum frame ID for automatic consecutive selection; only with --motion_plot_consecutive")
     group.add_argument("--motion_plot_max_objects", type=int, default=3, help="Maximum stable motion IDs per plotted sequence (default: 3)")
     group.add_argument("--motion_plot_component", choices=("total", "aleatoric", "epistemic"), default="total")
     group.add_argument("--motion_plot_track_ids", type=int, nargs="+")
@@ -457,12 +462,43 @@ def add_resume_plot_arguments(parser):
     group.add_argument("--motion_plot_formats", choices=("png", "pdf", "svg"), nargs="+", default=["png", "pdf"])
 
 
+def _frame_inventory(frames):
+    if not frames:
+        return "Available evaluation frames: none"
+    steps = sorted({right - left for left, right in zip(frames, frames[1:])})
+    preview = str(frames) if len(frames) <= 12 else f"{frames[:6]} ... {frames[-6:]}"
+    return (f"Available evaluation frames: count={len(frames)}, range={frames[0]}..{frames[-1]}, "
+            f"steps={steps[:8]}, IDs={preview}")
+
+
+def _consecutive_plot_frames(available, count, start_frame=None):
+    # The first evaluation frame has no previous track observation. Start after
+    # it by default, while respecting an explicitly requested lower bound.
+    lower = start_frame if start_frame is not None else (available[1] if len(available) > 1 else None)
+    run = []
+    if lower is not None:
+        for frame in available:
+            if frame < lower:
+                continue
+            if run and frame != run[-1] + 1:
+                run = []
+            run.append(frame)
+            if len(run) == count:
+                return run
+    return []
+
+
 def resume_plot_plan(args, dataset):
     """Validate plot filters before inference; never filter the evaluation loader."""
     if args.motion_plot_max_objects <= 0:
         raise ValueError("--motion_plot_max_objects must be positive")
     if not np.isfinite(args.motion_plot_context_radius) or args.motion_plot_context_radius <= 0:
         raise ValueError("--motion_plot_context_radius must be finite and positive")
+    count = args.motion_plot_consecutive
+    if count is not None and count <= 0:
+        raise ValueError("--motion_plot_consecutive must be positive")
+    if args.motion_plot_start_frame is not None and count is None:
+        raise ValueError("--motion_plot_start_frame requires --motion_plot_consecutive")
     for limits in (args.motion_plot_xlim, args.motion_plot_ylim):
         if limits is not None and (not np.isfinite(limits).all() or limits[0] >= limits[1]):
             raise ValueError("Motion plot axis limits must be finite, with MIN < MAX")
@@ -471,13 +507,27 @@ def resume_plot_plan(args, dataset):
         raise ValueError("--motion_plot_seq_ids must be valid evaluation dataset_list indices")
     plan = {}
     for index in sequence_ids:
-        available = set(int(frame) for frame in dataset.datasets[index].frames)
-        frames = available if args.motion_plot_frames is None else set(args.motion_plot_frames)
-        if frames - available:
+        available = sorted({int(frame) for frame in dataset.datasets[index].frames})
+        inventory = _frame_inventory(available)
+        if count is not None:
+            frames = _consecutive_plot_frames(available, count, args.motion_plot_start_frame)
+            if not frames:
+                hint = (" For GMVD, --gmvd_eval_all_frames disables evaluation subsampling; "
+                        "the source data must still contain consecutive annotated frames."
+                        if getattr(args, "dataset", "") in ("gmvd_train", "gmvd_test") else "")
+                raise ValueError(f"Motion plot sequence {index}: no run of {count} consecutive frame IDs "
+                                 f"with the requested start/history condition. {inventory}.{hint}")
+        else:
+            frames = available if args.motion_plot_frames is None else sorted(set(args.motion_plot_frames))
+        missing = set(frames) - set(available)
+        if missing:
             raise ValueError(f"Motion plot sequence {index}: frame IDs outside its evaluation split/sampling: "
-                             f"{sorted(frames - available)}")
+                             f"{sorted(missing)}. {inventory}. "
+                             "Use --motion_plot_consecutive 5 to automatically choose an existing consecutive run.")
         if frames:
-            plan[index] = sorted(frames)
+            plan[index] = frames
+            print(f"Motion plot sequence {index} ({dataset.dataset_list[index]}): "
+                  f"{frames if len(frames) <= 12 else str(len(frames)) + ' frames'}")
     return plan
 
 

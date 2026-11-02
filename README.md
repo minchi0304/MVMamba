@@ -513,6 +513,27 @@ and frames, preserving history and metric coverage. Frames must exist in each
 selected sequence's evaluation split/sampling. Sequences without eligible
 motion predictions are skipped.
 
+To select five consecutive **original frame IDs** automatically, replace
+`--motion_plot_frames ...` with:
+
+```bash
+--motion_plot_seq_ids 0 --motion_plot_consecutive 5
+```
+
+This selects an existing run whose IDs differ by exactly one, starting after
+the first evaluation frame by default so a previous observation is available.
+The actual chosen IDs are printed. Use `--motion_plot_start_frame N` to set a
+minimum starting frame ID. Missing annotation frames break a run. Sampled IDs
+such as `0, 10, 20, 30, 40` are not accepted as five consecutive original frames.
+
+If GMVD subsampling prevents such a run, add `--gmvd_eval_all_frames` to
+`main.py`. This overrides `sample_require` with zero for all GMVD **test rows**,
+using every available evaluation frame while leaving training rows and the
+CSV files intact. It changes the evaluation time interval and evaluated frame
+set, not just the plotted subset. The source dataset must still contain the
+requested number of consecutive annotated frames. Invalid explicit frame IDs
+now report the actual available range, spacing, and example IDs.
+
 Use `--motion_plot_component aleatoric` or `epistemic` for the other NIW
 components. For the plotted sequences, the evaluation motion CSV also includes
 `kappa`; other sequences can have an empty value in this column. Additional

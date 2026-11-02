@@ -310,6 +310,7 @@ if __name__ == '__main__':
     parser.add_argument('--bev_gaussian_sigma', type=float, default=2.0, help='Gaussian sigma used to generate BEV occupancy targets')
     parser.add_argument('--multi_task_loss', type=str, default='uncertainty', choices=['plain', 'uncertainty'], help='Choose plain summed loss or learned uncertainty weights for each active task')
     parser.add_argument('--data_root', type=str, default='/dataset/Multiview_datasets', help='Root containing dataset folders')
+    parser.add_argument('--gmvd_eval_all_frames', action='store_true', help='Use every available GMVD evaluation frame, overriding sample_require for test rows only')
     parser.add_argument('-d', '--dataset', type=str, default='wildtrack', choices=['wildtrack', 'multiviewx', 'citytrack', 'mvcrowdtrack', 'gmvd_test','gmvd_train'], help='Choose dataset wildtrack/multiviewx/citytrack/mvcrowdtrack/gmvd (default: wildtrack)')
     parser.add_argument('-pr', '--pretrained', default=False, action='store_true', help='Use pretrained weights (default: True)')
     parser.add_argument('-j', '--num_workers', type=int, default=4)
@@ -329,6 +330,8 @@ if __name__ == '__main__':
     parser.add_argument('--optim', type=str, default='Adam', choices=['SGD', 'Adam'], help='Choose optimizer.(default : SGD)')
 
     args = parser.parse_args()
+    if args.gmvd_eval_all_frames and args.dataset not in ('gmvd_train', 'gmvd_test'):
+        parser.error('--gmvd_eval_all_frames requires gmvd_train or gmvd_test')
     if not np.isfinite(args.niw_reg_weight) or args.niw_reg_weight < 0:
         parser.error('--niw_reg_weight must be finite and non-negative')
     if args.motion_history_len < 1 or args.track_buffer < 0:
@@ -433,6 +436,9 @@ if __name__ == '__main__':
             else:
                 # test data
                 print("inside test")
+                if args.gmvd_eval_all_frames:
+                    sample_require = 0
+                    print('GMVD evaluation: using every available frame (sample_require=0)')
                 # dataset_obj = GetDataset(base, train=False, transform=train_transform, grid_reduce=4, img_reduce=4, train_ratio=train_ratio, sample_require=sample_require)
                 dataset_obj = GetDataset(base, train=False, transform=train_transform, grid_reduce=4, img_reduce=8, train_ratio=train_ratio, sample_require=sample_require, data_aug=False, bev_gaussian_sigma=args.bev_gaussian_sigma)
                 test_dataset_list.append(dataset_obj)
