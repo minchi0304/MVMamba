@@ -286,7 +286,7 @@ def draw_frame(points, frame, sequence, component, ellipse_scale, xlim, ylim,
            title=f"{_basename(sequence)} | frame {frame} | {component}")
     ax.set_aspect("equal", adjustable="box")
     ax.set_axisbelow(True)
-    ax.grid(alpha=.25)
+    ax.grid(False, which="both")
     if invert_y:
         ax.invert_yaxis()
     fig.tight_layout()
