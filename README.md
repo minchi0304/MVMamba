@@ -485,7 +485,44 @@ with all gate choices using `--resume <checkpoint>`.
 
 Use `python main.py --help` for the complete list of options.
 
-## Motion covariance visualization from a checkpoint
+## Motion covariance visualization during resume evaluation
+
+`python main.py ... --resume CHECKPOINT` automatically saves motion covariance
+plots when using Mamba/BiMamba with `--motion_loss niw`. The figures reuse the
+same evaluation pass and are written after evaluation to
+`logs/RUN/motion_uncertainty_plots/seq_N_NAME/`. No second model load or inference
+pass is performed. Keep the architecture and history options in your existing
+resume command consistent with the checkpoint; this path still uses the
+`main.py` model settings supplied on the command line.
+
+Append these options to the existing resume command to plot three objects in
+sequence 0 at frames 100 and 110:
+
+```bash
+--motion_plot_seq_ids 0 \
+--motion_plot_frames 100 110 \
+--motion_plot_max_objects 3 \
+--motion_plot_component total \
+--motion_plot_formats png pdf
+```
+
+By default, all evaluation sequences and frames are plotted, with at most three
+stable motion IDs per sequence, total covariance, and PNG/PDF output. Plot
+filters affect only the saved figures: evaluation still processes all sequences
+and frames, preserving history and metric coverage. Frames must exist in each
+selected sequence's evaluation split/sampling. Sequences without eligible
+motion predictions are skipped.
+
+Use `--motion_plot_component aleatoric` or `epistemic` for the other NIW
+components. For the plotted sequences, the evaluation motion CSV also includes
+`kappa`; other sequences can have an empty value in this column. Additional
+controls are `--motion_plot_track_ids`, `--motion_plot_gt_ids`,
+`--motion_plot_context_radius`, `--motion_plot_xlim`, `--motion_plot_ylim`, and
+`--motion_plot_show_ids`. Disable these covariance figures with
+`--no-plot_motion_uncertainty`. They are not automatically generated during
+training-epoch evaluation, Kalman evaluation, or smooth-L1 motion evaluation.
+
+## Standalone motion covariance visualization from a checkpoint
 
 Run the trained detector and motion model directly from the standalone plotting
 script. No pre-existing prediction/GT/detection result files are needed:

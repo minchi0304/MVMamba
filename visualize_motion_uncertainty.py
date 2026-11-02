@@ -439,6 +439,90 @@ def run(args):
     return files
 
 
+def add_resume_plot_arguments(parser):
+    """Options used by main.py; rendering still lives in this standalone file."""
+    group = parser.add_argument_group("Motion covariance plots during --resume evaluation")
+    group.add_argument("--plot_motion_uncertainty", action=argparse.BooleanOptionalAction, default=True,
+                       help="Save covariance plots during resume with Mamba/BiMamba NIW (default: enabled)")
+    group.add_argument("--motion_plot_seq_ids", type=int, nargs="+", help="Evaluation sequence IDs to plot; default: all")
+    group.add_argument("--motion_plot_frames", type=int, nargs="+", help="Frame IDs to plot; evaluation still processes every frame")
+    group.add_argument("--motion_plot_max_objects", type=int, default=3, help="Maximum stable motion IDs per plotted sequence (default: 3)")
+    group.add_argument("--motion_plot_component", choices=("total", "aleatoric", "epistemic"), default="total")
+    group.add_argument("--motion_plot_track_ids", type=int, nargs="+")
+    group.add_argument("--motion_plot_gt_ids", type=int, nargs="+")
+    group.add_argument("--motion_plot_context_radius", type=float, default=50., help="Nearby GT/detection selection radius in original grid cells")
+    group.add_argument("--motion_plot_xlim", type=float, nargs=2, metavar=("MIN", "MAX"))
+    group.add_argument("--motion_plot_ylim", type=float, nargs=2, metavar=("MIN", "MAX"))
+    group.add_argument("--motion_plot_show_ids", action="store_true")
+    group.add_argument("--motion_plot_formats", choices=("png", "pdf", "svg"), nargs="+", default=["png", "pdf"])
+
+
+def resume_plot_plan(args, dataset):
+    """Validate plot filters before inference; never filter the evaluation loader."""
+    if args.motion_plot_max_objects <= 0:
+        raise ValueError("--motion_plot_max_objects must be positive")
+    if not np.isfinite(args.motion_plot_context_radius) or args.motion_plot_context_radius <= 0:
+        raise ValueError("--motion_plot_context_radius must be finite and positive")
+    for limits in (args.motion_plot_xlim, args.motion_plot_ylim):
+        if limits is not None and (not np.isfinite(limits).all() or limits[0] >= limits[1]):
+            raise ValueError("Motion plot axis limits must be finite, with MIN < MAX")
+    sequence_ids = sorted(set(range(len(dataset.dataset_list)) if args.motion_plot_seq_ids is None else args.motion_plot_seq_ids))
+    if any(index < 0 or index >= len(dataset.dataset_list) for index in sequence_ids):
+        raise ValueError("--motion_plot_seq_ids must be valid evaluation dataset_list indices")
+    plan = {}
+    for index in sequence_ids:
+        available = set(int(frame) for frame in dataset.datasets[index].frames)
+        frames = available if args.motion_plot_frames is None else set(args.motion_plot_frames)
+        if frames - available:
+            raise ValueError(f"Motion plot sequence {index}: frame IDs outside its evaluation split/sampling: "
+                             f"{sorted(frames - available)}")
+        if frames:
+            plan[index] = sorted(frames)
+    return plan
+
+
+def plot_resume_results(args, dataset, epoch, res_dir, plan):
+    """Plot the just-completed evaluation files without loading/running a model."""
+    res_dir = Path(res_dir)
+    motion_csv = res_dir / f"motion_uncertainty_epoch_{epoch}.csv"
+    if not motion_csv.is_file():
+        print("Motion covariance plots skipped: this evaluation produced no motion predictions")
+        return []
+    motion = load_motion(motion_csv)
+    gt_path, detections_path = res_dir / "mota_gt.txt", res_dir / "all_res.txt"
+    gt, detections = load_numeric(gt_path, 11, ","), load_numeric(detections_path, 5)
+    files = []
+    for index, requested in plan.items():
+        root = dataset.dataset_list[index]
+        predictions = [row for row in motion if row["sequence"] == root]
+        eligible = [row for row in predictions if row["frame"] in requested
+                    and (args.motion_plot_track_ids is None or row["track_id"] in args.motion_plot_track_ids)]
+        if not eligible:
+            print(f"Motion covariance plots skipped for sequence {index}: no predictions for selected frames/IDs")
+            continue
+        # Entirely empty frames have no points to draw. This does not remove
+        # any frames from tracking or evaluation metrics.
+        available = ({row["frame"] for row in predictions}
+                     | {int(row[1]) for row in gt if int(row[0]) == index}
+                     | {int(row[0]) for row in detections if int(row[4]) == index})
+        frames = sorted(set(requested) & available)
+        if len(frames) != len(requested):
+            print(f"Motion plots sequence {index}: skipped empty frames {sorted(set(requested) - available)}")
+        plot_args = build_parser().parse_args([
+            "--motion-csv", str(motion_csv), "--gt", str(gt_path), "--detections", str(detections_path),
+        ])
+        plot_args.sequence, plot_args.sequence_id, plot_args.frames = root, index, frames
+        plot_args.output_dir = res_dir / "motion_uncertainty_plots"
+        for name in ("max_objects", "component", "track_ids", "gt_ids", "context_radius", "xlim", "ylim", "show_ids", "formats"):
+            setattr(plot_args, name, getattr(args, "motion_plot_" + name))
+        plot_args.detection_order = "xy" if dataset.datasets[index].base.indexing == "xy" else "yx"
+        plot_args.evaluation_checkpoint = args.resume
+        plot_args.evaluation_epoch = epoch
+        plot_args.evaluation_settings = vars(args).copy()
+        files.extend(run(plot_args))
+    return files
+
+
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)

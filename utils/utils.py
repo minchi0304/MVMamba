@@ -439,6 +439,8 @@ def write_motion_uncertainty_file(
         'cov_xy',
         'cov_yy',
     ]
+    if any('kappa' in row for rows in tracking_uncertainty_results.values() for row in rows):
+        fieldnames.append('kappa')
     with open(output_path, 'w', newline='') as output_file:
         writer = csv.DictWriter(output_file, fieldnames=fieldnames)
         writer.writeheader()

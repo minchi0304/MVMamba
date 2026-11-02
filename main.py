@@ -28,6 +28,7 @@ from detector.multiview_model import MultiView_Detection
 from detector.encoder import resnet18
 from tracker.mamba_motion_predictor import MambaMotionPredictor
 from tracker.bimamba_motion_predictor import BiMambaMotionPredictor
+from visualize_motion_uncertainty import add_resume_plot_arguments, resume_plot_plan, plot_resume_results
     
 ###################################################################################################################################
 score = []
@@ -174,11 +175,23 @@ def test(
     visualize_all_frames=False,
     plot_tracking_videos=False,
     plot_tracking_seq_ids=None,
+    plot_motion_uncertainty=False,
 ):
     model.eval()
 
     all_res_rows = []
     trackers_by_root = {}
+    motion_plot_plan = {}
+    if plot_motion_uncertainty:
+        if res_fpath is None:
+            raise ValueError('Motion covariance plots require an evaluation output path')
+        from motion_uncertainty_inference import build_logging_tracker
+        motion_plot_plan = resume_plot_plan(args, data_loader.dataset)
+        for sequence_id in motion_plot_plan:
+            root = data_loader.dataset.dataset_list[sequence_id]
+            trackers_by_root[root] = build_logging_tracker(
+                args, data_loader.dataset.dicts[root], device, model.motion_predictor,
+            )
     tracking_results = defaultdict(list)
     tracking_gt_results = defaultdict(list)
     tracking_uncertainty_results = defaultdict(list)
@@ -251,6 +264,8 @@ def test(
             plot_tracking_videos=plot_tracking_videos,
             plot_tracking_seq_ids=plot_tracking_seq_ids,
         )
+        if plot_motion_uncertainty:
+            plot_resume_results(args, data_loader.dataset, epoch, os.path.dirname(res_fpath), motion_plot_plan)
     else:
         moda = 0
 
@@ -308,6 +323,7 @@ if __name__ == '__main__':
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--visualize_all_frames', action='store_true', help='Save per-frame map images under maps_{epoch} during test')
     parser.add_argument('--plot_tracking_videos', action='store_true', help='Also save tracking trajectory and camera videos during test')
+    add_resume_plot_arguments(parser)
     parser.add_argument('--seed', type=int, default=1, help='random seed (default: 1)')
     parser.add_argument('--aug', action='store_true', help='Use train-time random resize/crop augmentation')
     parser.add_argument('--optim', type=str, default='Adam', choices=['SGD', 'Adam'], help='Choose optimizer.(default : SGD)')
@@ -509,6 +525,9 @@ if __name__ == '__main__':
             plot_tracking_seq_ids=[-1] if args.dataset == 'gmvd_test' else None,
             measure_fps=True,
             visualize_all_frames=args.visualize_all_frames,
+            plot_motion_uncertainty=(args.plot_motion_uncertainty
+                                     and args.motion_model in ('mamba', 'bimamba')
+                                     and args.motion_loss == 'niw'),
         )
         sys.exit(0)
 
