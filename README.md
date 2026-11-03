@@ -485,17 +485,13 @@ with all gate choices using `--resume <checkpoint>`.
 
 Use `python main.py --help` for the complete list of options.
 
-## Motion covariance visualization during resume evaluation
+## Resume evaluation and separate visualization
 
-`python main.py ... --resume CHECKPOINT` automatically saves motion covariance
-plots when using Mamba/BiMamba with `--motion_loss niw`. The figures reuse the
-same evaluation pass and are written after evaluation to
-`logs/RUN/motion_uncertainty_plots/seq_N_NAME/`. No second model load or inference
-pass is performed. Selected frames are combined into **one trajectory figure**
-per sequence and output format, named
-`trajectory_FIRSTFRAME_LASTFRAME_COMPONENT.png` (or PDF/SVG). Keep the architecture and history options in your existing
-resume command consistent with the checkpoint; this path still uses the
-`main.py` model settings supplied on the command line.
+`python main.py ... --resume CHECKPOINT` does **not** automatically generate
+motion covariance/trajectory figures. Run `visualize_motion_uncertainty.py`
+separately as shown below. Existing resume options for covariance plotting are
+opt-in only: `--plot_motion_uncertainty` explicitly enables that older workflow.
+Keep the model settings in the main.py resume command consistent with its checkpoint.
 
 Resume creates only the evaluation datasets and loader. Training images and
 training splits are not required. For GMVD, `-d gmvd_train --resume ...` reads
@@ -503,64 +499,6 @@ only the evaluation rows of `train_datapath.csv`, skipping training rows before
 opening their dataset directories. `-d gmvd_test --resume ...` uses evaluation
 rows from `test_datapath.csv`. The selected CSV is still required, and sequence
 IDs follow its evaluation-row order.
-
-Append these options to the existing resume command to plot three objects in
-sequence 0 at frames 100 and 110:
-
-```bash
---motion_plot_seq_ids 0 \
---motion_plot_frames 100 110 \
---motion_plot_max_objects 3 \
---motion_plot_component total \
---motion_plot_formats png pdf
-```
-
-By default, all evaluation sequences and frames are plotted, with at most three
-stable motion IDs per sequence, total covariance, and PNG/PDF output. Plot
-filters affect only the saved figures: evaluation still processes all sequences
-and frames, preserving history and metric coverage. Frames must exist in each
-selected sequence's evaluation split/sampling. Sequences without eligible
-motion predictions are skipped.
-
-Each motion track ID has one color throughout the selected time window. Motion
-uses circles with solid lines, GT uses crosses with dashed lines, and nearby
-detections use hollow squares with dotted lines. All frame-specific covariance
-ellipses use the same object color without resizing their covariance. Lines
-break across missing selected observations and GT identity changes. GT and
-detection color grouping still uses the documented proximity matching, not
-verified tracker/GT identity correspondence. The points CSV includes
-`object_label`/`object_color`, and the settings JSON records the color mapping.
-Use `--motion_plot_layout frames` only if separate images per frame are wanted.
-
-To select five consecutive **original frame IDs** automatically, replace
-`--motion_plot_frames ...` with:
-
-```bash
---motion_plot_seq_ids 0 --motion_plot_consecutive 5
-```
-
-This selects an existing run whose IDs differ by exactly one, starting after
-the first evaluation frame by default so a previous observation is available.
-The actual chosen IDs are printed. Use `--motion_plot_start_frame N` to set a
-minimum starting frame ID. Missing annotation frames break a run. Sampled IDs
-such as `0, 10, 20, 30, 40` are not accepted as five consecutive original frames.
-
-If GMVD subsampling prevents such a run, add `--gmvd_eval_all_frames` to
-`main.py`. This overrides `sample_require` with zero for all GMVD **test rows**,
-using every available evaluation frame while leaving training rows and the
-CSV files intact. It changes the evaluation time interval and evaluated frame
-set, not just the plotted subset. The source dataset must still contain the
-requested number of consecutive annotated frames. Invalid explicit frame IDs
-now report the actual available range, spacing, and example IDs.
-
-Use `--motion_plot_component aleatoric` or `epistemic` for the other NIW
-components. For the plotted sequences, the evaluation motion CSV also includes
-`kappa`; other sequences can have an empty value in this column. Additional
-controls are `--motion_plot_track_ids`, `--motion_plot_gt_ids`,
-`--motion_plot_context_radius`, `--motion_plot_xlim`, `--motion_plot_ylim`, and
-`--motion_plot_show_ids`. Disable these covariance figures with
-`--no-plot_motion_uncertainty`. They are not automatically generated during
-training-epoch evaluation, Kalman evaluation, or smooth-L1 motion evaluation.
 
 ## Standalone motion covariance visualization from a checkpoint
 
@@ -570,7 +508,8 @@ script. No pre-existing prediction/GT/detection result files are needed:
 ```bash
 python visualize_motion_uncertainty.py \
   --checkpoint logs/RUN/Best_Multiview_Tracking_IDF1_gmvd_train.pth \
-  --data_root /dataset --sequence-id 0 --frames 100 110 \
+  --data_root /dataset --sequence-id 0 --gmvd-eval-all-frames \
+  --consecutive-frames 5 \
   --max-objects 3 --component total --formats png pdf \
   --output-dir outputs/motion_from_checkpoint
 ```
@@ -599,7 +538,18 @@ or model weights. Only the selected sequence is loaded for inference.
 every sampled evaluation frame from the beginning of that sequence through the
 last requested frame, in order, so earlier detections and motion rollouts build
 the history. Requested frame numbers must exist in the evaluation split and
-its sampling. Omit `--frames` to process and plot the complete selected sequence.
+its sampling. Instead of specifying frame numbers, use `--consecutive-frames 5`
+to automatically select five existing original IDs spaced by exactly one.
+`--start-frame N` sets a minimum start ID; by default one earlier frame is left
+for tracking history. Missing annotation frames break a run. With neither
+frame-selection option, the entire selected sequence is processed and plotted.
+
+For GMVD checkpoint inference, `--gmvd-eval-all-frames` (also accepted as
+`--gmvd_eval_all_frames`) overrides the evaluation CSV's `sample_require` with
+zero for this run. This changes the inference interval to every available
+frame without modifying the CSV or running main.py. Source annotations must
+still contain consecutive IDs. Saved CSVs cannot recover skipped frames, so
+this option requires `--checkpoint`; use existing sampled IDs for CSV-only plots.
 
 The fresh `motion_uncertainty.csv`, `mota_gt.txt`, `all_res.txt`, and resolved
 `inference_settings.json` are saved in a new `OUTPUT_DIR/inference/RUN_ID/`
@@ -611,7 +561,13 @@ input remains controlled by `--implicit_motion_uncertainty_type`.
 
 By default, all selected frames are combined in one trajectory figure per
 sequence and format (`--layout trajectory`). Use `--layout frames` for separate
-frame figures. Figures show GT, high-confidence detections, the pure motion prediction before
+frame figures. Files are named `trajectory_FIRSTFRAME_LASTFRAME_COMPONENT.png`
+(or PDF/SVG). Each object retains one color throughout the window: motion uses
+circles/solid lines, GT crosses/dashed lines, and detections hollow squares/dotted
+lines. Covariance ellipses share the object's color. Lines break across missing
+selected observations and GT identity changes. The points CSV includes
+`object_label`/`object_color`, and settings JSON records the color mapping.
+Figures show GT, high-confidence detections, the pure motion prediction before
 detection replacement, and a covariance ellipse with semiaxes
 `sqrt(eigenvalues)`. They use equal axis units, no background grid, and no
 extra covariance multiplier. `--max-objects N` keeps N stable motion IDs and

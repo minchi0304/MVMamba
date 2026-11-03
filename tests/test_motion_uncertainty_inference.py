@@ -78,6 +78,10 @@ class InferenceSettingsTests(unittest.TestCase):
         self.assertEqual(Path(specs[0]["root"]), self.root / "scene5/config2/seq1")
         self.assertEqual(inference.choose_sequence(specs, sequence_id=1), specs[1])
         self.assertEqual(inference.choose_sequence(specs, "scene5/config1/seq1"), specs[1])
+        dense_specs = inference.sequence_specs(settings, split, all_frames=True)
+        self.assertEqual([s["sample_require"] for s in dense_specs], [0, 0])
+        self.assertEqual([s["sample_require"] for s in specs], [100, 100])
+        self.assertEqual([s["root"] for s in dense_specs], [s["root"] for s in specs])
         with self.assertRaisesRegex(ValueError, "one sequence"):
             inference.choose_sequence(specs, "seq1")
         with self.assertRaisesRegex(ValueError, "matching"):
@@ -93,6 +97,20 @@ class InferenceSettingsTests(unittest.TestCase):
         self.assertEqual(selected, [10, 30])
         with self.assertRaisesRegex(ValueError, "sampling"):
             inference.inference_frames([0, 10, 20], [11])
+
+    def test_standalone_consecutive_frames_preserve_inference_warmup(self):
+        args = self.arguments("--consecutive-frames", "5", "--start-frame", "204", "--gmvd-eval-all-frames")
+        self.assertTrue(args.gmvd_eval_all_frames)
+        processed, selected = inference.inference_frames(range(200, 220), args.frames, args.consecutive_frames, args.start_frame)
+        self.assertEqual(processed, list(range(200, 209)))
+        self.assertEqual(selected, list(range(204, 209)))
+        self.assertEqual(inference.select_plot_frames(range(200, 210), consecutive=5), list(range(201, 206)))
+        with self.assertRaisesRegex(ValueError, "steps=\\[23\\].*gmvd-eval-all-frames"):
+            inference.select_plot_frames(range(0, 2393, 23), consecutive=5)
+        with self.assertRaisesRegex(ValueError, "requires --consecutive"):
+            viz.run(self.arguments("--start-frame", "0"))
+        with self.assertRaisesRegex(ValueError, "positive"):
+            viz.run(self.arguments("--consecutive-frames", "0"))
 
     def test_checkpoint_cli_plots_only_fresh_results_with_component_decomposition(self):
         args = self.arguments("--frames", "20", "--component", "aleatoric", "--max-objects", "1",

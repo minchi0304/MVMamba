@@ -202,7 +202,7 @@ class MotionUncertaintyVisualizationTests(unittest.TestCase):
                 gt.append([0, frame, identity, -1, -1, -1, -1, 1, x + .1, y + .2, -1])
                 detections.append([frame, x + .2, y + .3, .9, 0])
         args = viz.build_parser().parse_args(self.write_inputs(records, gt, detections) + [
-            "--max-objects", "2", "--frames", "1", "2", "3", "4", "5", "--formats", "png", "pdf", "svg"])
+            "--max-objects", "2", "--consecutive-frames", "5", "--start-frame", "1", "--formats", "png", "pdf", "svg"])
         files = viz.run(args)
         self.assertEqual(len(files), 3)
         self.assertTrue(all(path.name.startswith("trajectory_000001_000005_total") for path in files))

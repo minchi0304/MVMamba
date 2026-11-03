@@ -52,6 +52,8 @@ def add_inference_arguments(parser):
     group = parser.add_argument_group("Checkpoint inference (settings from log.txt, then explicit overrides)")
     group.add_argument("--model-config", type=Path, help="Training log.txt or JSON settings; default: log.txt beside checkpoint")
     group.add_argument("--gmvd-csv", type=Path, help="GMVD split CSV; default: train_datapath.csv or test_datapath.csv in repository")
+    group.add_argument("--gmvd-eval-all-frames", "--gmvd_eval_all_frames", action="store_true",
+                       help="Disable GMVD evaluation subsampling for this standalone checkpoint run")
     group.add_argument("--device", default="cuda", help="Inference device, e.g. cuda or cuda:1")
     for name, (_, value_type, choices) in OPTIONS.items():
         flags = ["--" + name]
@@ -116,8 +118,10 @@ def resolve_settings(args):
     return argparse.Namespace(**values), config
 
 
-def sequence_specs(settings, gmvd_csv=None):
+def sequence_specs(settings, gmvd_csv=None, all_frames=False):
     root = Path(settings.data_root).expanduser()
+    if all_frames and not settings.dataset.startswith("gmvd"):
+        raise ValueError("--gmvd-eval-all-frames requires gmvd_train or gmvd_test")
     if settings.dataset.startswith("gmvd"):
         split = gmvd_csv or Path(__file__).parent / ("train_datapath.csv" if settings.dataset == "gmvd_train" else "test_datapath.csv")
         specs = []
@@ -133,7 +137,8 @@ def sequence_specs(settings, gmvd_csv=None):
                 if not np.isfinite(ratio) or not 0 <= ratio < 1 or samples < 0:
                     raise ValueError(f"{split}: invalid evaluation split settings for {path}")
                 specs.append(dict(sequence_id=len(specs), root=str(path), train_ratio=ratio,
-                                  sample_require=samples, kind="wildtrack" if path.name == "Wildtrack" else "multiviewx"))
+                                  sample_require=0 if all_frames else samples,
+                                  kind="wildtrack" if path.name == "Wildtrack" else "multiviewx"))
         if not specs:
             raise ValueError(f"{split}: no evaluation sequences")
         return specs
@@ -158,14 +163,54 @@ def choose_sequence(specs, name=None, sequence_id=None):
     return candidates[0]
 
 
-def inference_frames(available, requested=None):
-    available = sorted(int(frame) for frame in available)
+def frame_inventory(frames):
+    if not frames:
+        return "Available evaluation frames: none"
+    steps = sorted({right - left for left, right in zip(frames, frames[1:])})
+    preview = str(frames) if len(frames) <= 12 else f"{frames[:6]} ... {frames[-6:]}"
+    return (f"Available evaluation frames: count={len(frames)}, range={frames[0]}..{frames[-1]}, "
+            f"steps={steps[:8]}, IDs={preview}")
+
+
+def select_plot_frames(available, requested=None, consecutive=None, start_frame=None):
+    available = sorted({int(frame) for frame in available})
+    if consecutive is not None:
+        if consecutive <= 0:
+            raise ValueError("--consecutive-frames must be positive")
+        if requested is not None:
+            raise ValueError("Use --frames or --consecutive-frames, not both")
+    elif start_frame is not None:
+        raise ValueError("--start-frame requires --consecutive-frames")
     if not available:
         raise ValueError("The selected evaluation sequence has no frames")
+    if consecutive is not None:
+        # Retain one earlier observation by default; explicit lower bounds can
+        # include the first frame, which has no motion prediction yet.
+        lower = start_frame if start_frame is not None else (available[1] if len(available) > 1 else None)
+        run = []
+        if lower is not None:
+            for frame in available:
+                if frame < lower:
+                    continue
+                if run and frame != run[-1] + 1:
+                    run = []
+                run.append(frame)
+                if len(run) == consecutive:
+                    return run
+        raise ValueError(f"No run of {consecutive} consecutive frame IDs with the requested start/history condition. "
+                         f"{frame_inventory(available)}. For GMVD checkpoint inference, "
+                         "--gmvd-eval-all-frames disables subsampling; consecutive source annotations are still required.")
     selected = available if requested is None else sorted(set(requested))
     missing = set(selected) - set(available)
     if not selected or missing:
-        raise ValueError(f"Requested frames are outside this evaluation split/sampling: {sorted(missing)}")
+        raise ValueError(f"Requested frames are outside this evaluation split/sampling: {sorted(missing)}. "
+                         f"{frame_inventory(available)}. Use --consecutive-frames 5 to automatically select existing frames.")
+    return selected
+
+
+def inference_frames(available, requested=None, consecutive=None, start_frame=None):
+    available = sorted({int(frame) for frame in available})
+    selected = select_plot_frames(available, requested, consecutive, start_frame)
     # Include every previous evaluation frame, even for a sparse plot request.
     return [frame for frame in available if frame <= selected[-1]], selected
 
@@ -330,7 +375,7 @@ def write_inference(output, result, metadata):
 
 def run_checkpoint(args):
     settings, config = resolve_settings(args)
-    specs = sequence_specs(settings, args.gmvd_csv)
+    specs = sequence_specs(settings, args.gmvd_csv, all_frames=args.gmvd_eval_all_frames)
     if args.list_sequences:
         for spec in specs:
             print(f"{spec['sequence_id']}: {spec['root']}")
@@ -349,16 +394,18 @@ def run_checkpoint(args):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     dataset = build_dataset(settings, spec)
-    inference_frames(dataset.datasets[0].frames, args.frames)  # Fail before model loading for invalid frame IDs.
+    _, selected = inference_frames(dataset.datasets[0].frames, args.frames, args.consecutive_frames, args.start_frame)
+    print(f"Selected plot frames: {selected if len(selected) <= 12 else str(len(selected)) + ' frames'}", flush=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     output = args.output_dir / "inference" / stamp
     model = build_model(settings, args.checkpoint.expanduser(), device, output)
     print(f"Loaded checkpoint: {args.checkpoint} (strict state_dict match)", flush=True)
-    result = infer_sequence(model, dataset, settings, spec, device, args.frames)
+    result = infer_sequence(model, dataset, settings, spec, device, selected)
     paths = write_inference(output, result, dict(
         checkpoint=str(args.checkpoint.expanduser().resolve()), model_config=str(config) if config else None,
         model_settings=vars(settings), sequence_id=spec["sequence_id"], split=spec,
         gmvd_csv=str(args.gmvd_csv) if args.gmvd_csv else None,
+        gmvd_eval_all_frames=args.gmvd_eval_all_frames,
     ))
     for key, value in paths.items():
         setattr(args, key, value)

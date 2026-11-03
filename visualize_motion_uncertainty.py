@@ -4,7 +4,8 @@ Run a trained checkpoint and plot its fresh inference results:
 
     python visualize_motion_uncertainty.py \
         --checkpoint logs/RUN/Best_Multiview_Tracking_IDF1_gmvd_train.pth \
-        --data_root /dataset --sequence-id 0 --frames 100 110 --max-objects 3
+        --data_root /dataset --sequence-id 0 --gmvd-eval-all-frames \
+        --consecutive-frames 5 --max-objects 3
 
 Checkpoint mode needs the project's CUDA/Mamba environment. Model settings are
 read from log.txt beside the checkpoint, or --model-config LOG_OR_JSON, with
@@ -13,8 +14,13 @@ evaluation sequence is loaded, and every evaluation frame from its start through
 the last requested frame is processed to preserve tracking history. GMVD IDs
 are mapped automatically from the split CSV; --sequence OR --sequence-id is
 sufficient. --list-sequences lists the actual ID/path mapping without inference.
+--consecutive-frames N selects existing original IDs spaced by exactly one;
+--start-frame sets a minimum start ID. --gmvd-eval-all-frames disables GMVD
+subsampling for this checkpoint run without changing the split CSV. The default
+automatic start leaves one earlier evaluation frame for tracking history.
 Fresh CSVs (including NIW kappa) and inference settings are saved below
 OUTPUT_DIR/inference/RUN_ID, then used directly to generate the figures.
+main.py --resume does not automatically generate these covariance plots.
 
 Alternatively, CSV-only plotting needs only NumPy and Matplotlib (no model/GPU
 imports). Use files from the SAME evaluation:
@@ -83,7 +89,7 @@ import math
 from pathlib import Path
 import re
 
-from motion_uncertainty_inference import add_inference_arguments, run_checkpoint
+from motion_uncertainty_inference import add_inference_arguments, run_checkpoint, select_plot_frames
 
 import matplotlib
 matplotlib.use("Agg")
@@ -458,7 +464,10 @@ def build_parser():
     parser.add_argument("--sequence", help="Sequence path or unique name; checkpoint mode also accepts scene/config/seq")
     parser.add_argument("--sequence-id", type=int, help="Evaluation sequence index; checkpoint mode resolves the matching path automatically")
     parser.add_argument("--list-sequences", action="store_true", help="Print available names/IDs and exit")
-    parser.add_argument("--frames", type=int, nargs="+", help="Frames to draw; default: all frames in the selected sequence")
+    frames = parser.add_mutually_exclusive_group()
+    frames.add_argument("--frames", type=int, nargs="+", help="Exact frames to draw; default: all frames in the selected sequence")
+    frames.add_argument("--consecutive-frames", type=int, metavar="N", help="Choose N existing original frame IDs spaced by 1")
+    parser.add_argument("--start-frame", type=int, help="Minimum frame ID for --consecutive-frames")
     parser.add_argument("--layout", choices=("trajectory", "frames"), default="trajectory",
                         help="Combine selected frames in one trajectory figure (default), or save separate frames")
     parser.add_argument("--track-ids", type=int, nargs="+", help="Filter motion predictions only")
@@ -481,6 +490,10 @@ def build_parser():
 
 
 def run(args):
+    if args.consecutive_frames is not None and args.consecutive_frames <= 0:
+        raise ValueError("--consecutive-frames must be positive")
+    if args.start_frame is not None and args.consecutive_frames is None:
+        raise ValueError("--start-frame requires --consecutive-frames")
     scale = 1. if args.meters_per_cell is None else args.meters_per_cell
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError("--meters-per-cell must be finite and positive")
@@ -500,6 +513,8 @@ def run(args):
             return []
     elif args.gt is None or args.detections is None:
         raise ValueError("--motion-csv requires both --gt and --detections from the same evaluation")
+    elif args.gmvd_eval_all_frames:
+        raise ValueError("--gmvd-eval-all-frames requires --checkpoint; existing CSVs cannot supply unsaved frames")
     motion = load_motion(args.motion_csv)
     gt = load_numeric(args.gt, 11, delimiter=",")
     detections = load_numeric(args.detections, 5)
@@ -515,9 +530,9 @@ def run(args):
     if order == "auto":
         order = "yx" if _basename(sequence).lower() == "wildtrack" else "xy"
     available_frames = {r["frame"] for r in motion} | {int(v) for v in gt[:, 1]} | {int(v) for v in detections[:, 0]}
-    frames = sorted(available_frames if args.frames is None else set(args.frames))
-    if not frames or set(frames) - available_frames:
-        raise ValueError(f"No data for requested frame(s): {sorted(set(frames) - available_frames)}")
+    frames = select_plot_frames(available_frames, args.frames,
+                                None if args.checkpoint else args.consecutive_frames,
+                                None if args.checkpoint else args.start_frame)
     points = prepare_points(motion, gt, detections, args.component, scale, order,
                             set(frames), args.track_ids, args.gt_ids, args.min_score)
     selected_track_ids = None
@@ -571,8 +586,8 @@ def run(args):
 def add_resume_plot_arguments(parser):
     """Options used by main.py; rendering still lives in this standalone file."""
     group = parser.add_argument_group("Motion covariance plots during --resume evaluation")
-    group.add_argument("--plot_motion_uncertainty", action=argparse.BooleanOptionalAction, default=True,
-                       help="Save covariance plots during resume with Mamba/BiMamba NIW (default: enabled)")
+    group.add_argument("--plot_motion_uncertainty", action=argparse.BooleanOptionalAction, default=False,
+                       help="Explicitly enable covariance plots during resume (default: disabled; use the standalone script)")
     group.add_argument("--motion_plot_seq_ids", type=int, nargs="+", help="Evaluation sequence IDs to plot; default: all")
     frames = group.add_mutually_exclusive_group()
     frames.add_argument("--motion_plot_frames", type=int, nargs="+", help="Exact frame IDs to plot; evaluation still processes every frame")
@@ -591,32 +606,6 @@ def add_resume_plot_arguments(parser):
     group.add_argument("--motion_plot_ylim", type=float, nargs=2, metavar=("MIN", "MAX"))
     group.add_argument("--motion_plot_show_ids", action="store_true")
     group.add_argument("--motion_plot_formats", choices=("png", "pdf", "svg"), nargs="+", default=["png", "pdf"])
-
-
-def _frame_inventory(frames):
-    if not frames:
-        return "Available evaluation frames: none"
-    steps = sorted({right - left for left, right in zip(frames, frames[1:])})
-    preview = str(frames) if len(frames) <= 12 else f"{frames[:6]} ... {frames[-6:]}"
-    return (f"Available evaluation frames: count={len(frames)}, range={frames[0]}..{frames[-1]}, "
-            f"steps={steps[:8]}, IDs={preview}")
-
-
-def _consecutive_plot_frames(available, count, start_frame=None):
-    # The first evaluation frame has no previous track observation. Start after
-    # it by default, while respecting an explicitly requested lower bound.
-    lower = start_frame if start_frame is not None else (available[1] if len(available) > 1 else None)
-    run = []
-    if lower is not None:
-        for frame in available:
-            if frame < lower:
-                continue
-            if run and frame != run[-1] + 1:
-                run = []
-            run.append(frame)
-            if len(run) == count:
-                return run
-    return []
 
 
 def resume_plot_plan(args, dataset):
@@ -638,23 +627,13 @@ def resume_plot_plan(args, dataset):
         raise ValueError("--motion_plot_seq_ids must be valid evaluation dataset_list indices")
     plan = {}
     for index in sequence_ids:
-        available = sorted({int(frame) for frame in dataset.datasets[index].frames})
-        inventory = _frame_inventory(available)
-        if count is not None:
-            frames = _consecutive_plot_frames(available, count, args.motion_plot_start_frame)
-            if not frames:
-                hint = (" For GMVD, --gmvd_eval_all_frames disables evaluation subsampling; "
-                        "the source data must still contain consecutive annotated frames."
-                        if getattr(args, "dataset", "") in ("gmvd_train", "gmvd_test") else "")
-                raise ValueError(f"Motion plot sequence {index}: no run of {count} consecutive frame IDs "
-                                 f"with the requested start/history condition. {inventory}.{hint}")
-        else:
-            frames = available if args.motion_plot_frames is None else sorted(set(args.motion_plot_frames))
-        missing = set(frames) - set(available)
-        if missing:
-            raise ValueError(f"Motion plot sequence {index}: frame IDs outside its evaluation split/sampling: "
-                             f"{sorted(missing)}. {inventory}. "
-                             "Use --motion_plot_consecutive 5 to automatically choose an existing consecutive run.")
+        available = dataset.datasets[index].frames
+        try:
+            frames = select_plot_frames(available, args.motion_plot_frames, count, args.motion_plot_start_frame)
+        except ValueError as exc:
+            message = str(exc).replace("No run", "no run").replace("--consecutive-frames", "--motion_plot_consecutive")
+            message = message.replace("--start-frame", "--motion_plot_start_frame").replace("--gmvd-eval-all-frames", "--gmvd_eval_all_frames")
+            raise ValueError(f"Motion plot sequence {index}: {message}") from exc
         if frames:
             plan[index] = frames
             print(f"Motion plot sequence {index} ({dataset.dataset_list[index]}): "

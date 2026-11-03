@@ -34,7 +34,8 @@ class ResumePlotSelectionTests(unittest.TestCase):
     def test_default_and_disabled_plots_and_sequence_frame_selection(self):
         dataset = SimpleNamespace(dataset_list=["seq1", "seq2"], datasets=[
             SimpleNamespace(frames=[10, 20]), SimpleNamespace(frames=[100, 110])])
-        self.assertTrue(plot_settings().plot_motion_uncertainty)
+        self.assertFalse(plot_settings().plot_motion_uncertainty)
+        self.assertTrue(plot_settings("--plot_motion_uncertainty").plot_motion_uncertainty)
         self.assertFalse(plot_settings("--no-plot_motion_uncertainty").plot_motion_uncertainty)
         self.assertEqual(viz.resume_plot_plan(plot_settings(), dataset), {0: [10, 20], 1: [100, 110]})
         args = plot_settings("--motion_plot_seq_ids", "1", "--motion_plot_frames", "110")
@@ -161,11 +162,13 @@ class ResumeEvaluationIntegrationTests(unittest.TestCase):
                         patch.object(utils, "decode_frame", side_effect=decode) as decoder, \
                         patch.object(utils, "finalize_results", side_effect=finalize), \
                         patch.object(viz, "run_checkpoint", side_effect=AssertionError("Must not rerun the model")):
-                    score = main.test(model, 1, loader, str(folder / "eval.txt"), plot_motion_uncertainty=enabled)
+                    options = {"plot_motion_uncertainty": True} if enabled else {}
+                    score = main.test(model, 1, loader, str(folder / "eval.txt"), **options)
                 self.assertEqual(score, 50.)
                 self.assertEqual(decoder.call_count, 6)  # Both sequences and all frames, irrespective of plot filters.
             for filename in ("mota_pred.txt", "mota_gt.txt", "all_res.txt"):
                 self.assertEqual((root / "False" / filename).read_bytes(), (root / "True" / filename).read_bytes())
+            self.assertFalse((root / "False" / "motion_uncertainty_plots").exists())
             with (root / "False" / "motion_uncertainty_epoch_1.csv").open() as stream:
                 baseline = list(csv.DictReader(stream))
             with (root / "True" / "motion_uncertainty_epoch_1.csv").open() as stream:
