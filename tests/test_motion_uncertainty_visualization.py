@@ -99,7 +99,7 @@ class MotionUncertaintyVisualizationTests(unittest.TestCase):
             detections=[[2, 20, 10, .9, 0]],
         )
         files = viz.run(viz.build_parser().parse_args(args + ["--frames", "1", "2", "--meters-per-cell", ".1",
-                                                             "--component", "aleatoric", "--formats", "png", "svg", "pdf"]))
+                                                             "--layout", "frames", "--component", "aleatoric", "--formats", "png", "svg", "pdf"]))
         self.assertEqual(len(files), 6)
         self.assertTrue(all(path.stat().st_size > 100 for path in files))
         output = files[0].parent
@@ -192,6 +192,84 @@ class MotionUncertaintyVisualizationTests(unittest.TestCase):
                 viz.run(viz.build_parser().parse_args(arguments + ["--max-objects", count]))
         with self.assertRaisesRegex(ValueError, "requires motion"):
             viz.run(viz.build_parser().parse_args(arguments + ["--max-objects", "3"]))
+
+    def test_five_frames_export_one_trajectory_per_format_with_consistent_object_colors(self):
+        records, gt, detections = [], [], []
+        for frame in (5, 1, 4, 2, 3):
+            for track, identity, offset in ((42, 7, 0.), (99, 8, 30.)):
+                x, y = offset + frame * 2., offset + frame
+                records.append(dict(self.record, frame=frame, track_id=track, predicted_x=x, predicted_y=y))
+                gt.append([0, frame, identity, -1, -1, -1, -1, 1, x + .1, y + .2, -1])
+                detections.append([frame, x + .2, y + .3, .9, 0])
+        args = viz.build_parser().parse_args(self.write_inputs(records, gt, detections) + [
+            "--max-objects", "2", "--frames", "1", "2", "3", "4", "5", "--formats", "png", "pdf", "svg"])
+        files = viz.run(args)
+        self.assertEqual(len(files), 3)
+        self.assertTrue(all(path.name.startswith("trajectory_000001_000005_total") for path in files))
+        self.assertTrue(all(path.stat().st_size > 100 for path in files))
+        output = files[0].parent
+        self.assertEqual(list(output.glob("frame_*")), [])
+        with (output / "plotted_points_total.csv").open() as stream:
+            points = list(csv.DictReader(stream))
+        self.assertEqual(len(points), 30)
+        self.assertEqual({point["frame"] for point in points}, {str(i) for i in range(1, 6)})
+        colors = {}
+        for label in ("M42", "M99"):
+            obj = [point for point in points if point["object_label"] == label]
+            self.assertEqual({point["source"] for point in obj}, {"motion", "gt", "detection"})
+            self.assertEqual(len({point["object_color"] for point in obj}), 1)
+            colors[label] = obj[0]["object_color"]
+            self.assertEqual({point["cov_xx"] for point in obj if point["source"] == "motion"}, {"4.0"})
+        self.assertNotEqual(colors["M42"], colors["M99"])
+        settings = json.loads((output / "plot_settings_total.json").read_text())
+        self.assertEqual(settings["layout"], "trajectory")
+        self.assertEqual(settings["object_colors"], colors)
+        self.assertFalse(plt.get_fignums())
+
+    def test_trajectories_break_at_missing_frames_and_gt_identity_changes(self):
+        raw = []
+        for source, frames, identities in (("motion", [3, 1], [1, 1]),
+                                           ("detection", [3, 1], [None, None]),
+                                           ("gt", [3, 1, 2], [11, 10, 11])):
+            for frame, identity in zip(frames, identities):
+                raw.append(dict(source=source, id=identity, frame=frame, context_track_id=1,
+                                xy=np.array([float(frame), 2.]), ellipse=(4., 2., 30.)))
+        raw.append(dict(source="motion", id=2, frame=2, xy=np.array([20., 30.]), ellipse=(6., 4., 40.)))
+        points, colors = viz.color_trajectory_points(raw)
+        self.assertTrue(all("object_color" not in point for point in raw))
+        fig = viz.draw_trajectory(points, [1, 2, 3], "scene", "total", (0, 30), (0, 40), show_ids=True)
+        try:
+            ax = fig.axes[0]
+            connected = [line for line in ax.lines if len(line.get_xdata()) > 1]
+            self.assertEqual(len(connected), 1)
+            self.assertEqual(connected[0].get_marker(), "x")
+            np.testing.assert_array_equal(connected[0].get_xdata(), [2., 3.])
+            self.assertEqual({text.get_text() for text in ax.texts}, {"M1", "M2"})
+            self.assertEqual(ax.get_aspect(), 1.)
+            self.assertFalse(any(line.get_visible() for line in ax.get_xgridlines() + ax.get_ygridlines()))
+            self.assertEqual(len(ax.patches), 6)
+            self.assertEqual({text.get_text() for text in fig.legends[0].get_texts()},
+                             {"Motion prediction", "GT (nearby)", "Detection (nearby)", "Total covariance"})
+            motion = [p for p in points if p["source"] == "motion"]
+            for outline, point in zip(ax.patches[1::2], motion):
+                self.assertEqual((outline.width, outline.height, outline.angle), point["ellipse"])
+                self.assertEqual(viz.to_hex(outline.get_edgecolor()), colors[point["object_label"]])
+                np.testing.assert_array_equal(outline.center, point["xy"])
+        finally:
+            plt.close(fig)
+
+    def test_unlimited_context_keeps_unpaired_points_and_separate_id_namespaces(self):
+        points = [dict(source="motion", frame=1, id=7, xy=np.array([0., 0.])),
+                  dict(source="gt", frame=1, id=7, xy=np.array([100., 100.])),
+                  dict(source="detection", frame=1, id=None, xy=np.array([200., 200.])),
+                  dict(source="detection", frame=1, id=None, xy=np.array([.1, .1]))]
+        annotated, colors = viz.color_trajectory_points(viz.assign_context(points, 1.))
+        self.assertEqual(len(annotated), 4)
+        self.assertEqual([p["object_label"] for p in annotated], ["M7", "G7", None, "M7"])
+        self.assertNotEqual(colors["M7"], colors["G7"])
+        self.assertEqual(annotated[2]["object_color"], "#909090")
+        self.assertEqual(annotated[3]["object_color"], colors["M7"])
+        self.assertTrue(all("context_track_id" not in point for point in points))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-r"""Plot per-frame GT/detection/motion points and motion covariance ellipses.
+r"""Plot GT/detection/motion trajectories and motion covariance ellipses.
 
 Run a trained checkpoint and plot its fresh inference results:
 
@@ -53,8 +53,14 @@ all_res contains saved high-confidence detections, not all tracker candidates.
 It is overwritten each evaluation: do not pair an old/best motion CSV with a
 different epoch's all_res. GT IDs and tracker IDs are separate namespaces;
 the plot shows contemporaneous points without inventing identity matches.
-No trajectory lines are drawn. Exported plotted_points_COMPONENT.csv retains
-frames/IDs so lines can be drawn separately later.
+By default, all selected frames form one trajectory figure per sequence and
+format. Object colors follow motion track IDs; GT/detection context uses that
+track's color, with different markers/line styles for each source. Context is
+still proximity-based, not verified identity or tracker assignment. Lines stop
+at missing selected frames and GT identity changes. Unpaired GT uses its own
+GT-ID color, and unpaired detections remain gray points. Use --layout frames
+for the previous separate-frame figures. Exported plotted_points_COMPONENT.csv
+retains frames/IDs, context mapping and trajectory object colors.
 
 --max-objects N selects the first N available motion track IDs in ascending
 order, keeping those same IDs across the requested frames (no replacements
@@ -83,6 +89,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse, Patch
+from matplotlib.lines import Line2D
+from matplotlib.colors import to_hex
 import numpy as np
 
 
@@ -220,20 +228,16 @@ def prepare_points(motion, gt, detections, component, coordinate_scale, detectio
     return points
 
 
-def limit_objects(points, max_objects, context_radius):
-    """Keep stable motion IDs and unique nearby context, never infer true IDs."""
-    track_ids = sorted({p["id"] for p in points if p["source"] == "motion"})[:max_objects]
-    if not track_ids:
-        raise ValueError("--max-objects requires motion predictions after frame/ID filtering")
-    chosen = set(track_ids)
+def assign_context(points, context_radius):
+    """Annotate unique nearby context without discarding unpaired points."""
+    annotated = [dict(point) for point in points]
     by_frame = {}
-    for point in points:
+    for point in annotated:
         by_frame.setdefault(point["frame"], []).append(point)
-    selected = []
     for frame_points in by_frame.values():
         motion = sorted((p for p in frame_points if p["source"] == "motion"), key=lambda p: p["id"])
-        selected.extend(dict(p, context_track_id=p["id"], context_distance=0.)
-                        for p in motion if p["id"] in chosen)
+        for point in motion:
+            point.update(context_track_id=point["id"], context_distance=0.)
         for source in ("gt", "detection"):
             candidates = [p for p in frame_points if p["source"] == source]
             if not motion or not candidates:
@@ -252,10 +256,17 @@ def limit_objects(points, max_objects, context_radius):
                 used_motion.add(motion_index)
                 used_context.add(context_index)
                 track_id = motion[motion_index]["id"]
-                if track_id in chosen:
-                    selected.append(dict(candidates[context_index], context_track_id=track_id,
-                                         context_distance=distance))
-    return selected, track_ids
+                candidates[context_index].update(context_track_id=track_id, context_distance=distance)
+    return annotated
+
+
+def limit_objects(points, max_objects, context_radius):
+    """Keep stable motion IDs and unique nearby context, never infer true IDs."""
+    track_ids = sorted({p["id"] for p in points if p["source"] == "motion"})[:max_objects]
+    if not track_ids:
+        raise ValueError("--max-objects requires motion predictions after frame/ID filtering")
+    chosen = set(track_ids)
+    return [p for p in assign_context(points, context_radius) if p.get("context_track_id") in chosen], track_ids
 
 
 def plot_limits(points):
@@ -314,9 +325,113 @@ def draw_frame(points, frame, sequence, component, xlim, ylim,
     return fig
 
 
+def color_trajectory_points(points):
+    """Assign each displayed object one color for the complete selected window."""
+    annotated = []
+    for point in points:
+        if point["source"] == "motion":
+            label = f"M{point['id']}"
+        elif point.get("context_track_id") is not None:
+            label = f"M{point['context_track_id']}"
+        elif point["source"] == "gt":
+            label = f"G{point['id']}"
+        else:
+            label = None
+        annotated.append(dict(point, object_label=label))
+    labels = sorted({p["object_label"] for p in annotated if p["object_label"] is not None},
+                    key=lambda label: (label[0] != "M", int(label[1:])))
+    if len(labels) <= 10:
+        palette = plt.get_cmap("tab10").colors[:len(labels)]
+    else:
+        palette = plt.get_cmap("turbo")(np.linspace(.05, .95, len(labels)))
+    colors = {label: to_hex(color) for label, color in zip(labels, palette)}
+    for point in annotated:
+        point["object_color"] = colors.get(point["object_label"], "#909090")
+    return annotated, colors
+
+
+def trajectory_segments(points, frames):
+    """Connect only the same source/identity at adjacent selected time steps."""
+    order = {frame: index for index, frame in enumerate(sorted(set(frames)))}
+    groups = {}
+    for point in points:
+        # A detection without a nearby track has no temporal identity.
+        if point["object_label"] is None:
+            continue
+        identity = point["id"] if point["source"] == "gt" else None
+        groups.setdefault((point["object_label"], point["source"], identity), []).append(point)
+    segments = []
+    for group in groups.values():
+        segment = []
+        for point in sorted(group, key=lambda p: p["frame"]):
+            if segment and order[point["frame"]] != order[segment[-1]["frame"]] + 1:
+                segments.append(segment)
+                segment = []
+            segment.append(point)
+        if segment:
+            segments.append(segment)
+    return segments
+
+
+def draw_trajectory(points, frames, sequence, component, xlim, ylim,
+                    unit="grid cells", show_ids=False, invert_y=False):
+    fig, ax = plt.subplots(figsize=(10, 7))
+    styles = {"motion": ("o", "-", "Motion prediction"),
+              "gt": ("x", "--", "GT (nearby)"),
+              "detection": ("s", ":", "Detection (nearby)")}
+    for point in points:
+        if point["source"] == "motion":
+            width, height, angle = point["ellipse"]
+            ax.add_patch(Ellipse(point["xy"], width=width, height=height, angle=angle,
+                                 facecolor=point["object_color"], edgecolor="none", alpha=.07, zorder=1))
+            ax.add_patch(Ellipse(point["xy"], width=width, height=height, angle=angle,
+                                 facecolor="none", edgecolor=point["object_color"], linewidth=1., alpha=.8, zorder=2))
+    for segment in trajectory_segments(points, frames):
+        first = segment[0]
+        marker, linestyle, _ = styles[first["source"]]
+        xy = np.array([point["xy"] for point in segment])
+        ax.plot(xy[:, 0], xy[:, 1], color=first["object_color"], marker=marker, linestyle=linestyle,
+                markersize=4.5, markerfacecolor="none" if first["source"] == "detection" else first["object_color"],
+                linewidth=1.4, zorder=4 if first["source"] == "motion" else 3)
+    unpaired = [p for p in points if p["object_label"] is None]
+    if unpaired:
+        xy = np.array([p["xy"] for p in unpaired])
+        ax.scatter(xy[:, 0], xy[:, 1], marker="s", s=22, facecolors="none", edgecolors="#909090", zorder=3)
+    objects = {p["object_label"]: p["object_color"] for p in points if p["object_label"] is not None}
+    if show_ids:
+        endpoints = {}
+        for point in sorted(points, key=lambda p: p["frame"]):
+            if point["source"] == "motion" or (point["object_label"] or "").startswith("G"):
+                endpoints[point["object_label"]] = point
+        for label, point in endpoints.items():
+            ax.annotate(label, point["xy"], xytext=(5, 6), textcoords="offset points",
+                        fontsize=8, color=point["object_color"])
+    has_context = any(p["source"] != "motion" and p.get("context_track_id") is not None for p in points)
+    handles = [Line2D([], [], color="#444444", marker=marker, linestyle=line,
+                      markerfacecolor="none" if source == "detection" else "#444444",
+                      label=label if has_context else label.replace(" (nearby)", ""))
+               for source, (marker, line, label) in styles.items()]
+    handles.append(Patch(facecolor="none", edgecolor="#444444", label=f"{component.capitalize()} covariance"))
+    # Keep the source legend at figure level so adding the object legend cannot
+    # replace it or exclude it from tight-bounding-box exports.
+    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(.5, .01), ncol=2, frameon=False)
+    if objects:
+        object_handles = [Line2D([], [], color=color, linewidth=2.5, label=label)
+                          for label, color in sorted(objects.items(), key=lambda pair: (pair[0][0] != "M", int(pair[0][1:])))]
+        ax.legend(handles=object_handles, title="Object", loc="upper left", bbox_to_anchor=(1.01, 1.), frameon=False)
+    ax.set(xlim=xlim, ylim=ylim, xlabel=f"BEV x ({unit})", ylabel=f"BEV y ({unit})",
+           title=f"{_basename(sequence)} | frames {min(frames)}–{max(frames)} ({len(frames)} frames) | {component}")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(False, which="both")
+    if invert_y:
+        ax.invert_yaxis()
+    fig.tight_layout(rect=(0, .12, 1, 1))
+    return fig
+
+
 def write_points(path, points, sequence, sequence_id, component):
     fields = ["sequence", "sequence_id", "frame", "source", "id", "x", "y", "score", "matched",
-              "component", "cov_xx", "cov_xy", "cov_yy", "context_track_id", "context_distance"]
+              "component", "cov_xx", "cov_xy", "cov_yy", "context_track_id", "context_distance", "object_label", "object_color"]
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
@@ -324,7 +439,8 @@ def write_points(path, points, sequence, sequence_id, component):
             row = dict(sequence=sequence, sequence_id=sequence_id, frame=point["frame"],
                        source=point["source"], id=point["id"], x=point["xy"][0], y=point["xy"][1],
                        score=point.get("score"), matched=point.get("matched"),
-                       context_track_id=point.get("context_track_id"), context_distance=point.get("context_distance"))
+                       context_track_id=point.get("context_track_id"), context_distance=point.get("context_distance"),
+                       object_label=point.get("object_label"), object_color=point.get("object_color"))
             if point["source"] == "motion":
                 covariance = point["covariance"]
                 row.update(component=component, cov_xx=covariance[0, 0],
@@ -343,10 +459,12 @@ def build_parser():
     parser.add_argument("--sequence-id", type=int, help="Evaluation sequence index; checkpoint mode resolves the matching path automatically")
     parser.add_argument("--list-sequences", action="store_true", help="Print available names/IDs and exit")
     parser.add_argument("--frames", type=int, nargs="+", help="Frames to draw; default: all frames in the selected sequence")
+    parser.add_argument("--layout", choices=("trajectory", "frames"), default="trajectory",
+                        help="Combine selected frames in one trajectory figure (default), or save separate frames")
     parser.add_argument("--track-ids", type=int, nargs="+", help="Filter motion predictions only")
     parser.add_argument("--gt-ids", type=int, nargs="+", help="Filter GT only; GT IDs are not tracker IDs")
     parser.add_argument("--max-objects", type=int, help="Limit to N stable motion track IDs, plus at most one nearby GT/detection each")
-    parser.add_argument("--context-radius", type=float, default=50., help="Nearby point selection radius in original grid cells (default: 50); only with --max-objects")
+    parser.add_argument("--context-radius", type=float, default=50., help="Nearby point selection radius in original grid cells (default: 50); for object limits or trajectory colors")
     parser.add_argument("--component", choices=("total", "aleatoric", "epistemic"), default="total")
     parser.add_argument("--detection-order", choices=("auto", "xy", "yx"), default="auto")
     parser.add_argument("--min-score", type=float, default=0., help="Further filter the saved detections")
@@ -406,6 +524,8 @@ def run(args):
     if args.max_objects is not None:
         points, selected_track_ids = limit_objects(points, args.max_objects, args.context_radius * scale)
         print(f"Selected motion track IDs: {selected_track_ids}; GT/detection context uses proximity, not tracker assignment")
+    elif args.layout == "trajectory":
+        points = assign_context(points, args.context_radius * scale)
     if not points:
         raise ValueError("No points remain after applying filters")
     xlim, ylim = plot_limits(points)
@@ -413,17 +533,25 @@ def run(args):
     slug = re.sub(r"[^a-zA-Z0-9_.-]", "_", _basename(sequence)) or "sequence"
     output = args.output_dir / f"seq_{sequence_id}_{slug}"
     output.mkdir(parents=True, exist_ok=True)
-    by_frame = {frame: [] for frame in frames}
-    for point in points:
-        by_frame[point["frame"]].append(point)
+    object_colors = None
+    if args.layout == "trajectory":
+        points, object_colors = color_trajectory_points(points)
+        plots = [(frames, points, f"trajectory_{frames[0]:06d}_{frames[-1]:06d}_{args.component}")]
+    else:
+        by_frame = {frame: [] for frame in frames}
+        for point in points:
+            by_frame[point["frame"]].append(point)
+        plots = [(frame, by_frame[frame], f"frame_{frame:06d}_{args.component}") for frame in frames]
     files = []
-    for frame in frames:
-        fig = draw_frame(by_frame[frame], frame, sequence, args.component,
-                         xlim, ylim, "m" if args.meters_per_cell is not None else "grid cells",
-                         args.show_ids, args.invert_y, nearby_context=args.max_objects is not None)
+    for time_selection, plot_points, name in plots:
+        draw = draw_trajectory if args.layout == "trajectory" else draw_frame
+        options = {} if args.layout == "trajectory" else {"nearby_context": args.max_objects is not None}
+        fig = draw(plot_points, time_selection, sequence, args.component,
+                   xlim, ylim, "m" if args.meters_per_cell is not None else "grid cells",
+                   args.show_ids, args.invert_y, **options)
         try:
             for extension in dict.fromkeys(args.formats):
-                destination = output / f"frame_{frame:06d}_{args.component}.{extension}"
+                destination = output / f"{name}.{extension}"
                 fig.savefig(destination, dpi=args.dpi, bbox_inches="tight")
                 files.append(destination)
         finally:
@@ -433,7 +561,8 @@ def run(args):
     settings.update(sequence=sequence, sequence_id=sequence_id, detection_order=order,
                     frames=frames, xlim=list(xlim), ylim=list(ylim), selected_track_ids=selected_track_ids,
                     ellipse_definition="semiaxes=sqrt(eigenvalues)",
-                    context_selection="greedy_nearest_one_to_one" if args.max_objects is not None else None)
+                    object_colors=object_colors,
+                    context_selection="greedy_nearest_one_to_one" if args.max_objects is not None or args.layout == "trajectory" else None)
     (output / f"plot_settings_{args.component}.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
     print(f"Saved {len(files)} figure(s) and point coordinates to {output}")
     return files
@@ -453,6 +582,8 @@ def add_resume_plot_arguments(parser):
                        help="Minimum frame ID for automatic consecutive selection; only with --motion_plot_consecutive")
     group.add_argument("--motion_plot_max_objects", type=int, default=3, help="Maximum stable motion IDs per plotted sequence (default: 3)")
     group.add_argument("--motion_plot_component", choices=("total", "aleatoric", "epistemic"), default="total")
+    group.add_argument("--motion_plot_layout", choices=("trajectory", "frames"), default="trajectory",
+                       help="Combine selected frames in one figure (default), or save separate frames")
     group.add_argument("--motion_plot_track_ids", type=int, nargs="+")
     group.add_argument("--motion_plot_gt_ids", type=int, nargs="+")
     group.add_argument("--motion_plot_context_radius", type=float, default=50., help="Nearby GT/detection selection radius in original grid cells")
@@ -563,7 +694,7 @@ def plot_resume_results(args, dataset, epoch, res_dir, plan):
         ])
         plot_args.sequence, plot_args.sequence_id, plot_args.frames = root, index, frames
         plot_args.output_dir = res_dir / "motion_uncertainty_plots"
-        for name in ("max_objects", "component", "track_ids", "gt_ids", "context_radius", "xlim", "ylim", "show_ids", "formats"):
+        for name in ("layout", "max_objects", "component", "track_ids", "gt_ids", "context_radius", "xlim", "ylim", "show_ids", "formats"):
             setattr(plot_args, name, getattr(args, "motion_plot_" + name))
         plot_args.detection_order = "xy" if dataset.datasets[index].base.indexing == "xy" else "yx"
         plot_args.evaluation_checkpoint = args.resume

@@ -174,7 +174,9 @@ class ResumeEvaluationIntegrationTests(unittest.TestCase):
             self.assertEqual({row["kappa"] for row in plotted if row["sequence"] == dataset.dataset_list[1]}, {"3.0"})
             self.assertEqual({row["kappa"] for row in plotted if row["sequence"] == dataset.dataset_list[0]}, {""})
             output = root / "True" / "motion_uncertainty_plots" / "seq_1_seq1"
-            self.assertEqual(len(list(output.glob("*.png"))), 2)
+            self.assertEqual(len(list(output.glob("*.png"))), 1)
+            self.assertTrue((output / "trajectory_000011_000012_epistemic.png").is_file())
+            self.assertEqual(list(output.glob("frame_*")), [])
             self.assertFalse((output.parent / "seq_0_seq1").exists())
             with (output / "plotted_points_epistemic.csv").open() as stream:
                 points = list(csv.DictReader(stream))
@@ -184,6 +186,7 @@ class ResumeEvaluationIntegrationTests(unittest.TestCase):
             metadata = json.loads((output / "plot_settings_epistemic.json").read_text())
             self.assertEqual(metadata["evaluation_checkpoint"], "weights.pth")
             self.assertEqual(metadata["evaluation_epoch"], 1)
+            self.assertEqual(metadata["layout"], "trajectory")
 
 
 if __name__ == "__main__":

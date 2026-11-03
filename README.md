@@ -491,7 +491,9 @@ Use `python main.py --help` for the complete list of options.
 plots when using Mamba/BiMamba with `--motion_loss niw`. The figures reuse the
 same evaluation pass and are written after evaluation to
 `logs/RUN/motion_uncertainty_plots/seq_N_NAME/`. No second model load or inference
-pass is performed. Keep the architecture and history options in your existing
+pass is performed. Selected frames are combined into **one trajectory figure**
+per sequence and output format, named
+`trajectory_FIRSTFRAME_LASTFRAME_COMPONENT.png` (or PDF/SVG). Keep the architecture and history options in your existing
 resume command consistent with the checkpoint; this path still uses the
 `main.py` model settings supplied on the command line.
 
@@ -519,6 +521,16 @@ filters affect only the saved figures: evaluation still processes all sequences
 and frames, preserving history and metric coverage. Frames must exist in each
 selected sequence's evaluation split/sampling. Sequences without eligible
 motion predictions are skipped.
+
+Each motion track ID has one color throughout the selected time window. Motion
+uses circles with solid lines, GT uses crosses with dashed lines, and nearby
+detections use hollow squares with dotted lines. All frame-specific covariance
+ellipses use the same object color without resizing their covariance. Lines
+break across missing selected observations and GT identity changes. GT and
+detection color grouping still uses the documented proximity matching, not
+verified tracker/GT identity correspondence. The points CSV includes
+`object_label`/`object_color`, and the settings JSON records the color mapping.
+Use `--motion_plot_layout frames` only if separate images per frame are wanted.
 
 To select five consecutive **original frame IDs** automatically, replace
 `--motion_plot_frames ...` with:
@@ -597,12 +609,17 @@ so `--component total`, `aleatoric`, and `epistemic` are all available. The
 component controls only the plotted ellipse; the model's implicit covariance
 input remains controlled by `--implicit_motion_uncertainty_type`.
 
-Figures show GT, high-confidence detections, the pure motion prediction before
+By default, all selected frames are combined in one trajectory figure per
+sequence and format (`--layout trajectory`). Use `--layout frames` for separate
+frame figures. Figures show GT, high-confidence detections, the pure motion prediction before
 detection replacement, and a covariance ellipse with semiaxes
 `sqrt(eigenvalues)`. They use equal axis units, no background grid, and no
 extra covariance multiplier. `--max-objects N` keeps N stable motion IDs and
 at most one nearby GT/detection per ID; this proximity selection is not an
-identity annotation or the tracker's actual assignment. Use `--xlim MIN MAX`
+identity annotation or the tracker's actual assignment. Object colors are shared
+across the three sources; source markers and line styles remain distinct. When
+no object limit is set, unpaired GT retains a separate GT-ID color and unpaired
+detections remain gray points, without an invented detection trajectory. Use `--xlim MIN MAX`
 and `--ylim MIN MAX` for a closer view without changing covariance values.
 
 CSV-only plotting is still supported with just NumPy and Matplotlib. For
