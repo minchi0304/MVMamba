@@ -60,13 +60,15 @@ It is overwritten each evaluation: do not pair an old/best motion CSV with a
 different epoch's all_res. GT IDs and tracker IDs are separate namespaces;
 the plot shows contemporaneous points without inventing identity matches.
 By default, all selected frames form one trajectory figure per sequence and
-format. Object colors follow motion track IDs; GT/detection context uses that
-track's color, with different markers/line styles for each source. Context is
+format. Object colors follow motion track IDs; GT context uses that track's
+color. Detections use black hollow squares in both layouts and black dotted
+lines in trajectory views. Each source has distinct markers/line styles. Context is
 still proximity-based, not verified identity or tracker assignment. Lines stop
 at missing selected frames and GT identity changes. Unpaired GT uses its own
-GT-ID color, and unpaired detections remain gray points. Use --layout frames
+GT-ID color, and unpaired detections remain black hollow squares. Use --layout frames
 for the previous separate-frame figures. Exported plotted_points_COMPONENT.csv
-retains frames/IDs, context mapping and trajectory object colors.
+retains frames/IDs, context mapping and trajectory object colors; object_color
+records the group palette even though detections are rendered in black.
 --sources motion shows only motion predictions and covariance ellipses;
 --sources motion detection also shows detections while hiding GT;
 --sources motion gt includes GT. The default is gt detection motion.
@@ -318,7 +320,7 @@ def draw_frame(points, frame, sequence, component, xlim, ylim,
                unit="grid cells", show_ids=False, invert_y=False, nearby_context=False,
                show_covariance=True):
     fig, ax = plt.subplots(figsize=(9, 7))
-    colors = {"gt": "#238443", "detection": "#2166ac", "motion": "#d73027"}
+    colors = {"gt": "#238443", "detection": "#000000", "motion": "#d73027"}
     styles = {"gt": ("x", "GT", 65), "detection": ("s", "Detection", 48),
               "motion": ("o", "Motion prediction", 35)}
     for point in points:
@@ -423,14 +425,16 @@ def draw_trajectory(points, frames, sequence, component, xlim, ylim,
         first = segment[0]
         marker, linestyle, _ = styles[first["source"]]
         xy = np.array([point["xy"] for point in segment])
-        ax.plot(xy[:, 0], xy[:, 1], color=first["object_color"], marker=marker, linestyle=linestyle,
+        color = "#000000" if first["source"] == "detection" else first["object_color"]
+        ax.plot(xy[:, 0], xy[:, 1], color=color, marker=marker, linestyle=linestyle,
                 markersize=4.5, markerfacecolor="none" if first["source"] == "detection" else first["object_color"],
                 linewidth=1.4, zorder=4 if first["source"] == "motion" else 3)
     unpaired = [p for p in points if p["object_label"] is None]
     if unpaired:
         xy = np.array([p["xy"] for p in unpaired])
-        ax.scatter(xy[:, 0], xy[:, 1], marker="s", s=22, facecolors="none", edgecolors="#909090", zorder=3)
-    objects = {p["object_label"]: p["object_color"] for p in points if p["object_label"] is not None}
+        ax.scatter(xy[:, 0], xy[:, 1], marker="s", s=22, facecolors="none", edgecolors="#000000", zorder=3)
+    objects = {p["object_label"]: p["object_color"] for p in points
+               if p["object_label"] is not None and p["source"] != "detection"}
     if show_ids:
         endpoints = {}
         for point in sorted(points, key=lambda p: p["frame"]):
@@ -441,7 +445,7 @@ def draw_trajectory(points, frames, sequence, component, xlim, ylim,
                         fontsize=8, color=point["object_color"])
     has_context = any(p["source"] != "motion" and p.get("context_track_id") is not None for p in points)
     sources = {p["source"] for p in points}
-    handles = [Line2D([], [], color="#444444", marker=marker, linestyle=line,
+    handles = [Line2D([], [], color="#000000" if source == "detection" else "#444444", marker=marker, linestyle=line,
                       markerfacecolor="none" if source == "detection" else "#444444",
                       label=label if has_context else label.replace(" (nearby)", ""))
                for source, (marker, line, label) in styles.items() if source in sources]

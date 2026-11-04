@@ -566,20 +566,23 @@ input remains controlled by `--implicit_motion_uncertainty_type`.
 By default, all selected frames are combined in one trajectory figure per
 sequence and format (`--layout trajectory`). Use `--layout frames` for separate
 frame figures. Files are named `trajectory_FIRSTFRAME_LASTFRAME_COMPONENT.png`
-(or PDF/SVG). Each object retains one color throughout the window: motion uses
-circles/solid lines, GT crosses/dashed lines, and detections hollow squares/dotted
-lines. Covariance ellipses share the object's color. Lines break across missing
-selected observations and GT identity changes. The points CSV includes
+(or PDF/SVG). Each object retains one color for motion and GT throughout the
+window: motion uses circles/solid lines and GT crosses/dashed lines. Detections
+use black hollow squares/dotted lines. Covariance ellipses share the object's
+color. Lines break across missing selected observations and GT identity changes.
+The points CSV includes
 `object_label`/`object_color`, and settings JSON records the color mapping.
+`object_color` records the group palette; detections are rendered in black
+in both layouts regardless of their group color.
 Figures show GT, high-confidence detections, the pure motion prediction before
 detection replacement, and a covariance ellipse with semiaxes
 `sqrt(eigenvalues)`. They use equal axis units, no background grid, and no
 extra covariance multiplier. `--max-objects N` keeps N stable motion IDs and
 at most one nearby GT/detection per ID; this proximity selection is not an
 identity annotation or the tracker's actual assignment. Object colors are shared
-across the three sources; source markers and line styles remain distinct. When
+between motion and GT; source markers and line styles remain distinct. When
 no object limit is set, unpaired GT retains a separate GT-ID color and unpaired
-detections remain gray points, without an invented detection trajectory. Use `--xlim MIN MAX`
+detections remain black hollow squares, without an invented detection trajectory. Use `--xlim MIN MAX`
 and `--ylim MIN MAX` for a closer view without changing covariance values.
 
 Choose which sources to display with `--sources` (default: `gt detection motion`):
