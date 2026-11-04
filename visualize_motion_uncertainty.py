@@ -70,6 +70,8 @@ retains frames/IDs, context mapping and trajectory object colors.
 --sources motion shows only motion predictions and covariance ellipses;
 --sources motion detection also shows detections while hiding GT;
 --sources motion gt includes GT. The default is gt detection motion.
+Add --hide-covariance to show points/trajectories without covariance ellipses
+or their legend entry. Saved motion covariance values are retained in the CSV.
 This display filter applies after object selection/context matching and controls
 the figure, legend, automatic axis limits, and exported points CSV. In CSV mode,
 --gt/--detections may be omitted when their corresponding sources are hidden.
@@ -295,11 +297,11 @@ def limit_objects(points, max_objects, context_radius, selection="id", rng=None)
     return [p for p in assign_context(points, context_radius) if p.get("context_track_id") in chosen], track_ids
 
 
-def plot_limits(points):
+def plot_limits(points, show_covariance=True):
     bounds = []
     for point in points:
         radius = np.zeros(2)
-        if point["source"] == "motion":
+        if show_covariance and point["source"] == "motion":
             width, height, angle = point["ellipse"]
             radians = math.radians(angle)
             radius = .5 * np.sqrt([
@@ -313,13 +315,14 @@ def plot_limits(points):
 
 
 def draw_frame(points, frame, sequence, component, xlim, ylim,
-               unit="grid cells", show_ids=False, invert_y=False, nearby_context=False):
+               unit="grid cells", show_ids=False, invert_y=False, nearby_context=False,
+               show_covariance=True):
     fig, ax = plt.subplots(figsize=(9, 7))
     colors = {"gt": "#238443", "detection": "#2166ac", "motion": "#d73027"}
     styles = {"gt": ("x", "GT", 65), "detection": ("s", "Detection", 48),
               "motion": ("o", "Motion prediction", 35)}
     for point in points:
-        if point["source"] == "motion":
+        if show_covariance and point["source"] == "motion":
             width, height, angle = point["ellipse"]
             ax.add_patch(Ellipse(point["xy"], width=width, height=height, angle=angle,
                                  facecolor=colors["motion"], edgecolor="none", alpha=.12, zorder=1))
@@ -339,13 +342,13 @@ def draw_frame(points, frame, sequence, component, xlim, ylim,
         kwargs = dict(facecolors="none", edgecolors=colors[source]) if source == "detection" else dict(color=colors[source])
         ax.scatter(xy[:, 0], xy[:, 1], marker=marker, s=size, label=label, zorder=3, **kwargs)
     handles, labels = ax.get_legend_handles_labels()
-    if any(p["source"] == "motion" for p in points):
+    if show_covariance and any(p["source"] == "motion" for p in points):
         handles.append(Patch(facecolor=colors["motion"], edgecolor=colors["motion"], alpha=.25))
         labels.append(f"{component.capitalize()} covariance")
     if handles:
         ax.legend(handles, labels, loc="upper center", bbox_to_anchor=(.5, -.1), ncol=2, frameon=False)
     ax.set(xlim=xlim, ylim=ylim, xlabel=f"BEV x ({unit})", ylabel=f"BEV y ({unit})",
-           title=f"{_basename(sequence)} | frame {frame} | {component}")
+           title=f"{_basename(sequence)} | frame {frame}" + (f" | {component}" if show_covariance else ""))
     ax.set_aspect("equal", adjustable="box")
     ax.set_axisbelow(True)
     ax.grid(False, which="both")
@@ -404,13 +407,13 @@ def trajectory_segments(points, frames):
 
 
 def draw_trajectory(points, frames, sequence, component, xlim, ylim,
-                    unit="grid cells", show_ids=False, invert_y=False):
+                    unit="grid cells", show_ids=False, invert_y=False, show_covariance=True):
     fig, ax = plt.subplots(figsize=(10, 7))
     styles = {"motion": ("o", "-", "Motion prediction"),
               "gt": ("x", "--", "GT (nearby)"),
               "detection": ("s", ":", "Detection (nearby)")}
     for point in points:
-        if point["source"] == "motion":
+        if show_covariance and point["source"] == "motion":
             width, height, angle = point["ellipse"]
             ax.add_patch(Ellipse(point["xy"], width=width, height=height, angle=angle,
                                  facecolor=point["object_color"], edgecolor="none", alpha=.07, zorder=1))
@@ -442,7 +445,7 @@ def draw_trajectory(points, frames, sequence, component, xlim, ylim,
                       markerfacecolor="none" if source == "detection" else "#444444",
                       label=label if has_context else label.replace(" (nearby)", ""))
                for source, (marker, line, label) in styles.items() if source in sources]
-    if "motion" in sources:
+    if show_covariance and "motion" in sources:
         handles.append(Patch(facecolor="none", edgecolor="#444444", label=f"{component.capitalize()} covariance"))
     # Keep the source legend at figure level so adding the object legend cannot
     # replace it or exclude it from tight-bounding-box exports.
@@ -453,7 +456,8 @@ def draw_trajectory(points, frames, sequence, component, xlim, ylim,
                           for label, color in sorted(objects.items(), key=lambda pair: (pair[0][0] != "M", int(pair[0][1:])))]
         ax.legend(handles=object_handles, title="Object", loc="upper left", bbox_to_anchor=(1.01, 1.), frameon=False)
     ax.set(xlim=xlim, ylim=ylim, xlabel=f"BEV x ({unit})", ylabel=f"BEV y ({unit})",
-           title=f"{_basename(sequence)} | frames {min(frames)}–{max(frames)} ({len(frames)} frames) | {component}")
+           title=f"{_basename(sequence)} | frames {min(frames)}–{max(frames)} ({len(frames)} frames)"
+                 + (f" | {component}" if show_covariance else ""))
     ax.set_aspect("equal", adjustable="box")
     ax.grid(False, which="both")
     if invert_y:
@@ -498,7 +502,9 @@ def build_parser():
     parser.add_argument("--layout", choices=("trajectory", "frames"), default="trajectory",
                         help="Combine selected frames in one trajectory figure (default), or save separate frames")
     parser.add_argument("--sources", choices=("gt", "detection", "motion"), nargs="+", default=["gt", "detection", "motion"],
-                        help="Sources to display and export (default: all); motion includes covariance ellipses")
+                        help="Sources to display and export (default: all); motion includes covariance ellipses unless hidden")
+    parser.add_argument("--hide-covariance", action="store_true",
+                        help="Hide covariance ellipses and their legend; fit axes to points only, retaining covariance values in CSV")
     parser.add_argument("--track-ids", type=int, nargs="+", help="Filter motion predictions only")
     parser.add_argument("--gt-ids", type=int, nargs="+", help="Filter GT only; GT IDs are not tracker IDs")
     parser.add_argument("--max-objects", type=int, help="Limit to N stable motion track IDs, plus at most one nearby GT/detection each")
@@ -591,7 +597,7 @@ def run(args):
     points = [point for point in points if point["source"] in args.sources]
     if not points:
         raise ValueError(f"No points remain for --sources {' '.join(args.sources)} after frame/ID/object filtering")
-    xlim, ylim = plot_limits(points)
+    xlim, ylim = plot_limits(points, show_covariance=not args.hide_covariance)
     xlim, ylim = args.xlim if args.xlim is not None else xlim, args.ylim if args.ylim is not None else ylim
     slug = re.sub(r"[^a-zA-Z0-9_.-]", "_", _basename(sequence)) or "sequence"
     output = args.output_dir / f"seq_{sequence_id}_{slug}"
@@ -611,7 +617,7 @@ def run(args):
         options = {} if args.layout == "trajectory" else {"nearby_context": max_objects is not None}
         fig = draw(plot_points, time_selection, sequence, args.component,
                    xlim, ylim, "m" if args.meters_per_cell is not None else "grid cells",
-                   args.show_ids, args.invert_y, **options)
+                   args.show_ids, args.invert_y, show_covariance=not args.hide_covariance, **options)
         try:
             for extension in dict.fromkeys(args.formats):
                 destination = output / f"{name}.{extension}"
@@ -654,7 +660,9 @@ def add_resume_plot_arguments(parser):
     group.add_argument("--motion_plot_layout", choices=("trajectory", "frames"), default="trajectory",
                        help="Combine selected frames in one figure (default), or save separate frames")
     group.add_argument("--motion_plot_sources", choices=("gt", "detection", "motion"), nargs="+", default=["gt", "detection", "motion"],
-                       help="Sources to display and export; motion includes covariance ellipses")
+                       help="Sources to display and export; motion includes covariance ellipses unless hidden")
+    group.add_argument("--motion_plot_hide_covariance", action="store_true",
+                       help="Hide covariance ellipses and their legend; retain motion/detection/GT points")
     group.add_argument("--motion_plot_track_ids", type=int, nargs="+")
     group.add_argument("--motion_plot_gt_ids", type=int, nargs="+")
     group.add_argument("--motion_plot_context_radius", type=float, default=50., help="Nearby GT/detection selection radius in original grid cells")
@@ -731,7 +739,7 @@ def plot_resume_results(args, dataset, epoch, res_dir, plan):
         ])
         plot_args.sequence, plot_args.sequence_id, plot_args.frames = root, index, frames
         plot_args.output_dir = res_dir / "motion_uncertainty_plots"
-        for name in ("layout", "sources", "max_objects", "object_selection", "object_selection_seed", "component", "track_ids", "gt_ids", "context_radius", "xlim", "ylim", "show_ids", "formats"):
+        for name in ("layout", "sources", "hide_covariance", "max_objects", "object_selection", "object_selection_seed", "component", "track_ids", "gt_ids", "context_radius", "xlim", "ylim", "show_ids", "formats"):
             setattr(plot_args, name, getattr(args, "motion_plot_" + name))
         plot_args.detection_order = "xy" if dataset.datasets[index].base.indexing == "xy" else "yx"
         plot_args.evaluation_checkpoint = args.resume

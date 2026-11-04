@@ -588,7 +588,12 @@ Choose which sources to display with `--sources` (default: `gt detection motion`
 --sources motion                    # motion predictions and covariance ellipses
 --sources motion gt                 # motion and GT
 --sources motion detection          # motion and detections
+--sources motion detection --hide-covariance  # motion/detection points and trajectories only
 ```
+
+`--hide-covariance` removes the ellipses and covariance legend and fits automatic
+axis limits to the displayed points. The exported CSV retains motion covariance
+values. Omit the flag to display ellipses as usual.
 
 This works with both layouts, random object selection, and explicit frame
 windows. Only the selected sources appear in the figure, legend, automatic
