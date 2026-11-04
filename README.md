@@ -582,6 +582,22 @@ no object limit is set, unpaired GT retains a separate GT-ID color and unpaired
 detections remain gray points, without an invented detection trajectory. Use `--xlim MIN MAX`
 and `--ylim MIN MAX` for a closer view without changing covariance values.
 
+Choose which sources to display with `--sources` (default: `gt detection motion`):
+
+```bash
+--sources motion                    # motion predictions and covariance ellipses
+--sources motion gt                 # motion and GT
+--sources motion detection          # motion and detections
+```
+
+This works with both layouts, random object selection, and explicit frame
+windows. Only the selected sources appear in the figure, legend, automatic
+axis limits, and exported points CSV. Object selection and nearby context
+matching still use the supplied inputs before the display filter. In CSV mode,
+`--gt` and `--detections` can be omitted if those sources are hidden; for example,
+`--motion-csv PATH --sources motion` needs only the motion CSV. Checkpoint mode
+still runs the detector and tracker normally to obtain motion predictions.
+
 For a random single object on each invocation, append:
 
 ```bash

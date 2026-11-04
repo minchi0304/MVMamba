@@ -37,6 +37,7 @@ class ResumePlotSelectionTests(unittest.TestCase):
         self.assertFalse(plot_settings().plot_motion_uncertainty)
         self.assertEqual(plot_settings().motion_plot_object_selection, "id")
         self.assertIsNone(plot_settings().motion_plot_object_selection_seed)
+        self.assertEqual(plot_settings().motion_plot_sources, ["gt", "detection", "motion"])
         self.assertTrue(plot_settings("--plot_motion_uncertainty").plot_motion_uncertainty)
         self.assertFalse(plot_settings("--no-plot_motion_uncertainty").plot_motion_uncertainty)
         self.assertEqual(viz.resume_plot_plan(plot_settings(), dataset), {0: [10, 20], 1: [100, 110]})
@@ -151,7 +152,7 @@ class ResumeEvaluationIntegrationTests(unittest.TestCase):
         settings = plot_settings("--motion_plot_seq_ids", "1", "--motion_plot_consecutive", "2",
                                  "--motion_plot_component", "epistemic", "--motion_plot_formats", "png",
                                  "--motion_plot_object_selection", "random", "--motion_plot_object_selection_seed", "0",
-                                 "--motion_plot_max_objects", "1")
+                                 "--motion_plot_max_objects", "1", "--motion_plot_sources", "motion")
         for key, (default, _, _) in OPTIONS.items():
             setattr(settings, key, default)
         settings.dataset = "gmvd_test"
@@ -192,11 +193,13 @@ class ResumeEvaluationIntegrationTests(unittest.TestCase):
             with (output / "plotted_points_epistemic.csv").open() as stream:
                 points = list(csv.DictReader(stream))
             motion = next(row for row in points if row["source"] == "motion")
+            self.assertEqual({row["source"] for row in points}, {"motion"})
             self.assertEqual(float(motion["cov_xx"]), 1.)
             self.assertEqual({row["frame"] for row in points}, {"11", "12"})
             metadata = json.loads((output / "plot_settings_epistemic.json").read_text())
             self.assertEqual(metadata["object_selection"], "random")
             self.assertEqual(metadata["effective_object_selection_seed"], 0)
+            self.assertEqual(metadata["sources"], ["motion"])
             self.assertEqual(metadata["evaluation_checkpoint"], "weights.pth")
             self.assertEqual(metadata["evaluation_epoch"], 1)
             self.assertEqual(metadata["layout"], "trajectory")

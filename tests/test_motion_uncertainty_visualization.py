@@ -300,6 +300,78 @@ class MotionUncertaintyVisualizationTests(unittest.TestCase):
         self.assertEqual(settings["object_colors"], colors)
         self.assertFalse(plt.get_fignums())
 
+    def test_motion_only_display_filters_exports_and_limits_without_changing_covariance(self):
+        arguments = self.write_inputs(
+            gt=[[0, 2, 7, -1, -1, -1, -1, 1, 100., 100., -1]],
+            detections=[[2, 200., 200., .9, 0]])
+        for layout in ("trajectory", "frames"):
+            with self.subTest(layout=layout):
+                args = viz.build_parser().parse_args(arguments + [
+                    "--sources", "motion", "--layout", layout, "--component", "epistemic",
+                    "--object-selection", "random", "--object-selection-seed", "0", "--context-radius", "500"])
+                files = viz.run(args)
+                self.assertEqual(len(files), 1)
+                with (files[0].parent / "plotted_points_epistemic.csv").open() as stream:
+                    rows = list(csv.DictReader(stream))
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["source"], "motion")
+                self.assertEqual(rows[0]["id"], "42")
+                self.assertEqual((float(rows[0]["x"]), float(rows[0]["y"])), (10., 20.))
+                self.assertEqual((float(rows[0]["cov_xx"]), float(rows[0]["cov_xy"]), float(rows[0]["cov_yy"])),
+                                 (1., -.25, 2.25))
+                settings = json.loads((files[0].parent / "plot_settings_epistemic.json").read_text())
+                self.assertEqual(settings["sources"], ["motion"])
+                self.assertEqual(settings["selected_track_ids"], [42])
+                self.assertLess(settings["xlim"][1], 20.)
+                self.assertLess(settings["ylim"][1], 30.)
+        self.assertFalse(plt.get_fignums())
+
+    def test_source_legends_and_ellipses_follow_displayed_points_in_both_layouts(self):
+        raw = [dict(source=source, id=identity, frame=2, context_track_id=42,
+                    xy=np.array([10., 20.]), ellipse=(4., 2., 30.))
+               for source, identity in (("motion", 42), ("gt", 7), ("detection", None))]
+        for selected_sources, expected in ((["motion"], {"Motion prediction", "Total covariance"}),
+                                            (["gt"], {"GT (nearby)"}),
+                                            (["motion", "detection"], {"Motion prediction", "Detection (nearby)", "Total covariance"})):
+            points = [point for point in raw if point["source"] in selected_sources]
+            colored, _ = viz.color_trajectory_points(points)
+            for layout in ("trajectory", "frames"):
+                with self.subTest(sources=selected_sources, layout=layout):
+                    if layout == "trajectory":
+                        fig = viz.draw_trajectory(colored, [2], "scene", "total", (0, 30), (0, 30))
+                        legend = fig.legends[0]
+                    else:
+                        fig = viz.draw_frame(points, 2, "scene", "total", (0, 30), (0, 30), nearby_context=True)
+                        legend = fig.axes[0].get_legend()
+                    try:
+                        self.assertEqual({text.get_text() for text in legend.get_texts()}, expected)
+                        self.assertEqual(len(fig.axes[0].patches), 2 if "motion" in selected_sources else 0)
+                    finally:
+                        plt.close(fig)
+
+    def test_csv_mode_requires_only_displayed_context_sources(self):
+        self.write_inputs(records=[dict(self.record, kappa=None)])
+        arguments = ["--motion-csv", str(self.root / "motion.csv"), "--output-dir", str(self.root / "plots")]
+        with patch.object(viz, "load_numeric", wraps=viz.load_numeric) as load_numeric:
+            files = viz.run(viz.build_parser().parse_args(arguments + ["--sources", "motion"]))
+        load_numeric.assert_not_called()
+        self.assertEqual(len(files), 1)
+        files = viz.run(viz.build_parser().parse_args(arguments + [
+            "--detections", str(self.root / "all_res.txt"), "--sources", "motion", "detection"]))
+        with (files[0].parent / "plotted_points_total.csv").open() as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({row["source"] for row in rows}, {"motion", "detection"})
+        self.assertEqual({row["object_label"] for row in rows}, {"M42"})
+        for source, required in (("gt", "--gt"), ("detection", "--detections")):
+            with self.subTest(source=source), self.assertRaisesRegex(ValueError, f"requires {required}"):
+                viz.run(viz.build_parser().parse_args(arguments + ["--sources", source]))
+        # Hidden motion ellipses do not need kappa for decomposition.
+        files = viz.run(viz.build_parser().parse_args(arguments + [
+            "--gt", str(self.root / "mota_gt.txt"), "--sources", "gt", "--component", "epistemic"]))
+        with (files[0].parent / "plotted_points_epistemic.csv").open() as stream:
+            self.assertEqual({row["source"] for row in csv.DictReader(stream)}, {"gt"})
+
     def test_trajectories_break_at_missing_frames_and_gt_identity_changes(self):
         raw = []
         for source, frames, identities in (("motion", [3, 1], [1, 1]),

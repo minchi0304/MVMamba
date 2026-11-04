@@ -67,6 +67,12 @@ at missing selected frames and GT identity changes. Unpaired GT uses its own
 GT-ID color, and unpaired detections remain gray points. Use --layout frames
 for the previous separate-frame figures. Exported plotted_points_COMPONENT.csv
 retains frames/IDs, context mapping and trajectory object colors.
+--sources motion shows only motion predictions and covariance ellipses;
+--sources motion detection also shows detections while hiding GT;
+--sources motion gt includes GT. The default is gt detection motion.
+This display filter applies after object selection/context matching and controls
+the figure, legend, automatic axis limits, and exported points CSV. In CSV mode,
+--gt/--detections may be omitted when their corresponding sources are hidden.
 
 --max-objects N selects the first N available motion track IDs in ascending
 order, keeping those same IDs across the requested frames (no replacements
@@ -325,15 +331,19 @@ def draw_frame(points, frame, sequence, component, xlim, ylim,
             ax.annotate(f"{prefix}{point['id']}", point["xy"], xytext=label_offset,
                         textcoords="offset points", fontsize=8, color=colors[point["source"]])
     for source, (marker, label, size) in styles.items():
+        if not any(p["source"] == source for p in points):
+            continue
         if nearby_context and source != "motion":
             label += " (nearby)"
         xy = np.array([p["xy"] for p in points if p["source"] == source]).reshape(-1, 2)
         kwargs = dict(facecolors="none", edgecolors=colors[source]) if source == "detection" else dict(color=colors[source])
         ax.scatter(xy[:, 0], xy[:, 1], marker=marker, s=size, label=label, zorder=3, **kwargs)
     handles, labels = ax.get_legend_handles_labels()
-    handles.append(Patch(facecolor=colors["motion"], edgecolor=colors["motion"], alpha=.25))
-    labels.append(f"{component.capitalize()} covariance")
-    ax.legend(handles, labels, loc="upper center", bbox_to_anchor=(.5, -.1), ncol=2, frameon=False)
+    if any(p["source"] == "motion" for p in points):
+        handles.append(Patch(facecolor=colors["motion"], edgecolor=colors["motion"], alpha=.25))
+        labels.append(f"{component.capitalize()} covariance")
+    if handles:
+        ax.legend(handles, labels, loc="upper center", bbox_to_anchor=(.5, -.1), ncol=2, frameon=False)
     ax.set(xlim=xlim, ylim=ylim, xlabel=f"BEV x ({unit})", ylabel=f"BEV y ({unit})",
            title=f"{_basename(sequence)} | frame {frame} | {component}")
     ax.set_aspect("equal", adjustable="box")
@@ -427,14 +437,17 @@ def draw_trajectory(points, frames, sequence, component, xlim, ylim,
             ax.annotate(label, point["xy"], xytext=(5, 6), textcoords="offset points",
                         fontsize=8, color=point["object_color"])
     has_context = any(p["source"] != "motion" and p.get("context_track_id") is not None for p in points)
+    sources = {p["source"] for p in points}
     handles = [Line2D([], [], color="#444444", marker=marker, linestyle=line,
                       markerfacecolor="none" if source == "detection" else "#444444",
                       label=label if has_context else label.replace(" (nearby)", ""))
-               for source, (marker, line, label) in styles.items()]
-    handles.append(Patch(facecolor="none", edgecolor="#444444", label=f"{component.capitalize()} covariance"))
+               for source, (marker, line, label) in styles.items() if source in sources]
+    if "motion" in sources:
+        handles.append(Patch(facecolor="none", edgecolor="#444444", label=f"{component.capitalize()} covariance"))
     # Keep the source legend at figure level so adding the object legend cannot
     # replace it or exclude it from tight-bounding-box exports.
-    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(.5, .01), ncol=2, frameon=False)
+    if handles:
+        fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(.5, .01), ncol=2, frameon=False)
     if objects:
         object_handles = [Line2D([], [], color=color, linewidth=2.5, label=label)
                           for label, color in sorted(objects.items(), key=lambda pair: (pair[0][0] != "M", int(pair[0][1:])))]
@@ -473,8 +486,8 @@ def build_parser():
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--checkpoint", "--resume", type=Path, help="Run trained detector + motion weights and plot fresh results")
     source.add_argument("--motion-csv", type=Path, help="Plot an existing motion prediction CSV instead of running inference")
-    parser.add_argument("--gt", type=Path, help="mota_gt.txt from the same evaluation; required with --motion-csv")
-    parser.add_argument("--detections", type=Path, help="all_res.txt from the same evaluation; required with --motion-csv")
+    parser.add_argument("--gt", type=Path, help="mota_gt.txt from the same evaluation; required in CSV mode when GT is displayed")
+    parser.add_argument("--detections", type=Path, help="all_res.txt from the same evaluation; required in CSV mode when detections are displayed")
     parser.add_argument("--sequence", help="Sequence path or unique name; checkpoint mode also accepts scene/config/seq")
     parser.add_argument("--sequence-id", type=int, help="Evaluation sequence index; checkpoint mode resolves the matching path automatically")
     parser.add_argument("--list-sequences", action="store_true", help="Print available names/IDs and exit")
@@ -484,6 +497,8 @@ def build_parser():
     parser.add_argument("--start-frame", type=int, help="Exact starting frame ID for --consecutive-frames; missing frames are an error")
     parser.add_argument("--layout", choices=("trajectory", "frames"), default="trajectory",
                         help="Combine selected frames in one trajectory figure (default), or save separate frames")
+    parser.add_argument("--sources", choices=("gt", "detection", "motion"), nargs="+", default=["gt", "detection", "motion"],
+                        help="Sources to display and export (default: all); motion includes covariance ellipses")
     parser.add_argument("--track-ids", type=int, nargs="+", help="Filter motion predictions only")
     parser.add_argument("--gt-ids", type=int, nargs="+", help="Filter GT only; GT IDs are not tracker IDs")
     parser.add_argument("--max-objects", type=int, help="Limit to N stable motion track IDs, plus at most one nearby GT/detection each")
@@ -534,13 +549,15 @@ def run(args):
             raise ValueError("--checkpoint generates fresh GT/detections; omit --gt and --detections")
         if not run_checkpoint(args):
             return []
-    elif args.gt is None or args.detections is None:
-        raise ValueError("--motion-csv requires both --gt and --detections from the same evaluation")
+    elif "gt" in args.sources and args.gt is None:
+        raise ValueError("--motion-csv requires --gt from the same evaluation when --sources includes gt")
+    elif "detection" in args.sources and args.detections is None:
+        raise ValueError("--motion-csv requires --detections from the same evaluation when --sources includes detection")
     elif args.gmvd_eval_all_frames:
         raise ValueError("--gmvd-eval-all-frames requires --checkpoint; existing CSVs cannot supply unsaved frames")
     motion = load_motion(args.motion_csv)
-    gt = load_numeric(args.gt, 11, delimiter=",")
-    detections = load_numeric(args.detections, 5)
+    gt = load_numeric(args.gt, 11, delimiter=",") if args.gt is not None else np.empty((0, 11))
+    detections = load_numeric(args.detections, 5) if args.detections is not None else np.empty((0, 5))
     if args.list_sequences:
         print("Motion CSV sequence names (not mapped by this order):")
         print('\n'.join(sorted({r["sequence"] for r in motion})) or "(no predictions)")
@@ -556,7 +573,8 @@ def run(args):
     frames = select_plot_frames(available_frames, args.frames,
                                 None if args.checkpoint else args.consecutive_frames,
                                 None if args.checkpoint else args.start_frame)
-    points = prepare_points(motion, gt, detections, args.component, scale, order,
+    displayed_component = args.component if "motion" in args.sources else "total"
+    points = prepare_points(motion, gt, detections, displayed_component, scale, order,
                             set(frames), args.track_ids, args.gt_ids, args.min_score)
     selected_track_ids = None
     selection_seed, selection_rng = None, None
@@ -570,8 +588,9 @@ def run(args):
             print(f"Random object selection seed: {selection_seed}; IDs stay fixed within this plot window")
     elif args.layout == "trajectory":
         points = assign_context(points, args.context_radius * scale)
+    points = [point for point in points if point["source"] in args.sources]
     if not points:
-        raise ValueError("No points remain after applying filters")
+        raise ValueError(f"No points remain for --sources {' '.join(args.sources)} after frame/ID/object filtering")
     xlim, ylim = plot_limits(points)
     xlim, ylim = args.xlim if args.xlim is not None else xlim, args.ylim if args.ylim is not None else ylim
     slug = re.sub(r"[^a-zA-Z0-9_.-]", "_", _basename(sequence)) or "sequence"
@@ -634,6 +653,8 @@ def add_resume_plot_arguments(parser):
     group.add_argument("--motion_plot_component", choices=("total", "aleatoric", "epistemic"), default="total")
     group.add_argument("--motion_plot_layout", choices=("trajectory", "frames"), default="trajectory",
                        help="Combine selected frames in one figure (default), or save separate frames")
+    group.add_argument("--motion_plot_sources", choices=("gt", "detection", "motion"), nargs="+", default=["gt", "detection", "motion"],
+                       help="Sources to display and export; motion includes covariance ellipses")
     group.add_argument("--motion_plot_track_ids", type=int, nargs="+")
     group.add_argument("--motion_plot_gt_ids", type=int, nargs="+")
     group.add_argument("--motion_plot_context_radius", type=float, default=50., help="Nearby GT/detection selection radius in original grid cells")
@@ -710,7 +731,7 @@ def plot_resume_results(args, dataset, epoch, res_dir, plan):
         ])
         plot_args.sequence, plot_args.sequence_id, plot_args.frames = root, index, frames
         plot_args.output_dir = res_dir / "motion_uncertainty_plots"
-        for name in ("layout", "max_objects", "object_selection", "object_selection_seed", "component", "track_ids", "gt_ids", "context_radius", "xlim", "ylim", "show_ids", "formats"):
+        for name in ("layout", "sources", "max_objects", "object_selection", "object_selection_seed", "component", "track_ids", "gt_ids", "context_radius", "xlim", "ylim", "show_ids", "formats"):
             setattr(plot_args, name, getattr(args, "motion_plot_" + name))
         plot_args.detection_order = "xy" if dataset.datasets[index].base.indexing == "xy" else "yx"
         plot_args.evaluation_checkpoint = args.resume
