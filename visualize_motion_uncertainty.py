@@ -71,6 +71,19 @@ retains frames/IDs, context mapping and trajectory object colors.
 --max-objects N selects the first N available motion track IDs in ascending
 order, keeping those same IDs across the requested frames (no replacements
 when a track is absent). --track-ids can restrict the candidate IDs first.
+Use --object-selection largest/smallest to rank objects by their mean covariance
+trace over the selected frames, or both to show the largest and smallest together.
+The covariance component follows --component. Missing predictions are excluded
+from the mean. With these modes, --max-objects defaults to 1 (both: 2) and counts
+the total objects shown; both splits the count between the two ends, giving the
+larger end the extra object for odd counts. Ties prefer smaller track IDs, and
+no ID is selected twice. Selection stays fixed across the entire plot window.
+Selected IDs, candidate mean traces, and frame counts are saved in plot settings.
+--object-selection random selects one object by default, drawing again on each
+invocation independently of the model's --seed. The same object is kept across
+the selected frames within that invocation. --max-objects N samples N distinct
+IDs. Random draws can repeat an ID on subsequent runs. --object-selection-seed
+reproduces a selection; otherwise a fresh seed is generated and saved in settings.
 Each frame then shows at most one nearby GT and one nearby detection per
 selected motion point, hence at most 3*N points and N ellipses. Context points
 are chosen by greedy shortest-distance, one-to-one selection among the frame's
@@ -88,6 +101,7 @@ import json
 import math
 from pathlib import Path
 import re
+import secrets
 
 from motion_uncertainty_inference import add_inference_arguments, run_checkpoint, select_plot_frames
 
@@ -266,9 +280,40 @@ def assign_context(points, context_radius):
     return annotated
 
 
-def limit_objects(points, max_objects, context_radius):
+def covariance_scores(points):
+    """Mean trace of the displayed covariance, using only available predictions."""
+    traces = {}
+    for point in points:
+        if point["source"] == "motion":
+            traces.setdefault(point["id"], []).append(float(np.trace(point["covariance"])))
+    return {identity: dict(mean_trace=float(np.mean(values)), frame_count=len(values))
+            for identity, values in sorted(traces.items())}
+
+
+def limit_objects(points, max_objects, context_radius, selection="id", rng=None):
     """Keep stable motion IDs and unique nearby context, never infer true IDs."""
-    track_ids = sorted({p["id"] for p in points if p["source"] == "motion"})[:max_objects]
+    if selection == "id":
+        track_ids = sorted({p["id"] for p in points if p["source"] == "motion"})[:max_objects]
+    elif selection == "random":
+        candidates = sorted({p["id"] for p in points if p["source"] == "motion"})
+        generator = np.random.default_rng() if rng is None else rng
+        track_ids = [int(identity) for identity in generator.choice(
+            candidates, size=min(max_objects, len(candidates)), replace=False)]
+    else:
+        scores = covariance_scores(points)
+        smallest = sorted(scores, key=lambda identity: (scores[identity]["mean_trace"], identity))
+        largest = sorted(scores, key=lambda identity: (-scores[identity]["mean_trace"], identity))
+        if selection == "largest":
+            track_ids = largest[:max_objects]
+        elif selection == "smallest":
+            track_ids = smallest[:max_objects]
+        elif selection == "both":
+            count = min(max_objects, len(scores))
+            track_ids = largest[:(count + 1) // 2]
+            chosen = set(track_ids)
+            track_ids += [identity for identity in smallest if identity not in chosen][:count - len(track_ids)]
+        else:
+            raise ValueError(f"Unknown object selection: {selection}")
     if not track_ids:
         raise ValueError("--max-objects requires motion predictions after frame/ID filtering")
     chosen = set(track_ids)
@@ -473,6 +518,10 @@ def build_parser():
     parser.add_argument("--track-ids", type=int, nargs="+", help="Filter motion predictions only")
     parser.add_argument("--gt-ids", type=int, nargs="+", help="Filter GT only; GT IDs are not tracker IDs")
     parser.add_argument("--max-objects", type=int, help="Limit to N stable motion track IDs, plus at most one nearby GT/detection each")
+    parser.add_argument("--object-selection", choices=("id", "largest", "smallest", "both", "random"), default="id",
+                        help="Select by ID (default), mean covariance trace, or a fresh random draw; largest/smallest/random default to 1 object, both to 2")
+    parser.add_argument("--object-selection-seed", type=int,
+                        help="Reproduce random object selection (default: new seed each run, independent of model --seed)")
     parser.add_argument("--context-radius", type=float, default=50., help="Nearby point selection radius in original grid cells (default: 50); for object limits or trajectory colors")
     parser.add_argument("--component", choices=("total", "aleatoric", "epistemic"), default="total")
     parser.add_argument("--detection-order", choices=("auto", "xy", "yx"), default="auto")
@@ -501,6 +550,13 @@ def run(args):
         raise ValueError("--dpi must be positive and --min-score must be in [0, 1]")
     if args.max_objects is not None and args.max_objects <= 0:
         raise ValueError("--max-objects must be positive")
+    if args.object_selection == "both" and args.max_objects == 1:
+        raise ValueError("--object-selection both requires --max-objects of at least 2 (or omit it)")
+    if args.object_selection_seed is not None and args.object_selection_seed < 0:
+        raise ValueError("--object-selection-seed must be nonnegative")
+    max_objects = args.max_objects
+    if max_objects is None and args.object_selection != "id":
+        max_objects = 2 if args.object_selection == "both" else 1
     if not math.isfinite(args.context_radius) or args.context_radius <= 0:
         raise ValueError("--context-radius must be finite and positive")
     for limits in (args.xlim, args.ylim):
@@ -536,9 +592,21 @@ def run(args):
     points = prepare_points(motion, gt, detections, args.component, scale, order,
                             set(frames), args.track_ids, args.gt_ids, args.min_score)
     selected_track_ids = None
-    if args.max_objects is not None:
-        points, selected_track_ids = limit_objects(points, args.max_objects, args.context_radius * scale)
+    selection_scores = covariance_scores(points) if args.object_selection in ("largest", "smallest", "both") else None
+    selection_seed, selection_rng = None, None
+    if args.object_selection == "random":
+        selection_seed = args.object_selection_seed if args.object_selection_seed is not None else secrets.randbits(64)
+        selection_rng = np.random.default_rng(selection_seed)
+    if max_objects is not None:
+        points, selected_track_ids = limit_objects(points, max_objects, args.context_radius * scale, args.object_selection, selection_rng)
         print(f"Selected motion track IDs: {selected_track_ids}; GT/detection context uses proximity, not tracker assignment")
+        if selection_seed is not None:
+            print(f"Random object selection seed: {selection_seed}; IDs stay fixed within this plot window")
+        if selection_scores is not None:
+            print(f"Object selection: {args.object_selection}, mean trace of {args.component} covariance")
+            for identity in selected_track_ids:
+                score = selection_scores[identity]
+                print(f"  M{identity}: mean trace={score['mean_trace']:.6g}, {score['frame_count']} motion frame(s)")
     elif args.layout == "trajectory":
         points = assign_context(points, args.context_radius * scale)
     if not points:
@@ -560,7 +628,7 @@ def run(args):
     files = []
     for time_selection, plot_points, name in plots:
         draw = draw_trajectory if args.layout == "trajectory" else draw_frame
-        options = {} if args.layout == "trajectory" else {"nearby_context": args.max_objects is not None}
+        options = {} if args.layout == "trajectory" else {"nearby_context": max_objects is not None}
         fig = draw(plot_points, time_selection, sequence, args.component,
                    xlim, ylim, "m" if args.meters_per_cell is not None else "grid cells",
                    args.show_ids, args.invert_y, **options)
@@ -575,9 +643,12 @@ def run(args):
     settings = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     settings.update(sequence=sequence, sequence_id=sequence_id, detection_order=order,
                     frames=frames, xlim=list(xlim), ylim=list(ylim), selected_track_ids=selected_track_ids,
+                    effective_max_objects=max_objects, object_covariance_scores=selection_scores,
+                    effective_object_selection_seed=selection_seed,
+                    object_selection_metric="mean_trace" if selection_scores is not None else None,
                     ellipse_definition="semiaxes=sqrt(eigenvalues)",
                     object_colors=object_colors,
-                    context_selection="greedy_nearest_one_to_one" if args.max_objects is not None or args.layout == "trajectory" else None)
+                    context_selection="greedy_nearest_one_to_one" if max_objects is not None or args.layout == "trajectory" else None)
     (output / f"plot_settings_{args.component}.json").write_text(json.dumps(settings, indent=2), encoding="utf-8")
     print(f"Saved {len(files)} figure(s) and point coordinates to {output}")
     return files
@@ -596,6 +667,10 @@ def add_resume_plot_arguments(parser):
     group.add_argument("--motion_plot_start_frame", type=int,
                        help="Minimum frame ID for automatic consecutive selection; only with --motion_plot_consecutive")
     group.add_argument("--motion_plot_max_objects", type=int, default=3, help="Maximum stable motion IDs per plotted sequence (default: 3)")
+    group.add_argument("--motion_plot_object_selection", choices=("id", "largest", "smallest", "both", "random"), default="id",
+                       help="Select motion objects by ID, mean covariance trace, or random draw")
+    group.add_argument("--motion_plot_object_selection_seed", type=int,
+                       help="Reproduce random object selection; default: fresh seed, independent of model --seed")
     group.add_argument("--motion_plot_component", choices=("total", "aleatoric", "epistemic"), default="total")
     group.add_argument("--motion_plot_layout", choices=("trajectory", "frames"), default="trajectory",
                        help="Combine selected frames in one figure (default), or save separate frames")
@@ -612,6 +687,10 @@ def resume_plot_plan(args, dataset):
     """Validate plot filters before inference; never filter the evaluation loader."""
     if args.motion_plot_max_objects <= 0:
         raise ValueError("--motion_plot_max_objects must be positive")
+    if args.motion_plot_object_selection == "both" and args.motion_plot_max_objects == 1:
+        raise ValueError("--motion_plot_object_selection both requires --motion_plot_max_objects of at least 2")
+    if args.motion_plot_object_selection_seed is not None and args.motion_plot_object_selection_seed < 0:
+        raise ValueError("--motion_plot_object_selection_seed must be nonnegative")
     if not np.isfinite(args.motion_plot_context_radius) or args.motion_plot_context_radius <= 0:
         raise ValueError("--motion_plot_context_radius must be finite and positive")
     count = args.motion_plot_consecutive
@@ -673,7 +752,7 @@ def plot_resume_results(args, dataset, epoch, res_dir, plan):
         ])
         plot_args.sequence, plot_args.sequence_id, plot_args.frames = root, index, frames
         plot_args.output_dir = res_dir / "motion_uncertainty_plots"
-        for name in ("layout", "max_objects", "component", "track_ids", "gt_ids", "context_radius", "xlim", "ylim", "show_ids", "formats"):
+        for name in ("layout", "max_objects", "object_selection", "object_selection_seed", "component", "track_ids", "gt_ids", "context_radius", "xlim", "ylim", "show_ids", "formats"):
             setattr(plot_args, name, getattr(args, "motion_plot_" + name))
         plot_args.detection_order = "xy" if dataset.datasets[index].base.indexing == "xy" else "yx"
         plot_args.evaluation_checkpoint = args.resume

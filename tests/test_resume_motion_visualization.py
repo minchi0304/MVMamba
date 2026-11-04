@@ -35,13 +35,17 @@ class ResumePlotSelectionTests(unittest.TestCase):
         dataset = SimpleNamespace(dataset_list=["seq1", "seq2"], datasets=[
             SimpleNamespace(frames=[10, 20]), SimpleNamespace(frames=[100, 110])])
         self.assertFalse(plot_settings().plot_motion_uncertainty)
+        self.assertEqual(plot_settings().motion_plot_object_selection, "id")
+        self.assertIsNone(plot_settings().motion_plot_object_selection_seed)
         self.assertTrue(plot_settings("--plot_motion_uncertainty").plot_motion_uncertainty)
         self.assertFalse(plot_settings("--no-plot_motion_uncertainty").plot_motion_uncertainty)
         self.assertEqual(viz.resume_plot_plan(plot_settings(), dataset), {0: [10, 20], 1: [100, 110]})
         args = plot_settings("--motion_plot_seq_ids", "1", "--motion_plot_frames", "110")
         self.assertEqual(viz.resume_plot_plan(args, dataset), {1: [110]})
         for options in (("--motion_plot_seq_ids", "2"), ("--motion_plot_frames", "15"),
-                        ("--motion_plot_max_objects", "0"), ("--motion_plot_xlim", "5", "4")):
+                        ("--motion_plot_max_objects", "0"), ("--motion_plot_xlim", "5", "4"),
+                        ("--motion_plot_object_selection", "random", "--motion_plot_object_selection_seed", "-1"),
+                        ("--motion_plot_object_selection", "both", "--motion_plot_max_objects", "1")):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 viz.resume_plot_plan(plot_settings(*options), dataset)
 
@@ -143,7 +147,9 @@ class ResumeEvaluationIntegrationTests(unittest.TestCase):
             return 50.
 
         settings = plot_settings("--motion_plot_seq_ids", "1", "--motion_plot_consecutive", "2",
-                                 "--motion_plot_component", "epistemic", "--motion_plot_formats", "png")
+                                 "--motion_plot_component", "epistemic", "--motion_plot_formats", "png",
+                                 "--motion_plot_object_selection", "random", "--motion_plot_object_selection_seed", "0",
+                                 "--motion_plot_max_objects", "1")
         for key, (default, _, _) in OPTIONS.items():
             setattr(settings, key, default)
         settings.dataset = "gmvd_test"
@@ -187,6 +193,8 @@ class ResumeEvaluationIntegrationTests(unittest.TestCase):
             self.assertEqual(float(motion["cov_xx"]), 1.)
             self.assertEqual({row["frame"] for row in points}, {"11", "12"})
             metadata = json.loads((output / "plot_settings_epistemic.json").read_text())
+            self.assertEqual(metadata["object_selection"], "random")
+            self.assertEqual(metadata["effective_object_selection_seed"], 0)
             self.assertEqual(metadata["evaluation_checkpoint"], "weights.pth")
             self.assertEqual(metadata["evaluation_epoch"], 1)
             self.assertEqual(metadata["layout"], "trajectory")
