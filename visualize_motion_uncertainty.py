@@ -15,7 +15,7 @@ the last requested frame is processed to preserve tracking history. GMVD IDs
 are mapped automatically from the split CSV; --sequence OR --sequence-id is
 sufficient. --list-sequences lists the actual ID/path mapping without inference.
 --consecutive-frames N selects existing original IDs spaced by exactly one;
---start-frame sets a minimum start ID. --gmvd-eval-all-frames disables GMVD
+--start-frame sets the exact start ID. --gmvd-eval-all-frames disables GMVD
 subsampling for this checkpoint run without changing the split CSV. The default
 automatic start leaves one earlier evaluation frame for tracking history.
 Fresh CSVs (including NIW kappa) and inference settings are saved below
@@ -481,7 +481,7 @@ def build_parser():
     frames = parser.add_mutually_exclusive_group()
     frames.add_argument("--frames", type=int, nargs="+", help="Exact frames to draw; default: all frames in the selected sequence")
     frames.add_argument("--consecutive-frames", type=int, metavar="N", help="Choose N existing original frame IDs spaced by 1")
-    parser.add_argument("--start-frame", type=int, help="Minimum frame ID for --consecutive-frames")
+    parser.add_argument("--start-frame", type=int, help="Exact starting frame ID for --consecutive-frames; missing frames are an error")
     parser.add_argument("--layout", choices=("trajectory", "frames"), default="trajectory",
                         help="Combine selected frames in one trajectory figure (default), or save separate frames")
     parser.add_argument("--track-ids", type=int, nargs="+", help="Filter motion predictions only")
@@ -625,7 +625,7 @@ def add_resume_plot_arguments(parser):
     frames.add_argument("--motion_plot_consecutive", type=int, metavar="N",
                         help="Automatically choose N existing frame IDs spaced by exactly 1 (after the first evaluation frame)")
     group.add_argument("--motion_plot_start_frame", type=int,
-                       help="Minimum frame ID for automatic consecutive selection; only with --motion_plot_consecutive")
+                       help="Exact starting frame ID; only with --motion_plot_consecutive; missing frames are an error")
     group.add_argument("--motion_plot_max_objects", type=int, default=3, help="Maximum stable motion IDs per plotted sequence (default: 3)")
     group.add_argument("--motion_plot_object_selection", choices=("id", "random"), default="id",
                        help="Select motion objects by ID or random draw")

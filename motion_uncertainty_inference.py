@@ -184,9 +184,17 @@ def select_plot_frames(available, requested=None, consecutive=None, start_frame=
     if not available:
         raise ValueError("The selected evaluation sequence has no frames")
     if consecutive is not None:
-        # Retain one earlier observation by default; explicit lower bounds can
-        # include the first frame, which has no motion prediction yet.
-        lower = start_frame if start_frame is not None else (available[1] if len(available) > 1 else None)
+        if start_frame is not None:
+            selected = list(range(start_frame, start_frame + consecutive))
+            missing = sorted(set(selected) - set(available))
+            if missing:
+                raise ValueError(f"Requested consecutive frames {selected[0]}..{selected[-1]} are outside "
+                                 f"this evaluation split/sampling; missing frame IDs: {missing}. "
+                                 f"{frame_inventory(available)}. For GMVD checkpoint inference, "
+                                 "--gmvd-eval-all-frames disables subsampling; consecutive source annotations are still required.")
+            return selected
+        # Automatic selection leaves one earlier observation for motion history.
+        lower = available[1] if len(available) > 1 else None
         run = []
         if lower is not None:
             for frame in available:

@@ -540,9 +540,13 @@ last requested frame, in order, so earlier detections and motion rollouts build
 the history. Requested frame numbers must exist in the evaluation split and
 its sampling. Instead of specifying frame numbers, use `--consecutive-frames 5`
 to automatically select five existing original IDs spaced by exactly one.
-`--start-frame N` sets a minimum start ID; by default one earlier frame is left
-for tracking history. Missing annotation frames break a run. With neither
-frame-selection option, the entire selected sequence is processed and plotted.
+`--start-frame N` sets the exact start ID: `--start-frame 380 --consecutive-frames 5`
+plots frames `380, 381, 382, 383, 384`. If any requested frame is outside the
+evaluation split or absent after sampling, the command reports the missing IDs
+instead of moving to a later window. Without an explicit start, one earlier
+frame is left for tracking history. Missing annotation frames break an automatic
+run. With neither frame-selection option, the entire selected sequence is
+processed and plotted.
 
 For GMVD checkpoint inference, `--gmvd-eval-all-frames` (also accepted as
 `--gmvd_eval_all_frames`) overrides the evaluation CSV's `sample_require` with

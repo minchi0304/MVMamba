@@ -61,6 +61,9 @@ class ResumePlotSelectionTests(unittest.TestCase):
         dataset.datasets[0].frames = [10, 11, 13, 20, 21, 22, 23, 24]
         args.motion_plot_start_frame = None
         self.assertEqual(viz.resume_plot_plan(args, dataset), {0: [20, 21, 22, 23, 24]})
+        args.motion_plot_start_frame = 10
+        with self.assertRaisesRegex(ValueError, "missing frame IDs:.*12.*14"):
+            viz.resume_plot_plan(args, dataset)
 
     def test_sampling_is_not_silently_treated_as_original_frame_continuity(self):
         dataset = SimpleNamespace(dataset_list=["seq"], datasets=[SimpleNamespace(frames=[0, 10, 20, 30, 40, 50])])

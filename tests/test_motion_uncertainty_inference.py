@@ -112,6 +112,18 @@ class InferenceSettingsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "positive"):
             viz.run(self.arguments("--consecutive-frames", "0"))
 
+    def test_explicit_start_keeps_exact_frames_and_never_skips_to_a_later_window(self):
+        args = self.arguments("--start-frame", "380", "--consecutive-frames", "5")
+        processed, selected = inference.inference_frames(range(500), args.frames, args.consecutive_frames, args.start_frame)
+        self.assertEqual(selected, [380, 381, 382, 383, 384])
+        self.assertEqual(processed, list(range(385)))
+        self.assertEqual(inference.select_plot_frames(range(5), consecutive=1, start_frame=0), [0])
+        for available, missing in ((range(381, 400), 380),
+                                   ([frame for frame in range(500) if frame != 382], 382),
+                                   (range(390, 400), 380), (range(384), 384)):
+            with self.subTest(missing=missing), self.assertRaisesRegex(ValueError, f"missing frame IDs:.*{missing}"):
+                inference.select_plot_frames(available, consecutive=5, start_frame=380)
+
     def test_checkpoint_cli_plots_only_fresh_results_with_component_decomposition(self):
         args = self.arguments("--frames", "20", "--component", "aleatoric", "--max-objects", "1",
                               "--output-dir", str(self.root / "plots"))
