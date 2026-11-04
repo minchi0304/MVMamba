@@ -578,32 +578,6 @@ no object limit is set, unpaired GT retains a separate GT-ID color and unpaired
 detections remain gray points, without an invented detection trajectory. Use `--xlim MIN MAX`
 and `--ylim MIN MAX` for a closer view without changing covariance values.
 
-To choose objects by motion uncertainty, append one of these options to either
-the checkpoint or CSV plotting command:
-
-```bash
---object-selection largest --max-objects 1   # largest mean covariance trace
---object-selection smallest --max-objects 1  # smallest mean covariance trace
---object-selection both --max-objects 2      # one of each, in the same figure
-```
-
-The score is the mean of `trace(Sigma) = cov_xx + cov_yy` over each object's
-available predictions in the selected frame window, using the plotted
-`--component` (`total`, `aleatoric`, or `epistemic`). It measures summed variance,
-not ellipse area. Missing predictions do not count as zero, and `--track-ids`
-restricts candidates before ranking. Ties prefer smaller IDs. The chosen IDs
-remain fixed across frames and retain their nearby GT/detection context and
-object colors. Covariance values and model inference are unchanged.
-
-With covariance selection, omitting `--max-objects` chooses one object for
-`largest`/`smallest` or two for `both`. The count is a total limit: `both` with
-four objects picks the two largest and two smallest, without duplicate IDs;
-odd counts give the larger end one extra object. Fewer available candidates
-produce fewer objects. The default `--object-selection id` preserves the
-original ID-based selection. Settings JSON records the selection mode,
-candidate mean traces and frame counts. Use different `--output-dir` values
-to keep separate largest/smallest plots of the same frames and component.
-
 For a random single object on each invocation, append:
 
 ```bash

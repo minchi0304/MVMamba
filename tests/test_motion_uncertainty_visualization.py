@@ -165,76 +165,6 @@ class MotionUncertaintyVisualizationTests(unittest.TestCase):
         self.assertEqual(len([p for p in selected if p["source"] == "detection"]), 1)
         self.assertEqual(next(p for p in selected if p["source"] == "detection")["context_track_id"], 2)
 
-    def test_covariance_selection_uses_mean_keeps_fixed_ids_and_deduplicates_extremes(self):
-        points = []
-        for identity, traces in ((10, (2., 18.)), (20, (12.,)), (30, (20., 20.)), (40, (12.,))):
-            for frame, trace in enumerate(traces, 1):
-                points.append(dict(frame=frame, source="motion", id=identity,
-                                   xy=np.array([float(identity), 0.]), covariance=np.eye(2) * trace / 2.))
-                points.append(dict(frame=frame, source="gt", id=identity + 100,
-                                   xy=np.array([identity + .1, 0.])))
-        scores = viz.covariance_scores(points)
-        self.assertEqual(scores[10], dict(mean_trace=10., frame_count=2))
-        self.assertEqual(scores[20], dict(mean_trace=12., frame_count=1))
-        for mode, count, expected in (("largest", 2, [30, 20]), ("smallest", 2, [10, 20]),
-                                      ("both", 2, [30, 10]), ("both", 3, [30, 20, 10]),
-                                      ("both", 9, [30, 20, 10, 40])):
-            with self.subTest(mode=mode, count=count):
-                selected, ids = viz.limit_objects(points, count, 1., mode)
-                self.assertEqual(ids, expected)
-                self.assertEqual(len(ids), len(set(ids)))
-                self.assertEqual({p["context_track_id"] for p in selected}, set(expected))
-                self.assertEqual({p["id"] for p in selected if p["source"] == "gt"},
-                                 {identity + 100 for identity in expected})
-                # Frame 2 cannot substitute another object for the absent ID 20.
-                self.assertEqual({p["id"] for p in selected if p["source"] == "motion" and p["frame"] == 2},
-                                 set(expected) & {10, 30})
-        singleton = [dict(points[0], covariance=np.zeros((2, 2)))]
-        self.assertEqual(viz.limit_objects(singleton, 2, 1., "both")[1], [10])
-        self.assertTrue(all("context_track_id" not in p for p in points))
-
-    def test_covariance_selection_cli_respects_component_frames_units_and_id_filter(self):
-        records, gt, detections = [], [], []
-        for frame in (1, 2):
-            for identity, variance, kappa in ((10, 10., 99.), (20, 4., .1), (30, 1., 1.)):
-                x = identity * 2. + frame
-                records.append(dict(self.record, frame=frame, track_id=identity, predicted_x=x,
-                                    cov_xx=variance, cov_yy=variance, cov_xy=0., kappa=kappa))
-                gt.append([0, frame, identity + 100, -1, -1, -1, -1, 1, x + .1, 20., -1])
-                detections.append([frame, x + .2, 20., .9, 0])
-        # A large covariance outside the plotted interval must not affect selection.
-        records.append(dict(self.record, frame=0, track_id=30, cov_xx=1e6, cov_yy=1e6, cov_xy=0.))
-        arguments = self.write_inputs(records, gt, detections) + [
-            "--frames", "1", "2", "--meters-per-cell", ".1", "--context-radius", "2"]
-        for component, mode, expected in (("total", "largest", [10]), ("total", "smallest", [30]),
-                                          ("total", "both", [10, 30]), ("epistemic", "largest", [20]),
-                                          ("epistemic", "smallest", [10]), ("aleatoric", "smallest", [20])):
-            with self.subTest(component=component, mode=mode):
-                files = viz.run(viz.build_parser().parse_args(arguments + [
-                    "--component", component, "--object-selection", mode]))
-                settings = json.loads((files[0].parent / f"plot_settings_{component}.json").read_text())
-                self.assertEqual(settings["selected_track_ids"], expected)
-                self.assertEqual(settings["effective_max_objects"], 2 if mode == "both" else 1)
-                self.assertEqual(settings["object_selection_metric"], "mean_trace")
-                self.assertTrue(all(score["frame_count"] == 2 for score in settings["object_covariance_scores"].values()))
-                if component == "total":
-                    self.assertAlmostEqual(settings["object_covariance_scores"]["10"]["mean_trace"], .2)
-                with (files[0].parent / f"plotted_points_{component}.csv").open() as stream:
-                    rows = list(csv.DictReader(stream))
-                self.assertEqual(len(rows), len(expected) * 6)
-                self.assertEqual({int(row["context_track_id"]) for row in rows}, set(expected))
-                self.assertEqual({int(row["frame"]) for row in rows}, {1, 2})
-                for row in rows:
-                    if row["source"] == "motion":
-                        original = next(r for r in records if r["track_id"] == int(row["id"]) and r["frame"] == int(row["frame"]))
-                        self.assertAlmostEqual(float(row["cov_xx"]), viz.selected_covariance(original, component, .1)[0, 0])
-        filtered = viz.build_parser().parse_args(arguments + ["--object-selection", "both", "--track-ids", "10", "20"])
-        files = viz.run(filtered)
-        settings = json.loads((files[0].parent / "plot_settings_total.json").read_text())
-        self.assertEqual(settings["selected_track_ids"], [10, 20])
-        self.assertEqual(set(settings["object_covariance_scores"]), {"10", "20"})
-        self.assertFalse(plt.get_fignums())
-
     def test_random_object_selection_is_reproducible_independent_and_without_duplicates(self):
         points = []
         for frame in (1, 2):
@@ -264,16 +194,13 @@ class MotionUncertaintyVisualizationTests(unittest.TestCase):
             viz.limit_objects([], 1, 1., "random", np.random.default_rng(0))
         self.assertTrue(all("context_track_id" not in point for point in points))
 
-    def test_covariance_selection_validation_and_default(self):
+    def test_random_selection_validation_and_default(self):
         arguments = self.write_inputs(records=[])
         self.assertEqual(viz.build_parser().parse_args(arguments).object_selection, "id")
-        with self.assertRaisesRegex(ValueError, "at least 2"):
-            viz.run(viz.build_parser().parse_args(arguments + ["--object-selection", "both", "--max-objects", "1"]))
         with self.assertRaisesRegex(ValueError, "selection-seed must be nonnegative"):
             viz.run(viz.build_parser().parse_args(arguments + ["--object-selection", "random", "--object-selection-seed", "-1"]))
-        for mode in ("largest", "smallest", "both", "random"):
-            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "requires motion"):
-                viz.run(viz.build_parser().parse_args(arguments + ["--object-selection", mode]))
+        with self.assertRaisesRegex(ValueError, "requires motion"):
+            viz.run(viz.build_parser().parse_args(arguments + ["--object-selection", "random"]))
 
     def test_random_cli_draws_fresh_seeds_and_replays_recorded_selection(self):
         records, gt, detections = [], [], []
@@ -295,8 +222,6 @@ class MotionUncertaintyVisualizationTests(unittest.TestCase):
             self.assertEqual(settings["effective_max_objects"], 1)
             self.assertIsNone(settings["object_selection_seed"])
             self.assertEqual(settings["effective_object_selection_seed"], fresh_seed)
-            self.assertIsNone(settings["object_covariance_scores"])
-            self.assertIsNone(settings["object_selection_metric"])
             with (files[0].parent / "plotted_points_total.csv").open() as stream:
                 rows = list(csv.DictReader(stream))
             self.assertEqual(len(rows), 6)

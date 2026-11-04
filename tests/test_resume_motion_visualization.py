@@ -44,8 +44,7 @@ class ResumePlotSelectionTests(unittest.TestCase):
         self.assertEqual(viz.resume_plot_plan(args, dataset), {1: [110]})
         for options in (("--motion_plot_seq_ids", "2"), ("--motion_plot_frames", "15"),
                         ("--motion_plot_max_objects", "0"), ("--motion_plot_xlim", "5", "4"),
-                        ("--motion_plot_object_selection", "random", "--motion_plot_object_selection_seed", "-1"),
-                        ("--motion_plot_object_selection", "both", "--motion_plot_max_objects", "1")):
+                        ("--motion_plot_object_selection", "random", "--motion_plot_object_selection_seed", "-1")):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 viz.resume_plot_plan(plot_settings(*options), dataset)
 
